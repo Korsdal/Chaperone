@@ -11,8 +11,11 @@
 //! lazy-expiry sweep (`WHERE expiry_ms <= ?`) depends on. Conversion to/from
 //! [`chrono::DateTime<Utc>`] happens at the Rust boundary.
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::str::FromStr;
+use std::time::Duration;
 
 /// The schema through E-003: the lease table and the version index.
 ///
@@ -109,8 +112,22 @@ CREATE TABLE IF NOT EXISTS session_reads (
 
 /// Open (creating if absent) a SQLite pool at `url`, e.g.
 /// `sqlite:chapr-coord.db` or `sqlite::memory:`.
+/// WAL, because coord has several concurrent writers by design: HTTP handlers,
+/// the lease reaper, the blob GC, and the change-watcher. sqlx deliberately
+/// leaves `journal_mode` alone, so without this a created database keeps
+/// SQLite's `delete` rollback journal and those writers serialise into
+/// `SQLITE_BUSY` — which every module collapses into `Internal` → HTTP 500, and
+/// a 500 on a write's commit tail is exactly the case that loses an audit record.
 pub async fn connect(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx::Error> {
-    let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
+    let opts = SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        // sqlx defaults this to 5s; a slow blob volume plus four users deserves
+        // more headroom before a handler gives up and 500s.
+        .busy_timeout(Duration::from_secs(10))
+        // NORMAL is the standard companion to WAL: durable across process crash
+        // (which is what the journal protects against), fsync only on checkpoint.
+        .synchronous(SqliteSynchronous::Normal);
     SqlitePoolOptions::new()
         .max_connections(max_connections)
         .connect_with(opts)

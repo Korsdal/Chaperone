@@ -34,8 +34,16 @@ pub trait PathGrammar: Send + Sync {
         None
     }
 
-    /// A uniquely-named conflict sidecar `F.conflict-{user}-{ts}.ext` (concept
-    /// §11), preserving the original extension. Provided in terms of [`Self::sep`].
+    /// A uniquely-named conflict sidecar `F.conflict-{user}-{ts}-{id}.ext`
+    /// (concept §11), preserving the original extension. Provided in terms of
+    /// [`Self::sep`].
+    ///
+    /// The `{id}` is load-bearing, not decoration. The timestamp is
+    /// second-granular, and two CAS losses by the same principal inside one
+    /// second computed the *same* name — `create_new` then refused and
+    /// `write_cas_core` returned `AlreadyExists` with the losing bytes written
+    /// nowhere. That is reachable in practice: a live 4-session race produced two
+    /// conflicts in the same second unprompted.
     fn sidecar_path(&self, path: &CanonicalPath, principal: &Principal) -> CanonicalPath {
         let user: String = principal
             .as_str()
@@ -43,22 +51,41 @@ pub trait PathGrammar: Send + Sync {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let ts = Utc::now().format("%Y%m%d%H%M%S");
-        CanonicalPath::new_unchecked(insert_tag(
+        let id = short_id();
+        self.derived(insert_tag(
             path.as_str(),
-            &format!("conflict-{user}-{ts}"),
+            &format!("conflict-{user}-{ts}-{id}"),
             self.sep(),
         ))
     }
 
-    /// A `F.restored-{ts}.ext` sibling for a restore copy (concept §6.5),
-    /// preserving the original extension.
+    /// A `F.restored-{ts}-{id}.ext` sibling for a restore copy (concept §6.5),
+    /// preserving the original extension. Carries the same uniqueness suffix as
+    /// the sidecar, for the same reason.
     fn restored_path(&self, path: &CanonicalPath) -> CanonicalPath {
         let ts = Utc::now().format("%Y%m%d%H%M%S");
-        CanonicalPath::new_unchecked(insert_tag(
+        let id = short_id();
+        self.derived(insert_tag(
             path.as_str(),
-            &format!("restored-{ts}"),
+            &format!("restored-{ts}-{id}"),
             self.sep(),
         ))
+    }
+
+    /// Mint a derived path as a genuinely canonical one.
+    ///
+    /// Derived names are built from an already-canonical path plus ASCII, but
+    /// they used to bypass [`Self::normalize`] entirely — so under `WinGrammar`
+    /// (which casefolds) a sidecar carrying `CONTOSO_jsmith` was a
+    /// `CanonicalPath` that violated invariant 5, and then keyed coord state via
+    /// `register_conflict`. Route it through the grammar so that cannot happen.
+    fn derived(&self, raw: String) -> CanonicalPath {
+        match self.normalize(&raw) {
+            Ok(n) => CanonicalPath::new_unchecked(n),
+            // Unreachable for a derived name, and a failure here must not lose
+            // the caller's bytes — the sidecar path is where they get parked.
+            Err(_) => CanonicalPath::new_unchecked(raw),
+        }
     }
 
     /// Join a directory and an entry name with this grammar's separator (used by
@@ -148,6 +175,12 @@ pub fn grammar_for(kind: BackendKind) -> &'static dyn PathGrammar {
     }
 }
 
+/// A short random suffix for derived names. 8 hex chars of a v4 uuid — enough to
+/// make a same-second collision negligible without making the filename unreadable.
+fn short_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
 /// Collapse runs of `sep` into a single separator.
 fn collapse(body: &str, sep: char) -> String {
     let mut out = String::with_capacity(body.len());
@@ -203,9 +236,34 @@ mod tests {
         let p = CanonicalPath::new_unchecked("\\\\srv\\share\\q3.xlsx");
         let s = WinGrammar.sidecar_path(&p, &Principal::new_unchecked("CONTOSO\\jsmith"));
         let s = s.as_str();
-        assert!(s.starts_with("\\\\srv\\share\\q3.conflict-CONTOSO_jsmith-"));
+        // Casefolded, because a sidecar IS a CanonicalPath under this grammar and
+        // it keys coord state — the old behaviour preserved `CONTOSO_jsmith` and
+        // so minted a path that violated invariant 5.
+        assert!(s.starts_with("\\\\srv\\share\\q3.conflict-contoso_jsmith-"));
         assert!(s.ends_with(".xlsx"));
         assert!(!s.contains("CONTOSO\\jsmith"));
+        assert_eq!(s, WinGrammar.normalize(s).unwrap(), "sidecar must be canonical");
+    }
+
+    #[test]
+    fn sidecars_in_the_same_second_do_not_collide() {
+        // The whole point of the uniqueness suffix: same path, same principal,
+        // same wall-clock second used to produce the same filename, and the
+        // second CAS loser's bytes were then written nowhere.
+        let p = CanonicalPath::new_unchecked("\\\\srv\\share\\q3.xlsx");
+        let who = Principal::new_unchecked("CONTOSO\\jsmith");
+        let a = WinGrammar.sidecar_path(&p, &who);
+        let b = WinGrammar.sidecar_path(&p, &who);
+        assert_ne!(a.as_str(), b.as_str());
+        assert!(a.as_str().ends_with(".xlsx") && b.as_str().ends_with(".xlsx"));
+    }
+
+    #[test]
+    fn restored_copies_in_the_same_second_do_not_collide() {
+        let p = CanonicalPath::new_unchecked("/mnt/share/q3.xlsx");
+        let a = PosixGrammar.restored_path(&p);
+        let b = PosixGrammar.restored_path(&p);
+        assert_ne!(a.as_str(), b.as_str());
     }
 
     #[test]

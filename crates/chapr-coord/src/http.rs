@@ -14,7 +14,7 @@ use crate::state::AppState;
 use crate::{history, index, journal, lease};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -70,6 +70,18 @@ impl From<WatchEventRequest> for crate::watch::WatchEvent {
     }
 }
 
+/// Largest pre-image coord will accept on `PUT /blobs`.
+///
+/// axum's `DefaultBodyLimit` is 2 MiB, which silently capped every write to a
+/// file already larger than that — a write snapshots the file's *current* bytes,
+/// so the limit applied to the existing file, not the new content. Nothing in
+/// the config or docs ever mentioned a size ceiling because this byte channel
+/// was not supposed to exist (see the invariant-6 note in README.md).
+///
+/// Note both ends buffer fully in memory (`Bytes` in, `Vec<u8>` out), so this
+/// number is also coord's per-in-flight-write memory cost.
+pub const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
+
 /// Build the coord router over the given state.
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -82,7 +94,10 @@ pub fn router(state: AppState) -> Router {
         .route("/journal", post(open_journal))
         .route("/journal/clear", post(clear_journal))
         .route("/journal/recover", post(recover_journal))
-        .route("/blobs", put(put_blob))
+        .route(
+            "/blobs",
+            put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
+        )
         .route("/blobs/{version}", get(get_blob))
         .route("/version-log", post(append_version_log))
         .route("/history", post(get_history))
@@ -406,10 +421,12 @@ impl IntoResponse for ApiError {
 
             CoordUnreachable => StatusCode::SERVICE_UNAVAILABLE,
 
-            // Bugs / operational faults.
-            RecoveryFailed { .. } | Io { .. } | Internal { .. } => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            // Bugs / operational faults. `CommittedButUnrecorded` is raised by
+            // the endpoint, never by coord, but the shared enum stays total.
+            RecoveryFailed { .. }
+            | Io { .. }
+            | Internal { .. }
+            | CommittedButUnrecorded { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(self.0)).into_response()
     }

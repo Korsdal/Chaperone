@@ -47,6 +47,14 @@ use chrono::{DateTime, Utc};
 use std::io;
 use tokio::runtime::Handle;
 
+/// Largest pre-image the write path will snapshot to coord.
+///
+/// Must not exceed coord's `PUT /blobs` body limit (`chapr_coord::http::
+/// MAX_BLOB_BYTES`), which is the real ceiling; this mirrors it so the refusal
+/// happens locally with a message that explains *why* a big file cannot be
+/// written, instead of a bare 413 from the middle of the write.
+pub const MAX_PRE_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+
 /// What a backend can and cannot do (§14). Endpoint-internal — never crosses the
 /// wire (coord is already backend-agnostic). Drives exactly one behavioural
 /// branch: the journal gate on [`Self::atomic_writes`].
@@ -248,6 +256,47 @@ fn write_cas_core<P: FsPrimitives>(
     let v_new = VersionToken::hash(content);
     let force = matches!(args.mode, WriteMode::Force { .. });
 
+    // The pre-image has to fit through coord's blob channel. Check before doing
+    // anything durable, so an oversized file is a clear refusal here rather than
+    // an opaque HTTP 413 several steps later.
+    if current.len() > MAX_PRE_IMAGE_BYTES {
+        drop(file);
+        return Err(ChaprError::Io {
+            path: path.clone(),
+            message: format!(
+                "file is {} bytes; Chaperone snapshots the previous contents to history on \
+                 every write and the coordinator accepts at most {MAX_PRE_IMAGE_BYTES} bytes",
+                current.len()
+            ),
+        });
+    }
+
+    // Guard against a client that read a binary file — which the MCP layer hands
+    // back base64-encoded — and wrote that base64 TEXT straight back without
+    // declaring `encoding: "base64"`. The envelope header, the tool descriptions
+    // and the server instructions all state the rule, but a caller can ignore it,
+    // and the result would be silent destruction of a binary file that CAS
+    // happily accepts (the base_version is a genuine hash of the genuine bytes).
+    //
+    // The signature is unambiguous: the incoming bytes are valid base64 whose
+    // decoding is byte-for-byte the file's current contents. No caller means that.
+    // Length is checked first so this costs nothing on a normal write.
+    if content.len() == current.len().div_ceil(3) * 4
+        && std::str::from_utf8(&current).is_err()
+        && base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)
+            .is_ok_and(|decoded| decoded == current)
+    {
+        drop(file);
+        return Err(ChaprError::Io {
+            path: path.clone(),
+            message: "this write is the base64 TEXT of the file's current binary contents. \
+                      The read returned encoding=base64; write it back with encoding \"base64\" \
+                      so the bytes are decoded, or the file would be replaced by its own \
+                      base64 transcript"
+                .to_string(),
+        });
+    }
+
     // Step 6: CAS.
     if !force && v_now != *base_version {
         // Conflict: park the losing bytes in a fresh sidecar and register it.
@@ -270,7 +319,17 @@ fn write_cas_core<P: FsPrimitives>(
         });
     }
 
-    // Step 7: journal intent (fail-closed if coord is unreachable — no write).
+    // Step 7: snapshot the pre-image into the history store, keyed by V_now.
+    //
+    // BEFORE the journal, not after. A journal entry names `pre_image_version` as
+    // the bytes recovery will serve, so if the entry exists and the blob does not,
+    // a crash leaves a dangling entry pointing at nothing and the next reader gets
+    // `RecoveryFailed` instead of its file. Storing first means the worst case is
+    // a blob with no entry — harmless garbage the GC reclaims. `delete` and
+    // `restore` already ordered it this way; `write` was the outlier.
+    rt.block_on(coord.put_blob(current.clone()))?;
+
+    // Step 8: journal intent (fail-closed if coord is unreachable — no write).
     // Gated: only for non-atomic backends.
     if !atomic_writes {
         rt.block_on(coord.journal_open(&OpenJournalRequest {
@@ -281,9 +340,6 @@ fn write_cas_core<P: FsPrimitives>(
             intended_version: Some(v_new.clone()),
         }))?;
     }
-
-    // Step 8: snapshot the pre-image into the history store, keyed by V_now.
-    rt.block_on(coord.put_blob(current.clone()))?;
 
     // Step 9–10: write in place, truncate, flush, close.
     file.overwrite(content).map_err(|e| map_os_err(path, e))?;
@@ -303,14 +359,39 @@ fn write_cas_core<P: FsPrimitives>(
 }
 
 /// Create a new file (atomic `CREATE_NEW` — an existing file → AlreadyExists).
-/// No pre-image, no journal; the version-log + audit tail is the tool layer's.
+/// No journal (there is no pre-image to recover to); the version-log + audit tail
+/// is the tool layer's.
+///
+/// The created content IS snapshotted, even though nothing can tear here. The
+/// tool layer appends a version-log row naming this version, and a version-log
+/// row whose blob is absent is a broken promise: `chapr.history` lists the
+/// version and `chapr.restore` of it fails with `VersionNotFound`. Before this,
+/// a file created and never re-written had no recoverable history at all.
 fn create_core<P: FsPrimitives>(
     prims: &P,
-    _ctx: &WriteCtx,
+    ctx: &WriteCtx,
     path: &CanonicalPath,
     content: &[u8],
 ) -> Result<CommitReceipt, ChaprError> {
+    if content.len() > MAX_PRE_IMAGE_BYTES {
+        return Err(ChaprError::Io {
+            path: path.clone(),
+            message: format!(
+                "content is {} bytes; the coordinator accepts at most {MAX_PRE_IMAGE_BYTES}",
+                content.len()
+            ),
+        });
+    }
     prims.create_new(path.as_str(), content).map_err(|e| map_os_err(path, e))?;
+    // After the file exists: a failed snapshot must not leave a phantom create.
+    // Best-effort — the bytes are on the share either way, and the tool layer's
+    // version-log append is what makes the version visible.
+    if let Err(e) = ctx.rt.block_on(ctx.coord.put_blob(content.to_vec())) {
+        tracing::warn!(
+            path = %path, error = %e,
+            "created file but could not snapshot it to history; restore of this version will fail"
+        );
+    }
     Ok(CommitReceipt {
         from_version: None,
         to_version: Some(VersionToken::hash(content)),
@@ -493,6 +574,22 @@ fn move_cas_core<P: FsPrimitives>(
                 sidecar_path: dst.clone(),
             });
         }
+        // Snapshot what the rename is about to destroy. `dbytes` is exactly those
+        // bytes and was previously read only to hash, then dropped — so an
+        // overwrite-move was the one mutating verb with no recovery path at all,
+        // and coord's `move_paths` deliberately keeps dst's version log, which
+        // then advertised versions whose blobs were never stored.
+        if dbytes.len() > MAX_PRE_IMAGE_BYTES {
+            return Err(ChaprError::Io {
+                path: dst.clone(),
+                message: format!(
+                    "destination is {} bytes; an overwrite-move snapshots it to history first \
+                     and the coordinator accepts at most {MAX_PRE_IMAGE_BYTES}",
+                    dbytes.len()
+                ),
+            });
+        }
+        rt.block_on(coord.put_blob(dbytes))?;
     }
 
     // Ground truth first: the rename.

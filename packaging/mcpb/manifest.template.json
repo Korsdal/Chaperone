@@ -1,5 +1,4 @@
 {
-  "//": "Chaperone endpoint — MCPB manifest TEMPLATE. Copy per customer/OS and fill the {{PLACEHOLDERS}}. See ./README.md. Spec: https://github.com/modelcontextprotocol/mcpb (MANIFEST.md). Run `mcpb validate` after editing; if it flags manifest_version, set it to the value your installed CLI reports.",
   "manifest_version": "0.3",
   "name": "{{BUNDLE_NAME}}",
   "display_name": "{{DISPLAY_NAME}}",
@@ -47,6 +46,7 @@
     { "name": "chapr_list", "description": "List a directory with open-conflict counts." },
     { "name": "chapr_stat", "description": "Get a file's version, journal state, and any held lease." },
     { "name": "chapr_history", "description": "Show a file's version history." },
+    { "name": "chapr_restore", "description": "Restore a historical version, as a copy by default or in place." },
     { "name": "chapr_conflicts", "description": "List unreconciled conflicts under a path." },
     { "name": "chapr_resolve_conflict", "description": "Record how a conflict was reconciled, for the audit trail." }
   ]

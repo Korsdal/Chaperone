@@ -49,7 +49,14 @@ These are assertions, not preferences. Getting them backwards loses data.
    Everything from version-check to write-close happens under one held exclusive handle.
 5. **All coordination state is keyed by canonical path** (DFS-resolved, NFC, casefolded, UNC,
    normalized separators). Two users naming a file differently must map to the same lease.
-6. **Write path carries bytes; control channel carries metadata.** They never cross.
+6. **File bytes reach the model directly; coord sees bytes only for history.** The 200 MB PDF a
+   model reads never goes through coord — endpoint → share → model. But a write *does* send the
+   file's previous contents to coord, because that snapshot is what history and crash recovery are
+   made of (`PUT /blobs`). This invariant used to read "they never cross", which was false: the
+   rule was enforced on coord-facing *types* while the bytes travelled as a raw HTTP body, so the
+   channel was never sized and inherited axum's 2 MB default — silently capping writes to any file
+   already larger than that. The limit is now explicit (`http::MAX_BLOB_BYTES`, 256 MiB), and it
+   bounds coord's per-write memory because both ends buffer whole.
 
 Failure directions, likewise deliberate: coord unreachable on **write** → fail-closed (refuse);
 coord unreachable on **read** → degrade-open (serve with `integrity = "unverified"`). A torn file
@@ -92,7 +99,8 @@ authoritative.
 
 ## Build
 
-Requires Rust 1.75+.
+Requires Rust 1.85+ (`clap` and `clap_builder` declare 1.85, `axum-server` 1.82 — the tree does
+not build on the 1.75 this used to claim).
 
 ```sh
 cargo build --workspace

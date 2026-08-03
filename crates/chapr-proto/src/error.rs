@@ -182,6 +182,26 @@ pub enum ChaprError {
     #[error("invalid path {raw:?}: {reason}")]
     InvalidPath { raw: String, reason: String },
 
+    // ---- Committed-but-unrecorded ----------------------------------------
+    /// The bytes reached the share (write committed, handle closed) but coord
+    /// could not record it afterwards — the version-log or audit append failed.
+    /// The file's content **is** the new version; history and audit are missing
+    /// this entry, and no read receipt was recorded either.
+    ///
+    /// Distinct from [`Self::Internal`] on purpose: the caller must not retry
+    /// the write (that would conflict against its own committed bytes) and must
+    /// re-read before writing again. Reporting a bare failure here would tell
+    /// the caller the opposite of what happened.
+    #[error(
+        "write to {path} committed on disk as {version}, but recording it failed: {message}; \
+         the content is live — re-read the file before writing again"
+    )]
+    CommittedButUnrecorded {
+        path: CanonicalPath,
+        version: VersionToken,
+        message: String,
+    },
+
     // ---- Catch-alls -------------------------------------------------------
     /// An SMB/OS I/O error with no more specific variant above. Prefer a
     /// specific variant where one exists; this is the honest fallback, not a

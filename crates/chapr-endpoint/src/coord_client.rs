@@ -39,12 +39,39 @@ pub struct CoordClient {
     principal: Option<String>,
 }
 
+/// How long to wait for a TCP connect to coord before giving up.
+///
+/// Short on purpose: an unreachable coord should fail fast so a write fails
+/// closed and a read degrades open promptly.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Overall per-request ceiling.
+///
+/// Deliberately generous rather than snappy: `put_blob` sends a whole pre-image,
+/// which is now allowed up to coord's 256 MiB blob limit, and killing a
+/// legitimate large upload would be worse than the wedge this prevents. What it
+/// does buy is a bound — `reqwest::Client::new()` has NO timeout at all, and
+/// these calls run under `block_on` while the exclusive `FILE_SHARE_NONE` handle
+/// is held, so a coord that accepts the connection and then stalls used to wedge
+/// the file indefinitely for every other user, Excel and Explorer included.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl CoordClient {
     /// Bind to `base_url`. A trailing slash is trimmed so path joins are clean.
     pub fn new(base_url: impl Into<String>) -> Self {
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            // Only fails if the TLS backend cannot initialise, which would make
+            // every request fail anyway; fall back rather than poison `new`.
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "falling back to a default HTTP client with no timeouts");
+                Client::new()
+            });
         CoordClient {
             base: base_url.into().trim_end_matches('/').to_string(),
-            http: Client::new(),
+            http,
             principal: None,
         }
     }

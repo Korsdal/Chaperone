@@ -21,7 +21,10 @@ members = [
 [workspace.package]
 version = "0.1.0"          # baseline set by jok 2026-07-21; human owns version bumps (CLAUDE.md)
 edition = "2021"
-rust-version = "1.75"
+# 1.85, not 1.75: clap 4.6 and clap_builder declare rust-version 1.85 and
+# axum-server 0.7 declares 1.82, so a box provisioned for 1.75 cannot build this
+# tree. Verified against the locked versions in the registry cache.
+rust-version = "1.85"
 license = "UNLICENSED"
 publish = false
 
@@ -47,6 +50,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 unicode-normalization = "0.1"
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"
+# Binary content at the MCP boundary: a read of non-UTF-8 bytes is base64'd
+# rather than lossily transcoded, and a write can carry base64 back.
+base64 = "0.22"
+# Named directly by chapr-coord so it can pick a crypto provider explicitly. A
+# workspace build unifies rustls' `aws-lc-rs` (via axum-server) with `ring` (via
+# reqwest), and rustls then refuses to guess — see chapr-coord/src/main.rs.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

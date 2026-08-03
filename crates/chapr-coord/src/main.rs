@@ -135,6 +135,12 @@ pub(crate) async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Er
 
     match &cfg.tls {
         Some(tls) => {
+            // A workspace build compiles rustls with BOTH `aws-lc-rs` (via
+            // axum-server) and `ring` (via the endpoint's reqwest), and rustls
+            // then refuses to infer a process-level provider — `ServerConfig::
+            // builder()` inside from_pem_file panics. Pick one explicitly.
+            // Err means a provider is already installed, which is fine.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                 &tls.cert_path,
                 &tls.key_path,

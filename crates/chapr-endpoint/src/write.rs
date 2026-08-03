@@ -71,55 +71,58 @@ pub async fn write(
         })
         .await?;
 
-    // Steps 3–11: the §7 core, on a blocking thread. Coord's mid-handle calls
-    // use this runtime handle; the exclusive handle never leaves the thread.
-    let rt = Handle::current();
-    let coord2 = coord.clone();
-    let p2 = principal.clone();
-    let s2 = session_id.clone();
-    let args = WriteCasArgs {
-        path: path.clone(),
-        lease_id: lease.lease_id.clone(),
-        content,
-        base_version,
-        mode: mode.clone(),
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        let ctx = WriteCtx {
-            rt: &rt,
-            coord: &coord2,
-            principal: &p2,
-            session_id: &s2,
+    // Steps 3–11 live inside an inner async block so that every `?` exits the
+    // BLOCK rather than the function. `?` in a match arm returns from the
+    // enclosing fn, which is how the release below used to be skipped whenever
+    // the commit tail failed — leaving the lease held, and the renewer pushing
+    // its heartbeat to the 20-minute hard ceiling, on a file whose bytes were
+    // already committed. Every exit path now reaches step 13.
+    let resp: Result<WriteResponse, ChaprError> = async {
+        // Coord's mid-handle calls use this runtime handle; the exclusive handle
+        // never leaves the blocking thread.
+        let rt = Handle::current();
+        let coord2 = coord.clone();
+        let p2 = principal.clone();
+        let s2 = session_id.clone();
+        let args = WriteCasArgs {
+            path: path.clone(),
+            lease_id: lease.lease_id.clone(),
+            content,
+            base_version,
+            mode: mode.clone(),
         };
-        backend.write_cas(&ctx, &args)
-    })
-    .await
-    .map_err(|e| ChaprError::Internal {
-        message: format!("write task join failed: {e}"),
-    })?;
+        let receipt = tokio::task::spawn_blocking(move || {
+            let ctx = WriteCtx {
+                rt: &rt,
+                coord: &coord2,
+                principal: &p2,
+                session_id: &s2,
+            };
+            backend.write_cas(&ctx, &args)
+        })
+        .await
+        .map_err(|e| ChaprError::Internal {
+            message: format!("write task join failed: {e}"),
+        })??;
 
-    // Post-close tail (uniform across backends): commit the version log + audit
-    // from the receipt, then record the new version so the session can chain
-    // another write without re-reading (best-effort — §6.2). All strictly after
-    // the handle closed, so this runs as plain async.
-    let resp = match result {
-        Ok(receipt) => {
-            let v_new = receipt
-                .to_version
-                .clone()
-                .expect("a successful write produces a new version");
-            commit_tail(coord, principal, session_id, &path, &receipt, &v_new, &mode).await?;
-            let _ = coord
-                .record_read(&ReadReceipt {
-                    session_id: session_id.clone(),
-                    path: path.clone(),
-                    version: v_new.clone(),
-                })
-                .await;
-            Ok(WriteResponse { version: v_new })
-        }
-        Err(e) => Err(e),
-    };
+        // Post-close tail (uniform across backends): commit the version log +
+        // audit from the receipt, then record the new version so the session can
+        // chain another write without re-reading (best-effort — §6.2). All
+        // strictly after the handle closed, so this runs as plain async.
+        let v_new = receipt.to_version.clone().ok_or_else(|| ChaprError::Internal {
+            message: format!("backend bug: successful write receipt for {path} has no to_version"),
+        })?;
+        commit_tail(coord, principal, session_id, &path, &receipt, &v_new, &mode).await?;
+        let _ = coord
+            .record_read(&ReadReceipt {
+                session_id: session_id.clone(),
+                path: path.clone(),
+                version: v_new.clone(),
+            })
+            .await;
+        Ok(WriteResponse { version: v_new })
+    }
+    .await;
 
     // Step 13: stop renewing and release the lease regardless of outcome.
     let _ = leases.release(&lease.lease_id).await;
@@ -127,6 +130,16 @@ pub async fn write(
 }
 
 /// Step 11 (hoisted): append the version-log entry and audit the write commit.
+///
+/// By the time this runs the bytes are on the share and the handle is closed, so
+/// a failure here is **not** a failed write. Reporting one would be a lie in the
+/// worst direction: the caller re-writes and conflicts against its own committed
+/// bytes. Both calls are therefore wrapped in
+/// [`ChaprError::CommittedButUnrecorded`], which says what actually happened.
+///
+/// Deliberately no retry: neither call is idempotent, so retrying after a lost
+/// response double-appends the version log. The version *index* self-heals on the
+/// next read (mtime/size miss → re-hash → refresh); the caller's belief does not.
 async fn commit_tail(
     coord: &CoordClient,
     principal: &Principal,
@@ -136,6 +149,11 @@ async fn commit_tail(
     v_new: &VersionToken,
     mode: &WriteMode,
 ) -> Result<(), ChaprError> {
+    let committed = |e: ChaprError| ChaprError::CommittedButUnrecorded {
+        path: path.clone(),
+        version: v_new.clone(),
+        message: e.to_string(),
+    };
     coord
         .append_version_log(&AppendVersionLogRequest {
             path: path.clone(),
@@ -144,7 +162,8 @@ async fn commit_tail(
             size: receipt.size,
             event: VersionEvent::Write,
         })
-        .await?;
+        .await
+        .map_err(committed)?;
     let detail = match mode {
         WriteMode::Force { reason } => format!("forced write: {reason}"),
         WriteMode::Cas => "write".to_string(),
@@ -159,6 +178,7 @@ async fn commit_tail(
             to_version: Some(v_new.clone()),
             detail,
         })
-        .await?;
+        .await
+        .map_err(committed)?;
     Ok(())
 }

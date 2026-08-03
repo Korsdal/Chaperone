@@ -29,8 +29,8 @@
 
 use crate::state::AppState;
 use chapr_proto::{
-    AuditKind, CanonicalPath, ChaprError, JournalEntry, JournalState, LeaseId, Principal,
-    RecoveredFrom, SessionId, VersionToken,
+    CanonicalPath, ChaprError, JournalEntry, JournalState, LeaseId, Principal, RecoveredFrom,
+    SessionId, VersionToken,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
@@ -213,23 +213,40 @@ pub async fn recover(
         });
     }
 
+    // Clearing the entry and auditing the recovery are one atomic step. Done
+    // separately, a failure between them leaves the journal row already gone —
+    // so a retry hits the NotFound arm above and the recovery is both
+    // unrepeatable AND unaudited, on a trail that is a primary deliverable.
+    // The audit INSERT is hand-rolled to join the transaction, following the
+    // same precedent as `mv::move_paths`.
+    let mut tx = st.pool.begin().await.map_err(internal)?;
+
     sqlx::query("DELETE FROM journal WHERE path = ?1")
         .bind(path.as_str())
-        .execute(&st.pool)
+        .execute(&mut *tx)
         .await
         .map_err(internal)?;
 
-    crate::audit::record(
-        st,
-        principal,
-        session_id,
-        path,
-        AuditKind::CrashRecover,
-        Some(&pre_image),
-        None,
-        &format!("recovered pre-image after interrupted write by {interrupted_writer}"),
+    sqlx::query(
+        "INSERT INTO audit_log
+           (event_id, timestamp_ms, principal, session_id, canonical_path,
+            kind, from_version, to_version, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'crash_recover', ?6, NULL, ?7)",
     )
-    .await?;
+    .bind(format!("evt-{}", uuid::Uuid::new_v4()))
+    .bind(now_ms)
+    .bind(principal.as_str())
+    .bind(session_id.as_str())
+    .bind(path.as_str())
+    .bind(pre_image.as_str())
+    .bind(format!(
+        "recovered pre-image after interrupted write by {interrupted_writer}"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    tx.commit().await.map_err(internal)?;
 
     Ok(RecoveredFrom {
         version: pre_image,
@@ -249,7 +266,7 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::lease;
-    use chapr_proto::LeasePurpose;
+    use chapr_proto::{AuditKind, LeasePurpose};
 
     fn path() -> CanonicalPath {
         CanonicalPath::new_unchecked("\\\\srv\\share\\wip.md")
