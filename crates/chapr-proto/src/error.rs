@@ -1,0 +1,250 @@
+//! [`ChaprError`] — the exhaustive failure enum.
+//!
+//! This is the reason the project is in Rust (implementation notes §1): the
+//! failure modes this system is built around — CAS races, dangling journals,
+//! stale tokens, Office locks, retry storms — are exactly the class that
+//! `Result` + an exhaustive `match` force a caller to handle rather than
+//! forget. Every variant here corresponds to a named branch in the concept's
+//! state machines and failure table (§7, §8, §10).
+//!
+//! **When you add a failure mode to the system, add a variant here first.** A
+//! new failure that is not representable in this enum is a failure that some
+//! caller will handle by ignoring it.
+//!
+//! ## Wire form
+//!
+//! Internally tagged on a `code` field in `SCREAMING_SNAKE_CASE`, matching the
+//! concept's error names (`LEASE_HELD`, `CONFLICT`, …):
+//!
+//! ```json
+//! { "code": "LEASE_HELD", "holder": "CONTOSO\\jsmith", "paths": ["…"] }
+//! { "code": "CONFLICT", "current_version": "…", "sidecar_path": "…", … }
+//! { "code": "COORD_UNREACHABLE" }
+//! ```
+
+use crate::ids::{CanonicalPath, ConflictId, LeaseId, Principal};
+use crate::version::VersionToken;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Every way a `chapr.*` operation can fail. Serialisable so it travels the
+/// control channel intact, and `std::error::Error` via `thiserror` so it
+/// composes with `?` inside each binary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Error)]
+#[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChaprError {
+    // ---- Leases (concept §9) ---------------------------------------------
+    /// The requested lease (or one path of an all-or-none set) is held by
+    /// another principal. The agent backs off or asks the human (§7 step 2).
+    #[error("lease held by {holder} on {paths:?}")]
+    LeaseHeld {
+        holder: Principal,
+        /// The specific paths that were unavailable. For a set acquisition this
+        /// may be a subset of what was requested — the acquisition is still
+        /// all-or-none, so nothing was granted.
+        paths: Vec<CanonicalPath>,
+    },
+
+    /// A renew/release named a lease coord does not know (never granted, or
+    /// already reaped).
+    #[error("no such lease: {lease_id}")]
+    LeaseNotFound { lease_id: LeaseId },
+
+    /// The lease's heartbeat TTL elapsed before renewal. The write it covered
+    /// must be treated as failed and the file re-read before retrying (§15).
+    #[error("lease {lease_id} expired")]
+    LeaseExpired { lease_id: LeaseId },
+
+    /// The renewal thread failed to reach coord and marked held leases lost —
+    /// e.g. a laptop returning from sleep (§15). Distinct from `LeaseExpired`:
+    /// the endpoint noticed first, before coord reaped it.
+    #[error("lease {lease_id} lost (renewal failed)")]
+    LeaseLost { lease_id: LeaseId },
+
+    /// The lease hit its 20-minute hard lifetime ceiling and coord
+    /// force-expired it, defending against an agent stuck renewing forever
+    /// (§9). Re-acquisition requires a fresh read (new base version).
+    #[error("lease {lease_id} hit its hard lifetime ceiling at {hard_expiry}")]
+    MaxLeaseLifetimeExceeded {
+        lease_id: LeaseId,
+        hard_expiry: DateTime<Utc>,
+    },
+
+    // ---- The CAS / write core (concept §7) -------------------------------
+    /// CAS mismatch: the file changed since the agent read it. The agent's
+    /// bytes were written to `sidecar_path` and a conflict registered; neither
+    /// party's bytes are lost. The human reconciles (§7 step 6, §11).
+    #[error("write conflict on {sidecar_path}: file is now {current_version}, was last written by {last_writer}")]
+    Conflict {
+        /// The version found under the lock (`V_now`) — what the file actually
+        /// is now, not what the agent expected.
+        current_version: VersionToken,
+        last_writer: Principal,
+        /// When the file was last written.
+        when: DateTime<Utc>,
+        /// Where the losing agent's bytes were parked for reconciliation.
+        sidecar_path: CanonicalPath,
+    },
+
+    /// `base_version` was supplied but coord has no record of this session
+    /// having read it. Read-before-write is structurally enforced: the model
+    /// cannot fabricate a token it never saw (concept §6.2). Distinct from
+    /// `Conflict` — this is rejected *before* the write path even starts.
+    #[error("base_version for {path} was never read by this session")]
+    BaseVersionNotRecorded {
+        path: CanonicalPath,
+        provided: VersionToken,
+    },
+
+    /// A `write` arrived with no `base_version`. Required, not optional — a
+    /// model omits optional fields under pressure (concept §6.2).
+    #[error("write to {path} is missing the required base_version")]
+    BaseVersionRequired { path: CanonicalPath },
+
+    /// `mode = "force"` was requested without the mandatory `reason` string
+    /// (concept §6.2). Normally unrepresentable given [`crate::enums::WriteMode`]
+    /// carries the reason, but kept for adapters that build the request from
+    /// looser input.
+    #[error("force write to {path} requires a reason")]
+    ForceRequiresReason { path: CanonicalPath },
+
+    // ---- SMB / OS-level (concept §7 steps 3–4) ---------------------------
+    /// An Office lock file (`~$F`) is present. The write is refused — humans
+    /// always win; leases are advisory with respect to Excel (§7 step 3, §10).
+    #[error("{path} is open in Office (lock file {lock_file} present)")]
+    OfficeLockPresent {
+        path: CanonicalPath,
+        /// The `~$F` lock file that was detected.
+        lock_file: CanonicalPath,
+    },
+
+    /// The exclusive open (`share = NONE`) failed because another handle is
+    /// open — someone got there between the pre-flight and the open (§7 step 4).
+    /// The caller backs off and retries.
+    #[error("sharing violation opening {path} exclusively")]
+    SharingViolation { path: CanonicalPath },
+
+    // ---- Recovery (concept §8.1) -----------------------------------------
+    /// A dangling journal entry was found but the pre-image it points at is
+    /// missing from the history store, so recover-then-serve cannot complete.
+    /// A genuine data-integrity event, not an expected branch — surfaces to a
+    /// human.
+    #[error("cannot recover {path}: pre-image {missing_version} is gone from history")]
+    RecoveryFailed {
+        path: CanonicalPath,
+        missing_version: VersionToken,
+    },
+
+    // ---- Availability (concept §10) --------------------------------------
+    /// The control channel to coord is unreachable. On a **write** this is
+    /// terminal and fail-closed: no journal entry, no write (§7, §10). On a
+    /// read the endpoint degrades open instead and never raises this.
+    #[error("coordination service unreachable")]
+    CoordUnreachable,
+
+    /// Bounded retries against repeated BUSY/`LEASE_HELD` were exhausted. This
+    /// is the terminal "ask the human" state and is part of the tool contract —
+    /// it exists because an LLM will otherwise retry forever (§10).
+    #[error("retry budget exhausted for {path} after {attempts} attempts — ask the human")]
+    RetryBudgetExhausted { path: CanonicalPath, attempts: u32 },
+
+    // ---- Lookup / existence ----------------------------------------------
+    /// The path does not exist on the share.
+    #[error("not found: {path}")]
+    NotFound { path: CanonicalPath },
+
+    /// A `create` targeted a path that already exists.
+    #[error("already exists: {path}")]
+    AlreadyExists { path: CanonicalPath },
+
+    /// The user's own Kerberos'd open was denied by the file's ACL. Content
+    /// access stays safe precisely because this can happen (concept §13.1) —
+    /// coord never reads bytes on the user's behalf.
+    #[error("permission denied: {path}")]
+    PermissionDenied { path: CanonicalPath },
+
+    /// `history`/`restore` named a version not in the file's version log.
+    #[error("version {version} not found for {path}")]
+    VersionNotFound {
+        path: CanonicalPath,
+        version: VersionToken,
+    },
+
+    /// `resolve_conflict` named an unknown conflict id.
+    #[error("no such conflict: {conflict_id}")]
+    ConflictNotFound { conflict_id: ConflictId },
+
+    // ---- Malformed input --------------------------------------------------
+    /// A supplied path could not be canonicalised (concept §5.1). Carries the
+    /// raw input and why it failed. Never let an un-canonicalised path key
+    /// coordination state (invariant 5).
+    #[error("invalid path {raw:?}: {reason}")]
+    InvalidPath { raw: String, reason: String },
+
+    // ---- Catch-alls -------------------------------------------------------
+    /// An SMB/OS I/O error with no more specific variant above. Prefer a
+    /// specific variant where one exists; this is the honest fallback, not a
+    /// dumping ground.
+    #[error("I/O error on {path}: {message}")]
+    Io { path: CanonicalPath, message: String },
+
+    /// An unexpected internal error inside coord or the endpoint. Indicates a
+    /// bug, not an expected failure branch.
+    #[error("internal error: {message}")]
+    Internal { message: String },
+}
+
+/// Convenience alias for fallible `chapr.*` operations.
+pub type Result<T> = std::result::Result<T, ChaprError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tagged_by_screaming_snake_code() {
+        let e = ChaprError::CoordUnreachable;
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"code":"COORD_UNREACHABLE"}"#
+        );
+    }
+
+    #[test]
+    fn conflict_round_trips_with_all_fields() {
+        let e = ChaprError::Conflict {
+            current_version: VersionToken::hash(b"now"),
+            last_writer: Principal::new_unchecked("CONTOSO\\bthomas"),
+            when: DateTime::parse_from_rfc3339("2026-07-21T09:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            sidecar_path: CanonicalPath::new_unchecked(
+                "\\\\srv\\share\\q3.xlsx.conflict-jsmith-20260721.xlsx",
+            ),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""code":"CONFLICT""#));
+        let back: ChaprError = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn lease_held_carries_holder_and_paths() {
+        let e = ChaprError::LeaseHeld {
+            holder: Principal::new_unchecked("CONTOSO\\bthomas"),
+            paths: vec![CanonicalPath::new_unchecked("\\\\srv\\share\\a.md")],
+        };
+        let back: ChaprError = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn display_messages_are_human_readable() {
+        let e = ChaprError::RetryBudgetExhausted {
+            path: CanonicalPath::new_unchecked("\\\\srv\\share\\a.md"),
+            attempts: 5,
+        };
+        assert!(e.to_string().contains("ask the human"));
+    }
+}

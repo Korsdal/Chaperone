@@ -1,0 +1,61 @@
+# Chaperone — Cargo workspace root.
+#
+# Filesystem coordination for concurrent Claude Desktop agent sessions against a
+# single on-prem SMB fileserver. See CLAUDE.md and `init spec/` for the settled
+# architecture.
+#
+# Build order (implementation notes §3–4): chapr-proto -> chapr-coord -> chapr-endpoint.
+# Only chapr-proto exists today (backlog E-001). chapr-coord (E-002) and
+# chapr-endpoint (E-005) join this member list when they are built.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/chapr-proto",
+    "crates/chapr-coord",       # E-002 — axum + sqlx coordination service
+    "crates/chapr-endpoint",    # E-005 — coord client + canonicaliser (rmcp/windows-rs later slices)
+]
+
+# Shared package metadata. Every crate inherits these with `x.workspace = true`
+# so version/edition/license are defined once and cannot drift between binaries.
+[workspace.package]
+version = "0.1.0"          # baseline set by jok 2026-07-21; human owns version bumps (CLAUDE.md)
+edition = "2021"
+rust-version = "1.75"
+license = "UNLICENSED"
+publish = false
+
+# Single source of truth for dependency versions across all three crates.
+# Members reference these with `dep.workspace = true`, so chapr-coord and
+# chapr-endpoint cannot pull a different serde/blake3 than chapr-proto.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+# Added for chapr-coord (E-002). tokio is shared with chapr-endpoint (E-005).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.8"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Added for chapr-endpoint (E-005). `rustls-tls` (E-016) lets it reach an HTTPS
+# coord; Negotiate/Kerberos on top is still deferred (E-015).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+unicode-normalization = "0.1"
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+# The endpoint ships as a single static binary to managed laptops (notes §7).
+# Optimise for size/robustness over raw speed — this system is network-bound.
+opt-level = 2
+lto = "thin"

@@ -1,0 +1,27 @@
+# chapr-proto — the shared wire contract.
+#
+# Defines the Chaperone data model (§5.2), the chapr.* request/response types
+# (§6), and the exhaustive error enum. Both chapr-coord and chapr-endpoint
+# depend on this crate, so if either side drifts from the contract, it fails to
+# compile. Build this crate FIRST (implementation notes §4).
+#
+# No platform-specific dependencies live here. Path canonicalisation (§5.1)
+# needs Win32 and therefore belongs in chapr-endpoint, not in this crate — this
+# crate only carries the already-canonical value as a typed newtype.
+
+[package]
+name = "chapr-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

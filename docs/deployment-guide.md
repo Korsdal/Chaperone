@@ -1,0 +1,66 @@
+# Chaperone — deployment guide (generic)
+
+How to stand Chaperone up at a customer. This is the reusable playbook; a concrete
+per-customer instantiation (binaries filled in, one OS, one coord) lives in that
+customer's own deployable repo.
+
+## The shape
+
+Two artifacts, N-to-1:
+
+- **Coordinator** — one per environment, on-prem beside the fileserver. A single
+  binary (`chapr-coord`) + SQLite + a blob store. Owns leases, version index,
+  journal, history, conflicts, audit. Does **no** file I/O.
+- **Endpoints** — one MCPB per laptop, a stdio child of Claude Desktop. Does file
+  I/O as the logged-in user; owns the write path, CAS, read state machine.
+
+File **bytes** go endpoint → fileserver directly; **metadata** goes endpoint ↔
+coord over HTTP. They never cross.
+
+## Prerequisites
+- A shared fileserver: **SMB** (Windows) or **POSIX** (Linux/NFS).
+- A host for the coordinator that can reach the share's network and that laptops
+  can reach over HTTP(S).
+- Claude Desktop on each laptop.
+- To build: the Rust toolchain (`cargo`) and, to pack MCPBs, Node + `@anthropic-ai/mcpb`.
+
+## Step 1 — Coordinator
+1. Build: `cargo build --release -p chapr-coord`.
+2. Configure + install as a service — see [`../packaging/coord/service-install.md`](../packaging/coord/service-install.md)
+   (`chapr-coord setup`). Start from [`../packaging/coord/config.template.toml`](../packaging/coord/config.template.toml).
+3. Choose the **backend** coord announces (`smb`/`posix`) and the **auth** mode
+   (`trusted-header` for the MVP — zero end-user setup; `negotiate`/`oidc` to
+   harden later, E-015).
+4. Verify: `GET /healthz` → `ok`.
+
+## Step 2 — Endpoints (MCPB)
+1. Build one bundle **per client OS** — see [`../packaging/mcpb/README.md`](../packaging/mcpb/README.md).
+   Identity is auto-derived from the OS logon, so the only user-config field is the
+   coordinator URL.
+2. Distribute the `.mcpb`. Users install it in Claude Desktop
+   (Settings → Extensions) and enter the coordinator URL once.
+3. On first connect the endpoint reads coord's backend announcement, confirms it
+   against its own capabilities, and selects the matching backend.
+
+## Step 3 — Verify end to end
+- From a laptop: `chapr.read` a file on the share → returns content + a version.
+- `chapr.write` it back with that version → succeeds; a stale write → CONFLICT +
+  sidecar (bytes never lost).
+- `chapr.history` shows the version log; the coord audit trail attributes each
+  action to the acting user.
+
+## Operations
+- **Availability:** coord availability == write availability. Run it as a service,
+  monitor `/healthz`.
+- **Backup:** the SQLite DB **and** the blob store, together (audit + history).
+- **Storage:** history retention defaults (90 d / last-10 / 50 GB) are tunable;
+  validate against real write volume after a pilot.
+
+## Per-customer checklist
+- [ ] Backend type (SMB / POSIX) → coord `backend`
+- [ ] Coord host + address + persistent DB/blob volumes
+- [ ] Auth mode (MVP `trusted-header` vs enforced)
+- [ ] Client OS(es) → which MCPB bundle(s) to build
+- [ ] Coordinator URL baked into the bundle default / comms to users
+- [ ] TLS? (set `[tls]`)
+- [ ] Backup + monitoring wired

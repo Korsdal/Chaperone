@@ -1,0 +1,53 @@
+{
+  "//": "Chaperone endpoint — MCPB manifest TEMPLATE. Copy per customer/OS and fill the {{PLACEHOLDERS}}. See ./README.md. Spec: https://github.com/modelcontextprotocol/mcpb (MANIFEST.md). Run `mcpb validate` after editing; if it flags manifest_version, set it to the value your installed CLI reports.",
+  "manifest_version": "0.3",
+  "name": "{{BUNDLE_NAME}}",
+  "display_name": "{{DISPLAY_NAME}}",
+  "version": "{{VERSION}}",
+  "description": "Coordinated access to a shared network drive for concurrent Claude agent sessions — versioned reads/writes, leases, history, and an attributable audit trail.",
+  "author": {
+    "name": "{{AUTHOR}}"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "server/chapr-endpoint{{EXE_SUFFIX}}",
+    "mcp_config": {
+      "command": "${__dirname}/server/chapr-endpoint{{EXE_SUFFIX}}",
+      "args": [],
+      "env": {
+        "CHAPR_COORD_URL": "${user_config.coord_url}",
+        "RUST_LOG": "${user_config.log_level}"
+      }
+    }
+  },
+  "user_config": {
+    "coord_url": {
+      "type": "string",
+      "title": "Coordinator URL",
+      "description": "The address of the Chaperone coordinator (from your IT administrator, or your own coordinator setup). If you weren't given one, reach out before continuing. Example: http://coord-host:8787 (https:// if TLS is enabled). NOTE to packager: you MAY add a `default` here set to the REAL coordinator URL to pre-fill it for non-technical users — but never leave it as localhost.",
+      "required": true
+    },
+    "log_level": {
+      "type": "string",
+      "title": "Log level",
+      "description": "Endpoint log verbosity: error | warn | info | debug. Logs go to stderr, never the MCP channel.",
+      "required": false,
+      "default": "info"
+    }
+  },
+  "compatibility": {
+    "platforms": ["{{PLATFORM}}"]
+  },
+  "tools": [
+    { "name": "chapr_read", "description": "Read a file with coordinated versioning (content returned as untrusted data)." },
+    { "name": "chapr_write", "description": "Write a file with compare-and-swap; losing writes are parked in a sidecar." },
+    { "name": "chapr_create", "description": "Create a new file (fails if it exists)." },
+    { "name": "chapr_delete", "description": "Soft-delete a file (snapshotted to history first)." },
+    { "name": "chapr_move", "description": "Move/rename a file; version history moves with it." },
+    { "name": "chapr_list", "description": "List a directory with open-conflict counts." },
+    { "name": "chapr_stat", "description": "Get a file's version, journal state, and any held lease." },
+    { "name": "chapr_history", "description": "Show a file's version history." },
+    { "name": "chapr_conflicts", "description": "List unreconciled conflicts under a path." },
+    { "name": "chapr_resolve_conflict", "description": "Record how a conflict was reconciled, for the audit trail." }
+  ]
+}

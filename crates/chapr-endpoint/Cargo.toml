@@ -1,0 +1,43 @@
+# chapr-endpoint — the local MCP server (one per sales laptop).
+#
+# stdio child of Claude Desktop; does SMB I/O as the logged-in user and owns the
+# exclusive-open write path, CAS, read state machine, and lease-renewal thread.
+# Built LAST (implementation notes §4), once the protocol and coord are proven.
+#
+# E-005 slice 1 (foundation): this crate is a *library* for now — the coord HTTP
+# client and the path canonicaliser, both fully testable without Win32 or MCP.
+# The rmcp stdio server (the `[[bin]]`), the windows-rs write path, and the
+# lease-renewal thread land in later slices.
+
+[package]
+name = "chapr-endpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chapr-proto = { path = "../chapr-proto" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+unicode-normalization.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+# POSIX backend (E-019): portable advisory file locks. Advisory on Unix (flock),
+# mandatory on Windows (LockFileEx) — see the D-C caveat.
+fs4 = "1.1"
+# SMB backend: CreateFileW/MoveFileExW/ReadDirectoryChangesW. Windows-only, so
+# gated — the POSIX backend keeps the crate buildable on Linux (E-019 D-C).
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+# Mock coord for exercising the HTTP client without a live server.
+wiremock = "0.6"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,0 +1,58 @@
+# chapr-coord — the coordination service (E-002 slice).
+#
+# Exactly one instance runs on-prem beside the fileserver. It owns all
+# coordination metadata (concept §4.2). This crate has NO Windows primitives —
+# it is a stateful HTTP service over SQLite, which is why it is built before the
+# Windows-native endpoint (implementation notes §4).
+#
+# E-002 scope: the lease table only — `lease_acquire` (all-or-none, canonical
+# order) and `lease_release`, persisted to SQLite, behind one coarse lock. No
+# renewal (E-003), no journal (E-004), no version index yet.
+
+[package]
+name = "chapr-coord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "chapr-coord"
+path = "src/main.rs"
+
+[dependencies]
+chapr-proto = { path = "../chapr-proto" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+axum.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# E-016 installer + TLS.
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+toml = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# Windows-only deps, cfg-gated so coord's core stays platform-agnostic (builds on
+# any OS without the change-watcher or the Windows Service integration).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+] }
+# E-016: native Windows Service (SCM) integration.
+windows-service = "0.7"
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the router in-process for HTTP round-trip tests
+# without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+# Throwaway blob-store directories for history tests.
+tempfile = "3"

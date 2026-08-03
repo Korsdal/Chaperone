@@ -1,0 +1,45 @@
+# Chaperone coordinator — configuration TEMPLATE.
+# Precedence: built-in defaults < this file < environment (CHAPR_COORD_*).
+# Generate interactively with `chapr-coord setup`, or copy + edit this file and
+# run `chapr-coord serve --config coord.toml`.
+
+# SQLite database (operational state: leases, index, journal, conflicts, audit).
+# Put it on a persistent, backed-up volume.
+db_url = "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc"
+
+# Listen address. Bind to the interface endpoints reach; 127.0.0.1 for loopback,
+# 0.0.0.0 for a LAN-reachable service.
+addr = "0.0.0.0:8787"
+
+# Content-addressed history/blob store. A SEPARATE mount from the DB is
+# recommended (it grows with write volume). Back both up together.
+blob_root = "C:/ProgramData/Chaperone/blobs"
+
+# Control-channel auth (the pluggable Authenticator boundary):
+#   trusted-header  MVP: endpoint asserts the logged-in OS identity (accountability,
+#                   not spoof-proof — concept §13.1). The recommended default.
+#   disabled        no auth — loopback/dev only.
+#   negotiate|oidc  enforced hardening paths (deferred, E-015).
+auth = "trusted-header"
+
+# The fileserver backend coord ANNOUNCES to endpoints (they confirm it locally).
+# smb | posix.
+backend = "smb"
+
+# Background job intervals (seconds). Defaults are fine for ~20 users.
+reap_secs = 30      # lease reaper
+gc_secs   = 86400   # blob GC (daily)
+
+# --- Optional: change-watcher (invalidates the cache on out-of-band edits) ---
+# watch_dir  = "\\\\fileserver\\share"     # local/UNC path to watch
+# share_unc  = "\\\\fileserver\\share"     # canonical UNC prefix for mapping
+
+# --- Optional: TLS (serve HTTPS on the control channel) ---
+# [tls]
+# cert_path = "C:/ProgramData/Chaperone/tls/coord.crt"
+# key_path  = "C:/ProgramData/Chaperone/tls/coord.key"
+
+# --- Optional: mixed-backend routing (longest-prefix wins; else `backend`) ---
+# [[backend_routes]]
+# prefix = "\\\\fileserver\\share\\cloud"
+# kind   = "posix"

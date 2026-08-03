@@ -1,0 +1,20 @@
+# Normalize line endings in the repo (always LF stored), regardless of each
+# contributor's core.autocrlf. Without this, a checkout on a machine configured
+# differently produces whole-file phantom diffs. This workspace builds on both
+# Windows and Linux, so make it deterministic rather than machine-dependent.
+* text=auto
+
+# PowerShell is happiest with CRLF on disk.
+*.ps1 text eol=crlf
+
+# Keep these LF on disk even on Windows — they are read by tooling, not shells.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+
+# Binary — never touch, never diff.
+*.mcpb binary
+*.exe  binary
+*.pdf  binary
+*.png  binary

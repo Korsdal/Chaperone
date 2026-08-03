@@ -1,0 +1,39 @@
+# Rust / Cargo
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock IS committed — this workspace ships binaries (chapr-coord,
+# chapr-endpoint), so the lockfile is tracked for reproducible builds
+# (Rust guidance for applications).
+
+# Coordinator runtime artifacts (in case coord is run with default paths in-repo).
+chapr-blobs/
+*.db
+*.db-*
+
+# MCPB bundle staging + packed deliverable. build-mcpb.ps1 defaults to
+# -OutDir ./build and copies target/release/chapr-endpoint.exe into it.
+build/
+*.mcpb
+
+# Scratch working dir.
+scratchpad/
+
+# Local editor/OS cruft.
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.log
+
+# --- Internal development tooling — kept LOCAL, never published. -------------
+# The code is the product; these are private working docs / agent tooling.
+# (gitignore does not delete them — they remain on disk for local use.)
+CLAUDE.md
+LOGBOOK.md
+.claude/
+docs/init spec/
+docs/status.html
