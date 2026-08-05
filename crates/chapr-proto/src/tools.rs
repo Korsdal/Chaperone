@@ -18,10 +18,27 @@
 //!
 //! ## Invariant 6 (bytes vs metadata)
 //!
-//! [`ReadResponse`]/[`WriteRequest`] carry file bytes, but only over the
-//! endpoint↔model stdio channel — never over the control channel. The heavy
-//! 200 MB PDF flows endpoint → SMB → model; it never touches coord. Do not add
-//! a byte-carrying field to any coord-facing type in this module.
+//! [`ReadResponse`]/[`WriteRequest`] carry file bytes over the endpoint↔model
+//! stdio channel. The heavy 200 MB PDF a model *reads* flows endpoint → SMB →
+//! model and never touches coord.
+//!
+//! Coord does see bytes, in exactly one direction and for exactly one purpose:
+//! every write ships the file's **previous** contents to the history store as a
+//! pre-image (`PUT /blobs`), because that snapshot is what history and crash
+//! recovery are made of. That channel is bounded by `chapr_coord::http::
+//! MAX_BLOB_BYTES` (256 MiB), which is also the largest file that can be written
+//! at all — a write whose pre-image will not fit is refused up front by
+//! `chapr_endpoint::backend::MAX_PRE_IMAGE_BYTES`.
+//!
+//! **Do not add a byte-carrying field to any coord-facing type in this module,
+//! and do not add a byte-carrying coord *route* either.** This used to say only
+//! the first half, and the gap was load-bearing: `PUT /blobs` sends its bytes as
+//! a raw `application/octet-stream` body rather than as a type defined here, so
+//! it never tripped the rule as written. Nobody sized that channel, it inherited
+//! axum's 2 MB `DefaultBodyLimit`, and every write to a file already larger than
+//! 2 MB failed — on the *pre-image*, which is why the ceiling looked unrelated to
+//! the content being written and went undiagnosed until the pilot-readiness pass.
+//! An invariant enforced on type shape alone does not hold; state the channel too.
 
 use crate::enums::{
     AuditKind, ConflictResolution, Integrity, JournalState, LeasePurpose, RestoreMode,
