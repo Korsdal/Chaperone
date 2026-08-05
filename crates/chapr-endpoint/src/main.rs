@@ -8,6 +8,10 @@
 //!   announcement is only cross-checked, never overrides this.
 //! - `CHAPR_PRINCIPAL` — optional override of the identity; normally the acting
 //!   principal is derived automatically from the OS logon (E-023, D-024).
+//! - `CHAPR_MAX_INLINE_BYTES` — cap on the rendered body of one `chapr_read`.
+//!   Default [`chapr_endpoint::server::DEFAULT_MAX_INLINE_BYTES`] (128 KiB). This
+//!   bounds what a model can round-trip, not what the share can hold: binary
+//!   files come back base64, and a body the model cannot emit back is useless.
 //! - `RUST_LOG`        — tracing filter. Default `info`.
 
 use chapr_endpoint::backend::{default_backend_kind, make_backend};
@@ -48,7 +52,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Present our identity to coord (dev auth boundary; real deployments use
     // Negotiate/Kerberos on the transport instead of this header — I-001/I-002).
     let coord = CoordClient::new(&coord_url).with_principal(principal.as_str());
-    let server = ChaprServer::new(coord, backend, principal, session_id);
+    let mut server = ChaprServer::new(coord, backend, principal, session_id);
+    if let Some(cap) = std::env::var("CHAPR_MAX_INLINE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        tracing::info!(max_inline_bytes = cap, "inline read cap overridden");
+        server = server.with_max_inline_bytes(cap);
+    }
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;

@@ -41,7 +41,30 @@ Write-Host "==> Compiling chapr-endpoint (release) in $ChaperoneRoot"
 & $cargo build --release -p chapr-endpoint --manifest-path (Join-Path $ChaperoneRoot "Cargo.toml")
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
-$exe = Join-Path $ChaperoneRoot "target/release/chapr-endpoint.exe"
+# Ask cargo where it actually put the binary instead of assuming ./target.
+# The README tells you to set CARGO_TARGET_DIR when building alongside another
+# checkout — and with it set, a hardcoded ./target/release either does not exist
+# or, worse, still holds an OLD binary from a build before you set it. That path
+# ships a stale endpoint to a customer and nothing catches it.
+$targetDir = $null
+try {
+  $meta = & $cargo metadata --format-version 1 --no-deps `
+    --manifest-path (Join-Path $ChaperoneRoot "Cargo.toml") | ConvertFrom-Json
+  $targetDir = $meta.target_directory
+} catch {
+  Write-Warning "cargo metadata failed ($_); falling back to CARGO_TARGET_DIR / ./target"
+}
+if (-not $targetDir) {
+  $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $ChaperoneRoot "target" }
+}
+Write-Host "==> Target directory: $targetDir"
+
+# Freshness needs no check of its own: cargo build ran immediately above, and
+# cargo rebuilds whenever the binary is older than its sources. The only real
+# staleness risk was reading a DIFFERENT directory than cargo wrote to, which the
+# metadata lookup above removes. (Verified empirically: back-dating the exe just
+# makes cargo relink it.)
+$exe = Join-Path $targetDir "release/chapr-endpoint.exe"
 if (-not (Test-Path $exe)) { throw "release binary not found at $exe" }
 
 $server = Join-Path $OutDir "server"
@@ -52,14 +75,20 @@ Write-Host "==> Assembled bundle at $OutDir"
 
 if ($Pack) {
   Write-Host "==> Validating + packing with @anthropic-ai/mcpb"
+  # Check the exit code: validate's failure used to be ignored, so an invalid
+  # manifest was packed and shipped anyway, failing at install time on the
+  # user's laptop instead of here.
   npx --yes @anthropic-ai/mcpb validate (Join-Path $OutDir "manifest.json")
+  if ($LASTEXITCODE -ne 0) { throw "mcpb validate failed - not packing" }
   if ($Output) {
     npx --yes @anthropic-ai/mcpb pack $OutDir $Output
+    if ($LASTEXITCODE -ne 0) { throw "mcpb pack failed" }
     Write-Host "==> Packed -> $Output"
   } else {
     npx --yes @anthropic-ai/mcpb pack $OutDir
+    if ($LASTEXITCODE -ne 0) { throw "mcpb pack failed" }
   }
-  Write-Host "==> Install the .mcpb via Claude Desktop → Settings → Extensions."
+  Write-Host "==> Install the .mcpb via Claude Desktop -> Settings -> Extensions."
 } else {
   Write-Host "==> Next: mcpb pack `"$OutDir`" <output.mcpb>   (install: npm i -g @anthropic-ai/mcpb)"
 }

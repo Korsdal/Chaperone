@@ -37,6 +37,9 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
 toml = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Named directly only so we can install a crypto provider explicitly at bring-up;
+# axum-server already pulls rustls itself. See the install_default() call in main.rs.
+rustls.workspace = true
 
 # Windows-only deps, cfg-gated so coord's core stays platform-agnostic (builds on
 # any OS without the change-watcher or the Windows Service integration).

@@ -71,9 +71,23 @@ impl LeaseManager {
     }
 
     /// Stop renewing and release via coord.
+    ///
+    /// Local removal first is deliberate: the renewer must never resurrect a
+    /// lease the endpoint has decided to drop. If coord's DELETE then fails the
+    /// lease simply lapses at the 90 s heartbeat TTL, which is the safe
+    /// direction — but every caller discards this `Result` (a release failure
+    /// must not turn a completed write into an error), so log it here or the
+    /// failure is invisible everywhere.
     pub async fn release(&self, lease_id: &LeaseId) -> Result<(), ChaprError> {
         self.held.lock().await.remove(lease_id);
-        self.coord.lease_release(lease_id).await
+        let result = self.coord.lease_release(lease_id).await;
+        if let Err(e) = &result {
+            tracing::warn!(
+                lease = %lease_id, error = %e,
+                "lease release failed; it will lapse at the heartbeat TTL"
+            );
+        }
+        result
     }
 
     /// Whether the lease is still tracked and not marked lost.

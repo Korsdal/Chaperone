@@ -47,58 +47,68 @@ pub async fn create(
         })
         .await?;
 
-    let rt = Handle::current();
-    let (coord2, p2, s2, path2) = (coord.clone(), principal.clone(), session_id.clone(), path.clone());
-    let result = tokio::task::spawn_blocking(move || {
-        let ctx = WriteCtx {
-            rt: &rt,
-            coord: &coord2,
-            principal: &p2,
-            session_id: &s2,
-        };
-        backend.create(&ctx, &path2, &content)
-    })
-    .await
-    .map_err(join_err)?;
+    // Inner async block so every `?` exits the block, not the function — see the
+    // note in `write::write`. Without it, a failing tail skipped the release
+    // below and held the path for the full 20-minute hard lease lifetime.
+    let resp: Result<CreateResponse, ChaprError> = async {
+        let rt = Handle::current();
+        let (coord2, p2, s2, path2) =
+            (coord.clone(), principal.clone(), session_id.clone(), path.clone());
+        let receipt = tokio::task::spawn_blocking(move || {
+            let ctx = WriteCtx {
+                rt: &rt,
+                coord: &coord2,
+                principal: &p2,
+                session_id: &s2,
+            };
+            backend.create(&ctx, &path2, &content)
+        })
+        .await
+        .map_err(join_err)??;
 
-    let resp = match result {
-        Ok(receipt) => {
-            let version = receipt
-                .to_version
-                .clone()
-                .expect("create produces a new version");
-            coord
-                .append_version_log(&AppendVersionLogRequest {
-                    path: path.clone(),
-                    blob_hash: version.clone(),
-                    writer_principal: principal.clone(),
-                    size: receipt.size,
-                    event: VersionEvent::Create,
-                })
-                .await?;
-            coord
-                .record_audit(&RecordAuditRequest {
-                    principal: principal.clone(),
-                    session_id: session_id.clone(),
-                    path: path.clone(),
-                    kind: AuditKind::WriteCommit,
-                    from_version: None,
-                    to_version: Some(version.clone()),
-                    detail: "create".to_string(),
-                })
-                .await?;
-            // Record the new version so the session can immediately write to it (§6.2).
-            let _ = coord
-                .record_read(&ReadReceipt {
-                    session_id: session_id.clone(),
-                    path: path.clone(),
-                    version: version.clone(),
-                })
-                .await;
-            Ok(CreateResponse { version })
-        }
-        Err(e) => Err(e),
-    };
+        let version = receipt.to_version.clone().ok_or_else(|| ChaprError::Internal {
+            message: format!("backend bug: successful create receipt for {path} has no to_version"),
+        })?;
+        // The file exists on the share from here on, so a tail failure is
+        // committed-but-unrecorded, not a failed create.
+        let committed = |e: ChaprError| ChaprError::CommittedButUnrecorded {
+            path: path.clone(),
+            version: version.clone(),
+            message: e.to_string(),
+        };
+        coord
+            .append_version_log(&AppendVersionLogRequest {
+                path: path.clone(),
+                blob_hash: version.clone(),
+                writer_principal: principal.clone(),
+                size: receipt.size,
+                event: VersionEvent::Create,
+            })
+            .await
+            .map_err(&committed)?;
+        coord
+            .record_audit(&RecordAuditRequest {
+                principal: principal.clone(),
+                session_id: session_id.clone(),
+                path: path.clone(),
+                kind: AuditKind::WriteCommit,
+                from_version: None,
+                to_version: Some(version.clone()),
+                detail: "create".to_string(),
+            })
+            .await
+            .map_err(&committed)?;
+        // Record the new version so the session can immediately write to it (§6.2).
+        let _ = coord
+            .record_read(&ReadReceipt {
+                session_id: session_id.clone(),
+                path: path.clone(),
+                version: version.clone(),
+            })
+            .await;
+        Ok(CreateResponse { version })
+    }
+    .await;
     let _ = leases.release(&lease.lease_id).await;
     resp
 }
@@ -134,55 +144,63 @@ pub async fn delete(
         })
         .await?;
 
-    let rt = Handle::current();
-    let (coord2, p2, s2) = (coord.clone(), principal.clone(), session_id.clone());
-    let args = DeleteCasArgs {
-        path: path.clone(),
-        lease_id: lease.lease_id.clone(),
-        base_version,
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        let ctx = WriteCtx {
-            rt: &rt,
-            coord: &coord2,
-            principal: &p2,
-            session_id: &s2,
+    // Inner async block: see the note in `write::write`. This verb is the sharpest
+    // case — by the time the tail runs the file is already GONE from the share, so
+    // a tail failure that also leaked the lease left the path both deleted and
+    // locked, while telling the caller the delete failed.
+    let resp: Result<DeleteResponse, ChaprError> = async {
+        let rt = Handle::current();
+        let (coord2, p2, s2) = (coord.clone(), principal.clone(), session_id.clone());
+        let args = DeleteCasArgs {
+            path: path.clone(),
+            lease_id: lease.lease_id.clone(),
+            base_version,
         };
-        backend.delete_cas(&ctx, &args)
-    })
-    .await
-    .map_err(join_err)?;
+        let receipt = tokio::task::spawn_blocking(move || {
+            let ctx = WriteCtx {
+                rt: &rt,
+                coord: &coord2,
+                principal: &p2,
+                session_id: &s2,
+            };
+            backend.delete_cas(&ctx, &args)
+        })
+        .await
+        .map_err(join_err)??;
 
-    let resp = match result {
-        Ok(receipt) => {
-            let deleted = receipt
-                .from_version
-                .clone()
-                .expect("delete has a pre-image version");
-            coord
-                .append_version_log(&AppendVersionLogRequest {
-                    path: path.clone(),
-                    blob_hash: deleted.clone(),
-                    writer_principal: principal.clone(),
-                    size: receipt.size,
-                    event: VersionEvent::Delete,
-                })
-                .await?;
-            coord
-                .record_audit(&RecordAuditRequest {
-                    principal: principal.clone(),
-                    session_id: session_id.clone(),
-                    path: path.clone(),
-                    kind: AuditKind::WriteCommit,
-                    from_version: Some(deleted),
-                    to_version: None,
-                    detail: "soft delete".to_string(),
-                })
-                .await?;
-            Ok(DeleteResponse {})
-        }
-        Err(e) => Err(e),
-    };
+        let deleted = receipt.from_version.clone().ok_or_else(|| ChaprError::Internal {
+            message: format!("backend bug: successful delete receipt for {path} has no from_version"),
+        })?;
+        let committed = |e: ChaprError| ChaprError::CommittedButUnrecorded {
+            path: path.clone(),
+            version: deleted.clone(),
+            message: e.to_string(),
+        };
+        coord
+            .append_version_log(&AppendVersionLogRequest {
+                path: path.clone(),
+                blob_hash: deleted.clone(),
+                writer_principal: principal.clone(),
+                size: receipt.size,
+                event: VersionEvent::Delete,
+            })
+            .await
+            .map_err(&committed)?;
+        coord
+            .record_audit(&RecordAuditRequest {
+                principal: principal.clone(),
+                session_id: session_id.clone(),
+                path: path.clone(),
+                kind: AuditKind::WriteCommit,
+                from_version: Some(deleted.clone()),
+                to_version: None,
+                detail: "soft delete".to_string(),
+            })
+            .await
+            .map_err(&committed)?;
+        Ok(DeleteResponse {})
+    }
+    .await;
     let _ = leases.release(&lease.lease_id).await;
     resp
 }
@@ -266,55 +284,62 @@ pub async fn restore(
                     paths: vec![path.clone()],
                 })
                 .await?;
-            let rt = Handle::current();
-            let (coord2, p2, s2) = (coord.clone(), principal.clone(), session_id.clone());
-            let args = RestoreInPlaceArgs {
-                path: path.clone(),
-                lease_id: lease.lease_id.clone(),
-                bytes,
-                version: version.clone(),
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                let ctx = WriteCtx {
-                    rt: &rt,
-                    coord: &coord2,
-                    principal: &p2,
-                    session_id: &s2,
+            // Inner async block: see the note in `write::write`.
+            let resp: Result<RestoreResponse, ChaprError> = async {
+                let rt = Handle::current();
+                let (coord2, p2, s2) = (coord.clone(), principal.clone(), session_id.clone());
+                let args = RestoreInPlaceArgs {
+                    path: path.clone(),
+                    lease_id: lease.lease_id.clone(),
+                    bytes,
+                    version: version.clone(),
                 };
-                backend.restore_in_place(&ctx, &args)
-            })
-            .await
-            .map_err(join_err)?;
+                let receipt = tokio::task::spawn_blocking(move || {
+                    let ctx = WriteCtx {
+                        rt: &rt,
+                        coord: &coord2,
+                        principal: &p2,
+                        session_id: &s2,
+                    };
+                    backend.restore_in_place(&ctx, &args)
+                })
+                .await
+                .map_err(join_err)??;
 
-            let resp = match result {
-                Ok(receipt) => {
-                    coord
-                        .append_version_log(&AppendVersionLogRequest {
-                            path: path.clone(),
-                            blob_hash: version.clone(),
-                            writer_principal: principal.clone(),
-                            size: receipt.size,
-                            event: VersionEvent::Restore,
-                        })
-                        .await?;
-                    coord
-                        .record_audit(&RecordAuditRequest {
-                            principal: principal.clone(),
-                            session_id: session_id.clone(),
-                            path: path.clone(),
-                            kind: AuditKind::Restore,
-                            from_version: receipt.from_version.clone(),
-                            to_version: Some(version.clone()),
-                            detail: "restore in_place".to_string(),
-                        })
-                        .await?;
-                    Ok(RestoreResponse {
-                        restored_path: None,
-                        version: version.clone(),
+                // The old bytes are live on the share from here on.
+                let committed = |e: ChaprError| ChaprError::CommittedButUnrecorded {
+                    path: path.clone(),
+                    version: version.clone(),
+                    message: e.to_string(),
+                };
+                coord
+                    .append_version_log(&AppendVersionLogRequest {
+                        path: path.clone(),
+                        blob_hash: version.clone(),
+                        writer_principal: principal.clone(),
+                        size: receipt.size,
+                        event: VersionEvent::Restore,
                     })
-                }
-                Err(e) => Err(e),
-            };
+                    .await
+                    .map_err(&committed)?;
+                coord
+                    .record_audit(&RecordAuditRequest {
+                        principal: principal.clone(),
+                        session_id: session_id.clone(),
+                        path: path.clone(),
+                        kind: AuditKind::Restore,
+                        from_version: receipt.from_version.clone(),
+                        to_version: Some(version.clone()),
+                        detail: "restore in_place".to_string(),
+                    })
+                    .await
+                    .map_err(&committed)?;
+                Ok(RestoreResponse {
+                    restored_path: None,
+                    version: version.clone(),
+                })
+            }
+            .await;
             let _ = leases.release(&lease.lease_id).await;
             resp
         }

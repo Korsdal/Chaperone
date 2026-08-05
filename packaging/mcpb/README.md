@@ -57,6 +57,11 @@ public directory — expected, not an error.
   coordinator URL to pre-fill it — never localhost.
 - `manifest_version` is set to `0.3` (the value in the upstream MANIFEST.md
   example, and it passes `mcpb validate`). If a newer CLI reports otherwise, bump it.
+- **No comment keys in the manifest.** The template used to carry a `"//"` note and
+  `mcpb validate` (CLI 2.1.2) rejects it outright: `Unrecognized key(s) in object:
+  '//'`. The schema is closed, so any explanatory key fails validation — keep notes
+  here in the README instead. `build-mcpb.ps1` now checks `validate`'s exit code, so
+  this fails at build time rather than shipping a bundle that breaks on install.
 - The binary is **not** committed here — it is compiled at build time from the
   Chaperone workspace, so the bundle always matches a known source build.
 - A concrete instantiation for one customer lives in that customer's own deployable repo

@@ -29,6 +29,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
+# Binary content at the MCP boundary — a read of non-UTF-8 bytes comes back
+# base64 rather than lossily transcoded through from_utf8_lossy.
+base64.workspace = true
+# Uniqueness suffix on conflict-sidecar / restore-copy names: a second-granular
+# timestamp alone collides when two conflicts land in the same second.
+uuid.workspace = true
 # POSIX backend (E-019): portable advisory file locks. Advisory on Unix (flock),
 # mandatory on Windows (LockFileEx) — see the D-C caveat.
 fs4 = "1.1"
@@ -41,3 +47,7 @@ windows.workspace = true
 # Mock coord for exercising the HTTP client without a live server.
 wiremock = "0.6"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Real files under a throwaway dir, so the MCP round-trip tests drive the actual
+# POSIX backend (exclusive open, CAS re-hash, in-place overwrite) rather than a
+# mock that would skip exactly the code the corruption bug lived next to.
+tempfile = "3"

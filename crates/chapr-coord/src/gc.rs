@@ -11,6 +11,20 @@
 //! beyond-floor pre-images. A global `ceiling_bytes` valve then evicts the
 //! oldest still-kept-by-age (never floor) blobs until under the ceiling.
 //!
+//! Two additions guard the reference set against the fact that a blob is stored
+//! *before* the row that references it exists:
+//!
+//! - **In-flight pre-images.** `journal.pre_image_version` names the last
+//!   known-good bytes of a write that is still open. Nothing in the version log
+//!   references it yet, so a plain orphan sweep would delete exactly the blob
+//!   crash recovery needs — turning a recoverable torn write into
+//!   `RecoveryFailed`. The journal is therefore part of the keep-set.
+//! - **A write grace period.** `PUT /blobs` and `POST /version-log` are separate
+//!   round-trips, so every write has a window where its blob is on disk with no
+//!   row anywhere. Blobs whose file mtime is inside `write_grace` are kept
+//!   regardless, which closes that window without needing a distributed
+//!   transaction.
+//!
 //! Crucially this GCs **bytes only** — version-log *metadata* is untouched
 //! (kept for audit retention), so "who changed this and when" stays answerable
 //! long after the old bytes are gone; restoring a GC'd version fails cleanly
@@ -37,6 +51,9 @@ pub struct GcConfig {
     pub retention_days: i64,
     pub per_file_floor: usize,
     pub ceiling_bytes: u64,
+    /// Blobs written this recently are never evicted, whatever the reference set
+    /// says. Covers the gap between `PUT /blobs` and `POST /version-log`.
+    pub write_grace: std::time::Duration,
 }
 
 impl Default for GcConfig {
@@ -45,6 +62,9 @@ impl Default for GcConfig {
             retention_days: 90,
             per_file_floor: 10,
             ceiling_bytes: 50 * 1024 * 1024 * 1024,
+            // Generous relative to the milliseconds a commit tail actually takes;
+            // the cost of being wrong here is destroying a recovery pre-image.
+            write_grace: std::time::Duration::from_secs(3600),
         }
     }
 }
@@ -55,6 +75,9 @@ pub struct GcReport {
     pub blobs_kept: u64,
     pub blobs_evicted: u64,
     pub bytes_freed: u64,
+    /// Blobs the sweep wanted to evict but could not delete. Reported rather
+    /// than aborting the sweep; they are retried on the next tick.
+    pub evict_failures: u64,
 }
 
 /// Run one GC sweep.
@@ -89,7 +112,19 @@ pub async fn sweep(st: &AppState, cfg: &GcConfig) -> Result<GcReport, ChaprError
     .map(|r| r.get::<String, _>("blob_hash"))
     .collect();
 
+    // In-flight pre-images: a write that is still open has a journal row naming
+    // the last known-good bytes, and NO version-log row referencing them yet.
+    // These are the blobs crash recovery reads, so they are never evictable.
+    let in_flight: HashSet<String> = sqlx::query("SELECT pre_image_version FROM journal")
+        .fetch_all(&st.pool)
+        .await
+        .map_err(db)?
+        .into_iter()
+        .map(|r| r.get::<String, _>("pre_image_version"))
+        .collect();
+
     let mut keep: HashSet<String> = floor.union(&within_age).cloned().collect();
+    keep.extend(in_flight.iter().cloned());
 
     // Ceiling valve: if the kept set still exceeds the ceiling, evict the oldest
     // age-only (non-floor) blobs until under. Never evict floor blobs.
@@ -103,7 +138,13 @@ pub async fn sweep(st: &AppState, cfg: &GcConfig) -> Result<GcReport, ChaprError
         let ages = blob_newest_ts(st).await?;
         let mut evictable: Vec<&Blob> = blobs
             .iter()
-            .filter(|b| keep.contains(&b.hash) && !floor.contains(&b.hash))
+            // Never the floor, and never an in-flight pre-image — the ceiling is
+            // a storage guard, not a licence to break crash recovery.
+            .filter(|b| {
+                keep.contains(&b.hash)
+                    && !floor.contains(&b.hash)
+                    && !in_flight.contains(&b.hash)
+            })
             .collect();
         // Oldest first.
         evictable.sort_by_key(|b| ages.get(&b.hash).copied().unwrap_or(i64::MAX));
@@ -118,15 +159,36 @@ pub async fn sweep(st: &AppState, cfg: &GcConfig) -> Result<GcReport, ChaprError
         tracing::warn!(ceiling = cfg.ceiling_bytes, kept_bytes, "blob store over ceiling — evicting oldest beyond floor");
     }
 
-    // Sweep: delete every blob file not in the keep set.
+    // Sweep: delete every blob file not in the keep set, except ones written so
+    // recently that their referencing row may still be in flight.
+    let now = std::time::SystemTime::now();
     let mut report = GcReport::default();
     for b in &blobs {
         if keep.contains(&b.hash) {
             report.blobs_kept += 1;
-        } else {
-            fs::remove_file(&b.path).await.map_err(io)?;
-            report.blobs_evicted += 1;
-            report.bytes_freed += b.size;
+            continue;
+        }
+        let within_grace = b
+            .modified
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age < cfg.write_grace);
+        if within_grace {
+            report.blobs_kept += 1;
+            continue;
+        }
+        // One un-deletable blob (a concurrent read holding a handle on Windows,
+        // a permissions oddity) must not abort the rest of the sweep and discard
+        // the whole report.
+        match fs::remove_file(&b.path).await {
+            Ok(()) => {
+                report.blobs_evicted += 1;
+                report.bytes_freed += b.size;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                report.evict_failures += 1;
+                tracing::warn!(blob = %b.hash, error = %e, "blob eviction failed; will retry next sweep");
+            }
         }
     }
     Ok(report)
@@ -154,6 +216,9 @@ struct Blob {
     hash: String,
     path: PathBuf,
     size: u64,
+    /// File mtime, for the write-grace check. `None` if the platform or
+    /// filesystem would not report one — treated as "old" so it stays evictable.
+    modified: Option<std::time::SystemTime>,
 }
 
 /// The newest version-log timestamp per blob hash (for ceiling ordering).
@@ -187,9 +252,11 @@ async fn list_blobs(root: &std::path::Path) -> Result<Vec<Blob>, ChaprError> {
             let mut files = fs::read_dir(b.path()).await.map_err(io)?;
             while let Some(f) = files.next_entry().await.map_err(io)? {
                 if f.file_type().await.map_err(io)?.is_file() {
+                    let meta = f.metadata().await.map_err(io)?;
                     out.push(Blob {
                         hash: f.file_name().to_string_lossy().into_owned(),
-                        size: f.metadata().await.map_err(io)?.len(),
+                        size: meta.len(),
+                        modified: meta.modified().ok(),
                         path: f.path(),
                     });
                 }
@@ -226,6 +293,18 @@ mod tests {
         Principal::new_unchecked("CONTOSO\\demo")
     }
 
+    /// Test blobs are written milliseconds ago, so the real write-grace would
+    /// keep every one of them. Eviction tests opt out of it explicitly; the
+    /// grace itself is covered by `write_grace_protects_a_fresh_orphan`.
+    fn cfg(retention_days: i64, per_file_floor: usize, ceiling_bytes: u64) -> GcConfig {
+        GcConfig {
+            retention_days,
+            per_file_floor,
+            ceiling_bytes,
+            write_grace: std::time::Duration::ZERO,
+        }
+    }
+
     /// Store a blob and record a version-log entry for it at `age_days` old.
     async fn seed(st: &AppState, content: &[u8], age_days: i64) -> VersionToken {
         let stored = history::put_blob(&st.blob_root, content).await.unwrap();
@@ -258,7 +337,7 @@ mod tests {
         // A recent blob (1d).
         let recent = seed(&st, b"recent-content", 1).await;
 
-        let cfg = GcConfig { retention_days: 90, per_file_floor: 1, ceiling_bytes: u64::MAX };
+        let cfg = cfg(90, 1, u64::MAX);
         let report = sweep(&st, &cfg).await.unwrap();
 
         // floor=1 keeps the newest (recent); old is beyond floor AND past 90d → evicted.
@@ -274,7 +353,7 @@ mod tests {
         let recent_old_position = seed(&st, b"c1", 5).await; // recent, but will be beyond floor=1
         let newest = seed(&st, b"c2", 1).await;
 
-        let cfg = GcConfig { retention_days: 90, per_file_floor: 1, ceiling_bytes: u64::MAX };
+        let cfg = cfg(90, 1, u64::MAX);
         sweep(&st, &cfg).await.unwrap();
         // Both within 90d → both kept, even though only one is within the floor.
         assert!(exists(&st, &recent_old_position).await);
@@ -282,14 +361,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphan_blob_is_evicted() {
+    async fn orphan_blob_is_evicted_once_past_the_write_grace() {
         let tmp = tempfile::tempdir().unwrap();
         let st = st_with_blobs(&tmp, db::test_pool().await);
-        // A blob with no version-log row at all.
+        // A blob with no version-log row and no journal row: genuine garbage.
         let orphan = history::put_blob(&st.blob_root, b"orphan").await.unwrap().version;
-        let report = sweep(&st, &GcConfig::default()).await.unwrap();
+        let report = sweep(&st, &cfg(90, 10, u64::MAX)).await.unwrap();
         assert!(!exists(&st, &orphan).await);
         assert_eq!(report.blobs_evicted, 1);
+    }
+
+    #[tokio::test]
+    async fn write_grace_protects_a_fresh_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = st_with_blobs(&tmp, db::test_pool().await);
+        // Same blob as above, but swept with the real default grace: it was just
+        // written, so its `POST /version-log` may still be in flight.
+        let fresh = history::put_blob(&st.blob_root, b"just-written").await.unwrap().version;
+        let report = sweep(&st, &GcConfig::default()).await.unwrap();
+        assert!(exists(&st, &fresh).await, "a blob written seconds ago must survive");
+        assert_eq!(report.blobs_evicted, 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_journal_pre_image_is_never_evicted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = st_with_blobs(&tmp, db::test_pool().await);
+        // The pre-image of an open write: on disk, referenced only by `journal`.
+        // Evicting this turns a recoverable torn write into RecoveryFailed.
+        let pre = history::put_blob(&st.blob_root, b"pre-image").await.unwrap().version;
+        sqlx::query(
+            "INSERT INTO journal (path, lease_id, principal, pre_image_version, intended_version, opened_at_ms)
+             VALUES (?1, 'lease-x', ?2, ?3, NULL, ?4)",
+        )
+        .bind(path().as_str())
+        .bind(who().as_str())
+        .bind(pre.as_str())
+        .bind(Utc::now().timestamp_millis())
+        .execute(&st.pool)
+        .await
+        .unwrap();
+
+        // Zero grace and a retention window that would otherwise evict it.
+        let report = sweep(&st, &cfg(0, 0, u64::MAX)).await.unwrap();
+        assert!(exists(&st, &pre).await, "journal pre-image kept");
+        assert_eq!(report.blobs_evicted, 0);
     }
 
     #[tokio::test]
@@ -304,7 +420,7 @@ mod tests {
 
         // Ceiling 15 bytes: floor keeps newest (10); 5 bytes of headroom < the
         // next blob, so both older age-kept blobs get evicted.
-        let cfg = GcConfig { retention_days: 90, per_file_floor: 1, ceiling_bytes: 15 };
+        let cfg = cfg(90, 1, 15);
         sweep(&st, &cfg).await.unwrap();
 
         assert!(exists(&st, &newest).await, "floor always kept");
