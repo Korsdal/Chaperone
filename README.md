@@ -50,13 +50,14 @@ These are assertions, not preferences. Getting them backwards loses data.
 5. **All coordination state is keyed by canonical path** (DFS-resolved, NFC, casefolded, UNC,
    normalized separators). Two users naming a file differently must map to the same lease.
 6. **File bytes reach the model directly; coord sees bytes only for history.** The 200 MB PDF a
-   model reads never goes through coord — endpoint → share → model. But a write *does* send the
-   file's previous contents to coord, because that snapshot is what history and crash recovery are
-   made of (`PUT /blobs`). This invariant used to read "they never cross", which was false: the
-   rule was enforced on coord-facing *types* while the bytes travelled as a raw HTTP body, so the
-   channel was never sized and inherited axum's 2 MB default — silently capping writes to any file
-   already larger than that. The limit is now explicit (`http::MAX_BLOB_BYTES`, 256 MiB), and it
-   bounds coord's per-write memory because both ends buffer whole.
+   model reads never goes through coord — endpoint → share → model. A write *does* send the file's
+   previous contents to coord (`PUT /blobs`), because that pre-image snapshot is what history and
+   crash recovery are made of. That is the only byte flow on the control channel, it is one
+   direction, and it is bounded explicitly by `http::MAX_BLOB_BYTES` (256 MiB). Both ends buffer
+   whole, so that bound is also coord's per-in-flight-write memory cost — and the largest file
+   Chaperone can write at all, since a write whose pre-image will not fit is refused up front.
+   The bound is stated on the *route* as well as on the types: an invariant enforced on type shape
+   alone let an unsized raw-body channel exist unnoticed.
 
 Failure directions, likewise deliberate: coord unreachable on **write** → fail-closed (refuse);
 coord unreachable on **read** → degrade-open (serve with `integrity = "unverified"`). A torn file
@@ -68,6 +69,29 @@ The write path is the one place where a subtle mistake costs someone their data.
 the most boring, linear, synchronous-looking code in the repo, and should stay that way. Writes are
 in-place, never temp-then-rename — a rename carries the source ACL and strips the target's ACEs.
 Crash safety comes from the journal plus the snapshot, not from an atomic rename.
+
+### Read limits, and what a model can write back
+
+Two independent limits, deliberately not one number:
+
+- **`DEFAULT_MAX_INLINE_BYTES`** (512 KiB, override with `CHAPR_MAX_INLINE_BYTES`) is a *context*
+  limit — how much of a file usefully enters the model's input window. Over it, the read is refused
+  rather than truncated: a silently shortened body written back destroys the file's tail.
+- **`WRITEBACK_BUDGET_BYTES`** (128 KiB) is what a model can realistically echo back through
+  `chapr_write` in one call. It refuses nothing; it reports `writable_inline=` in the envelope
+  header, so a body too large to write back is still served for analysis while the model is told
+  in-band to put its output in a separate, smaller file.
+
+Collapsing these into a single cap makes reads as restrictive as writes, which is backwards here:
+the share is read-heavy over large materials and writes go into smaller, *different* derived
+artifacts.
+
+**Binary content is returned as base64, not extracted.** A non-UTF-8 file (xlsx, docx, pdf) comes
+back base64-encoded with `encoding=base64` in the envelope, so byte-exact round-trips are safe — but
+there is no text extraction, and a compressed PDF is not analysable in that form at any size. Reading
+tender PDFs *as documents* is therefore not something `chapr_read` delivers today; `ReadContent::Ref`
+is defined in the proto for this and is not yet produced anywhere. Chaperone coordinates the files;
+getting a PDF's text in front of a model is a separate, open problem.
 
 ## Layout
 
@@ -137,7 +161,9 @@ Known remaining work: real Kerberos/Negotiate on the control channel (needs a do
 against), DFS and drive-letter→UNC canonicalisation before real-SMB rollout, and validating SMB
 mandatory-lock semantics on an actual fileserver — the one thing a dev environment can't stand in
 for. MCPB signing is broken upstream, so the MVP ships unsigned; accountability rests on the audit
-trail.
+trail. Delivering a large PDF's *content* to a model is unsolved (see "Read limits" above): the
+bytes arrive base64, which is not analysable — either an `EmbeddedResource` content block or
+`ReadContent::Ref` needs to become real, or PDF reading stays outside the tool surface.
 
 ### Scope
 
