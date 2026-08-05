@@ -9,9 +9,11 @@
 //! - `CHAPR_PRINCIPAL` — optional override of the identity; normally the acting
 //!   principal is derived automatically from the OS logon (E-023, D-024).
 //! - `CHAPR_MAX_INLINE_BYTES` — cap on the rendered body of one `chapr_read`.
-//!   Default [`chapr_endpoint::server::DEFAULT_MAX_INLINE_BYTES`] (128 KiB). This
-//!   bounds what a model can round-trip, not what the share can hold: binary
-//!   files come back base64, and a body the model cannot emit back is useless.
+//!   Default [`chapr_endpoint::server::DEFAULT_MAX_INLINE_BYTES`] (512 KiB). A
+//!   *context* limit — how much of a file can usefully enter the model's input
+//!   window — not a round-trip limit. What a model can write back is the separate
+//!   [`chapr_endpoint::server::WRITEBACK_BUDGET_BYTES`], reported per read as
+//!   `writable_inline` in the envelope header rather than refusing the read.
 //! - `RUST_LOG`        — tracing filter. Default `info`.
 
 use chapr_endpoint::backend::{default_backend_kind, make_backend};

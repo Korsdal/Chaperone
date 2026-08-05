@@ -28,14 +28,37 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 
 /// Default cap on the rendered inline body of a `chapr_read`, in bytes.
 ///
-/// 128 KiB is not a storage limit — it is a *round-trippability* limit. Base64
-/// tokenizes at roughly 3 chars/token, so 128 KiB of binary renders to ~175 KB of
-/// text ≈ 58k tokens, which is about the most a model can emit back in one
-/// `chapr_write` given typical output budgets. A larger cap would hand back files
-/// the model can read but never write, which is a worse failure than a clear
-/// refusal. Genuinely large files need `ReadContent::Ref` (defined in the proto,
-/// not yet produced anywhere).
-pub const DEFAULT_MAX_INLINE_BYTES: usize = 128 * 1024;
+/// A **context** limit: how much of a file can usefully enter the model's input
+/// window at once. Text runs ~4 chars/token, so 512 KiB is roughly 130k tokens —
+/// enough for essentially any text tender, proposal or spreadsheet export on the
+/// share, and still a fraction of a large context.
+///
+/// Deliberately *not* the write-back budget. These are two independent limits and
+/// collapsing them into one number made reads as restrictive as writes, which is
+/// backwards for this workload: the share is read-heavy over large materials, and
+/// writes go into smaller, *different* derived artifacts (concept §2). Sizing the
+/// read cap to what a model can *emit* refused a 400 KB tender that was perfectly
+/// analyzable. A body too large to echo back is still worth reading; the envelope
+/// says so via `writable_inline=false` instead of refusing.
+///
+/// Override per endpoint with `CHAPR_MAX_INLINE_BYTES`. Genuinely huge files need
+/// `ReadContent::Ref` (defined in the proto, not yet produced anywhere).
+pub const DEFAULT_MAX_INLINE_BYTES: usize = 512 * 1024;
+
+/// The largest rendered body a model can realistically pass back through
+/// `chapr_write` in one call.
+///
+/// Base64 tokenizes at roughly 3 chars/token, so 128 KiB of rendered body is
+/// ~58k tokens — about the ceiling of a typical output budget. Past this the
+/// model truncates the echo itself, and a truncated body written back destroys
+/// the file's tail. That is the corruption this number exists to prevent, and it
+/// is the reasoning behind the original single cap — kept, but applied where it
+/// belongs.
+///
+/// Unlike [`DEFAULT_MAX_INLINE_BYTES`] this refuses nothing. It sets
+/// `writable_inline` in the envelope header so the model is told in-band that it
+/// may analyze the file but must not attempt to write it back whole.
+pub const WRITEBACK_BUDGET_BYTES: usize = 128 * 1024;
 
 /// The Chaperone MCP server for one endpoint session.
 #[derive(Clone)]
@@ -587,7 +610,8 @@ fn render_envelope(resp: &ReadResponse, max_inline_bytes: usize) -> Result<Strin
         ),
     };
     // Refuse rather than truncate: a silently shortened body that the model then
-    // writes back would destroy the tail of the file.
+    // writes back would destroy the tail of the file. This is the *context* cap —
+    // the separate write-back budget below annotates rather than refuses.
     if body.len() > max_inline_bytes {
         return Err(McpError::invalid_params(
             format!(
@@ -599,13 +623,16 @@ fn render_envelope(resp: &ReadResponse, max_inline_bytes: usize) -> Result<Strin
             None,
         ));
     }
+    // Readable but not necessarily writable-back. Stated in the header so the
+    // model learns the limit in-band rather than by truncating its own echo.
+    let writable_inline = body.len() <= WRITEBACK_BUDGET_BYTES;
     let version = resp
         .version
         .as_ref()
         .map(|v| v.to_string())
         .unwrap_or_else(|| "<unverified>".to_string());
     let mut header = format!(
-        "integrity={:?} version={version} encoding={encoding}",
+        "integrity={:?} version={version} encoding={encoding} writable_inline={writable_inline}",
         resp.integrity
     );
     if let Some(rf) = &resp.recovered_from {
@@ -617,11 +644,23 @@ fn render_envelope(resp: &ReadResponse, max_inline_bytes: usize) -> Result<Strin
     if let Some(n) = resp.open_conflicts {
         header.push_str(&format!(" open_conflicts={n}"));
     }
-    let binary_note = if encoding == "base64" {
-        "\nThe body is base64-encoded binary (RFC 4648). To write this file back, pass the body \
-         UNCHANGED to chapr_write with encoding \"base64\" — do not decode, reformat, or edit it."
-    } else {
-        ""
+    let binary_note = match (encoding, writable_inline) {
+        ("base64", true) => {
+            "\nThe body is base64-encoded binary (RFC 4648). To write this file back, pass the \
+             body UNCHANGED to chapr_write with encoding \"base64\" — do not decode, reformat, \
+             or edit it."
+        }
+        ("base64", false) => {
+            "\nThe body is base64-encoded binary (RFC 4648), and writable_inline=false: it is \
+             too large to pass back through chapr_write in one call. Read and analyze it, but do \
+             NOT attempt to write this file back — a partially echoed body would destroy it."
+        }
+        (_, false) => {
+            "\nwritable_inline=false: this body is too large to pass back through chapr_write in \
+             one call. Read and analyze it, but do NOT rewrite the whole file — a truncated body \
+             would destroy its tail. Write your output to a separate, smaller file instead."
+        }
+        _ => "",
     };
     Ok(format!(
         "<untrusted-shared-drive-data {header}>\n\
@@ -773,6 +812,16 @@ mod tests {
         head.split_whitespace()
             .find_map(|kv| kv.strip_prefix("version=").map(|v| v.to_string()))
             .expect("envelope header must carry version=")
+    }
+
+    fn envelope_writable_inline(s: &str) -> bool {
+        let head = s.lines().next().unwrap();
+        head.split_whitespace()
+            .find_map(|kv| {
+                kv.strip_prefix("writable_inline=")
+                    .map(|v| v.trim_end_matches('>') == "true")
+            })
+            .expect("envelope header must carry writable_inline=")
     }
 
     /// **The test that would have caught the corruption.**
@@ -941,6 +990,91 @@ mod tests {
         );
     }
 
+    /// The same mistake, but with the base64 **re-wrapped across lines** — which
+    /// is what a model actually does with a long payload.
+    ///
+    /// This is the gap the original guard left open: it compared `content.len()`
+    /// to the exact padded base64 length, so any inserted newline made the length
+    /// check fail, the guard was skipped, and the wrapped transcript was written
+    /// as text with CAS approving it. Same silent binary corruption the guard
+    /// exists to stop, reachable by the more likely spelling of the mistake.
+    #[tokio::test]
+    async fn wrapped_base64_written_back_as_text_is_refused() {
+        let coord = permissive_coord().await;
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut original = vec![0x50, 0x4b, 0x03, 0x04];
+        original.extend((0u8..=255).rev());
+        original.extend((0u8..=255).cycle().take(600));
+        let file = dir.path().join("wrapped.xlsx");
+        std::fs::write(&file, &original).unwrap();
+        let uri = file.to_string_lossy().to_string();
+
+        let read_out = tool_text(
+            &srv.chapr_read(Parameters(ReadArgs { uri: uri.clone() }))
+                .await
+                .expect("read"),
+        );
+        assert_eq!(envelope_encoding(&read_out), "base64");
+
+        // Re-wrap at 76 chars, the classic MIME width a model reaches for.
+        let body = envelope_body(&read_out);
+        let wrapped = body
+            .as_bytes()
+            .chunks(76)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(wrapped.len(), body.len(), "fixture must actually be wrapped");
+
+        let err = srv
+            .chapr_write(Parameters(WriteArgs {
+                uri,
+                content: wrapped,
+                encoding: ContentEncoding::Utf8,
+                base_version: envelope_version(&read_out),
+                force_reason: None,
+            }))
+            .await
+            .expect_err("a wrapped base64 transcript written as text must be refused");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("base64"), "the error must name the fix: {msg}");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            original,
+            "the file must be untouched"
+        );
+    }
+
+    /// Wrapping must not make a *legitimate* text write look like a transcript.
+    #[tokio::test]
+    async fn ordinary_text_write_still_succeeds_after_the_guard_change() {
+        let coord = permissive_coord().await;
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, b"# gamle noter\n").unwrap();
+        let uri = file.to_string_lossy().to_string();
+
+        let read_out = tool_text(
+            &srv.chapr_read(Parameters(ReadArgs { uri: uri.clone() }))
+                .await
+                .expect("read"),
+        );
+        let new = "# nye noter\n\nmed flere linjer\nog en pris: 1.000 kr\n";
+        srv.chapr_write(Parameters(WriteArgs {
+            uri,
+            content: new.to_string(),
+            encoding: ContentEncoding::Utf8,
+            base_version: envelope_version(&read_out),
+            force_reason: None,
+        }))
+        .await
+        .expect("an ordinary text write must not trip the transcript guard");
+        assert_eq!(std::fs::read(&file).unwrap(), new.as_bytes());
+    }
+
     /// A stale `base_version` must be refused and the file left alone, driven
     /// through the tool surface rather than the library.
     #[tokio::test]
@@ -1066,6 +1200,68 @@ mod tests {
         let parts: Vec<&str> = out.split("\n---\n").collect();
         let decoded = decode_content(parts[1].to_string(), ContentEncoding::Utf8).unwrap();
         assert_eq!(decoded, raw, "non-ASCII text must survive unchanged");
+    }
+
+    /// **The regression this branch exists to fix.**
+    ///
+    /// A 400 KB text tender is well within any usable context and is exactly the
+    /// material this tool is for, but it exceeded the old 128 KiB cap — which was
+    /// sized to the model's *output* budget — and was refused outright. It must
+    /// now be served, and flagged as not writable back in one call.
+    #[test]
+    fn large_text_reads_are_served_and_flagged_unwritable() {
+        let raw = "Tilbud — sektion\n".repeat(25_000); // ~425 KB of real text
+        assert!(raw.len() > WRITEBACK_BUDGET_BYTES, "fixture must exceed the write-back budget");
+        assert!(raw.len() < DEFAULT_MAX_INLINE_BYTES, "fixture must fit the read cap");
+        let bytes = raw.into_bytes();
+        let resp = ReadResponse {
+            content: ReadContent::Inline { bytes: bytes.clone() },
+            version: Some(VersionToken::hash(&bytes)),
+            integrity: Integrity::Verified,
+            recovered_from: None,
+            open_conflicts: None,
+        };
+        let out = render_envelope(&resp, DEFAULT_MAX_INLINE_BYTES)
+            .expect("a 425 KB text file must be readable, not refused");
+        assert!(!envelope_writable_inline(&out), "too large to echo back");
+        // And the model is told what to do instead of rewriting the whole file.
+        assert!(out.contains("separate, smaller file"), "must steer the write elsewhere");
+    }
+
+    /// The other half of the split: a small body stays fully round-trippable, so
+    /// the ordinary edit-a-markdown-file workflow is unaffected.
+    #[test]
+    fn small_bodies_are_writable_inline() {
+        let bytes = b"# kort notat\n".to_vec();
+        let resp = ReadResponse {
+            content: ReadContent::Inline { bytes: bytes.clone() },
+            version: Some(VersionToken::hash(&bytes)),
+            integrity: Integrity::Verified,
+            recovered_from: None,
+            open_conflicts: None,
+        };
+        let out = render_envelope(&resp, DEFAULT_MAX_INLINE_BYTES).unwrap();
+        assert!(envelope_writable_inline(&out));
+    }
+
+    /// Binary over the write-back budget: still served (it may be worth reading),
+    /// but the note must forbid the round-trip rather than invite it.
+    #[test]
+    fn large_binary_is_served_but_the_round_trip_is_forbidden() {
+        let bytes: Vec<u8> = (0u8..=255).cycle().take(150 * 1024).collect();
+        assert!(std::str::from_utf8(&bytes).is_err(), "fixture must be non-UTF-8");
+        let resp = ReadResponse {
+            content: ReadContent::Inline { bytes: bytes.clone() },
+            version: Some(VersionToken::hash(&bytes)),
+            integrity: Integrity::Verified,
+            recovered_from: None,
+            open_conflicts: None,
+        };
+        let out = render_envelope(&resp, DEFAULT_MAX_INLINE_BYTES).unwrap();
+        assert_eq!(envelope_encoding(&out), "base64");
+        assert!(!envelope_writable_inline(&out));
+        assert!(out.contains("do NOT attempt to write this file back"));
+        assert!(!out.contains("UNCHANGED"), "must not invite a round-trip it cannot survive");
     }
 
     #[test]
