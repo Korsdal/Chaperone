@@ -226,6 +226,37 @@ pub trait Backend: FileSource + Send + Sync {
 // over the backend's FsPrimitives + PathGrammar (E-019 D-D).
 // ---------------------------------------------------------------------------
 
+/// Whether `content` is the base64 transcript of `current` — i.e. a caller read a
+/// binary file, received the base64 body, and wrote it straight back as TEXT
+/// without declaring `encoding: "base64"`.
+///
+/// **Whitespace-tolerant on purpose.** The original check compared
+/// `content.len()` to the exact padded base64 length, which a model re-wrapping
+/// the body across lines defeats — and models routinely wrap long payloads. The
+/// wrapped transcript then slipped past this guard and past CAS (whose
+/// `base_version` is a genuine hash of the genuine bytes) and replaced the file
+/// with its own base64 listing. `decode_content` already strips whitespace on the
+/// declared-base64 path; this is the same tolerance on the *undeclared* path.
+///
+/// Ordering is for cost, not correctness: stripping whitespace can only shrink
+/// `content`, so a short body cannot be a transcript and is rejected in O(1)
+/// before anything scans or allocates. A normal text write pays one length
+/// comparison.
+fn is_base64_transcript_of(content: &[u8], current: &[u8]) -> bool {
+    let expected = current.len().div_ceil(3) * 4;
+    if content.len() < expected || std::str::from_utf8(current).is_ok() {
+        return false;
+    }
+    let compact: Vec<u8> = content
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    compact.len() == expected
+        && base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &compact)
+            .is_ok_and(|decoded| decoded == current)
+}
+
 /// The contended §7 write core. One held exclusive handle from version-check
 /// (`read_all` → hash) to close (`overwrite` → drop), invariant 4: no reopen
 /// between them, and the snapshot + journal are durable before the overwrite.
@@ -280,12 +311,7 @@ fn write_cas_core<P: FsPrimitives>(
     //
     // The signature is unambiguous: the incoming bytes are valid base64 whose
     // decoding is byte-for-byte the file's current contents. No caller means that.
-    // Length is checked first so this costs nothing on a normal write.
-    if content.len() == current.len().div_ceil(3) * 4
-        && std::str::from_utf8(&current).is_err()
-        && base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)
-            .is_ok_and(|decoded| decoded == current)
-    {
+    if is_base64_transcript_of(content, &current) {
         drop(file);
         return Err(ChaprError::Io {
             path: path.clone(),
