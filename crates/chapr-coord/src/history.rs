@@ -89,9 +89,30 @@ pub async fn get_blob(root: &Path, version: &VersionToken) -> Result<Vec<u8>, Ch
     }
 }
 
+/// The `writer_principal` recorded on a [`VersionEvent::Baseline`] entry.
+///
+/// Deliberately not the principal of the write that discovered the bytes: it did
+/// not author them, and the audit trail is a primary deliverable, so guessing
+/// would put a name against content that name did not produce. Whoever did write
+/// them did it outside Chaperone, where there is nothing to attribute.
+pub(crate) const BASELINE_PRINCIPAL: &str = "(pre-existing)";
+
 /// Append a version to a file's log (concept §7 step 11). Coord stamps the
 /// timestamp and derives `prev_hash` from the current head, so the chain is
 /// coord-owned. Returns the entry it wrote.
+///
+/// When `pre_image` is set and the chain does not already name it, a
+/// [`VersionEvent::Baseline`] entry is recorded for it first, inside the same
+/// transaction. That is what keeps the snapshotted blob referenced: this call
+/// records the version the write *produced*, while the blob the endpoint just
+/// uploaded is the one it *replaced*. For a file Chaperone itself authored the
+/// two line up one write apart and the pre-image is already in the chain, so no
+/// baseline is written; for a file it did not, the pre-image would otherwise be
+/// named by nothing and blob GC would reclaim the only copy of the file's
+/// pre-agent contents.
+///
+/// Ordering matters: the baseline goes in first so the produced version's
+/// `prev_hash` links to it, leaving the chain in true order.
 pub async fn append_version_log(
     st: &AppState,
     path: &CanonicalPath,
@@ -99,14 +120,52 @@ pub async fn append_version_log(
     writer_principal: &Principal,
     size: u64,
     event: VersionEvent,
+    pre_image: Option<&chapr_proto::PreImage>,
 ) -> Result<VersionLogEntry, ChaprError> {
     let _guard = st.acquire_lock.lock().await;
     let now = Utc::now();
+    let mut tx = st.pool.begin().await.map_err(db)?;
+
+    if let Some(pre) = pre_image {
+        let already_named =
+            sqlx::query("SELECT 1 FROM version_log WHERE path = ?1 AND blob_hash = ?2 LIMIT 1")
+                .bind(path.as_str())
+                .bind(pre.version.as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?
+                .is_some();
+        if !already_named {
+            let head: Option<String> = sqlx::query(
+                "SELECT blob_hash FROM version_log WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(path.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .map(|r| r.get::<String, _>("blob_hash"));
+            sqlx::query(
+                "INSERT INTO version_log
+                   (path, timestamp_ms, blob_hash, writer_principal, prev_hash, size, event)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(path.as_str())
+            .bind(now.timestamp_millis())
+            .bind(pre.version.as_str())
+            .bind(BASELINE_PRINCIPAL)
+            .bind(head)
+            .bind(pre.size as i64)
+            .bind(event_str(VersionEvent::Baseline))
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+    }
 
     let prev_hash: Option<VersionToken> =
         sqlx::query("SELECT blob_hash FROM version_log WHERE path = ?1 ORDER BY id DESC LIMIT 1")
             .bind(path.as_str())
-            .fetch_optional(&st.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db)?
             .and_then(|r| VersionToken::from_hex(r.get::<String, _>("blob_hash")));
@@ -123,9 +182,11 @@ pub async fn append_version_log(
     .bind(prev_hash.as_ref().map(|v| v.as_str()))
     .bind(size as i64)
     .bind(event_str(event))
-    .execute(&st.pool)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
+
+    tx.commit().await.map_err(db)?;
 
     Ok(VersionLogEntry {
         path: path.clone(),
@@ -177,6 +238,7 @@ fn shard_path(root: &Path, version: &VersionToken) -> (PathBuf, PathBuf) {
 
 fn event_str(e: VersionEvent) -> &'static str {
     match e {
+        VersionEvent::Baseline => "baseline",
         VersionEvent::Create => "create",
         VersionEvent::Write => "write",
         VersionEvent::Delete => "delete",
@@ -188,6 +250,7 @@ fn event_str(e: VersionEvent) -> &'static str {
 
 fn event_from_str(s: &str) -> VersionEvent {
     match s {
+        "baseline" => VersionEvent::Baseline,
         "create" => VersionEvent::Create,
         "delete" => VersionEvent::Delete,
         "restore" => VersionEvent::Restore,
@@ -267,10 +330,10 @@ mod tests {
 
         let v1 = VersionToken::hash(b"v1");
         let v2 = VersionToken::hash(b"v2");
-        let e1 = append_version_log(&st, &path(), &v1, &who(), 2, VersionEvent::Create)
+        let e1 = append_version_log(&st, &path(), &v1, &who(), 2, VersionEvent::Create, None)
             .await
             .unwrap();
-        let e2 = append_version_log(&st, &path(), &v2, &who(), 3, VersionEvent::Write)
+        let e2 = append_version_log(&st, &path(), &v2, &who(), 3, VersionEvent::Write, None)
             .await
             .unwrap();
 
@@ -285,6 +348,80 @@ mod tests {
         assert_eq!(hist.entries[0].event, VersionEvent::Write);
         assert_eq!(hist.entries[1].version, v1);
         assert_eq!(hist.entries[1].event, VersionEvent::Create);
+    }
+
+    /// A pre-image Chaperone never authored enters the chain as a baseline, ahead
+    /// of the version the write produced, and the produced version chains to it.
+    #[tokio::test]
+    async fn an_unknown_pre_image_is_recorded_as_a_baseline_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state_with_blobs(&tmp).await;
+
+        let human = VersionToken::hash(b"what a human wrote");
+        let produced = VersionToken::hash(b"what the agent wrote");
+        let entry = append_version_log(
+            &st,
+            &path(),
+            &produced,
+            &who(),
+            20,
+            VersionEvent::Write,
+            Some(&chapr_proto::PreImage {
+                version: human.clone(),
+                size: 18,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The write chains to the baseline, not to nothing.
+        assert_eq!(entry.prev_hash, Some(human.clone()));
+
+        let hist = history(&st.pool, &path()).await.unwrap();
+        assert_eq!(hist.entries.len(), 2);
+        assert_eq!(hist.entries[0].version, produced);
+        assert_eq!(hist.entries[1].version, human);
+        assert_eq!(hist.entries[1].event, VersionEvent::Baseline);
+        assert_eq!(hist.entries[1].size, 18);
+        // Authorship is not guessed: the agent did not write these bytes.
+        assert_eq!(hist.entries[1].writer.as_str(), BASELINE_PRINCIPAL);
+    }
+
+    /// The steady state: once Chaperone has authored a version, the next write's
+    /// pre-image is already in the chain and must not be duplicated.
+    #[tokio::test]
+    async fn a_pre_image_already_in_the_chain_adds_no_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state_with_blobs(&tmp).await;
+
+        let v1 = VersionToken::hash(b"v1");
+        append_version_log(&st, &path(), &v1, &who(), 2, VersionEvent::Create, None)
+            .await
+            .unwrap();
+
+        // Second write: its pre-image is v1, which the create entry already names.
+        let v2 = VersionToken::hash(b"v2");
+        append_version_log(
+            &st,
+            &path(),
+            &v2,
+            &who(),
+            3,
+            VersionEvent::Write,
+            Some(&chapr_proto::PreImage {
+                version: v1.clone(),
+                size: 2,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let hist = history(&st.pool, &path()).await.unwrap();
+        assert_eq!(hist.entries.len(), 2, "no duplicate entry for known bytes");
+        assert!(hist
+            .entries
+            .iter()
+            .all(|e| e.event != VersionEvent::Baseline));
     }
 
     #[tokio::test]

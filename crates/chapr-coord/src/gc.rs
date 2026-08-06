@@ -371,6 +371,61 @@ mod tests {
         assert_eq!(report.blobs_evicted, 1);
     }
 
+    /// The data-loss regression that motivated [`VersionEvent::Baseline`].
+    ///
+    /// A write snapshots the bytes it **replaces** and logs the version it
+    /// **produces**. For a file Chaperone itself authored those line up one write
+    /// apart, so every blob ends up referenced. For a file it did not — anything a
+    /// human wrote — the pre-image matched no version-log row, GC saw a plain
+    /// orphan, and once past the write grace it deleted the only copy of the
+    /// file's pre-agent contents. On the pilot's central workflow (agents writing
+    /// into human-authored tenders) that is the common path, not an edge case.
+    #[tokio::test]
+    async fn a_writes_pre_image_survives_gc_and_stays_restorable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = st_with_blobs(&tmp, db::test_pool().await);
+
+        // A human wrote this. Chaperone never saw it produced, so nothing in the
+        // version log names it.
+        let human = b"the tender a human wrote";
+        let pre = history::put_blob(&st.blob_root, human).await.unwrap();
+
+        // An agent writes over it, exactly as `commit_tail` does.
+        let produced = VersionToken::hash(b"what the agent wrote");
+        history::append_version_log(
+            &st,
+            &path(),
+            &produced,
+            &who(),
+            20,
+            chapr_proto::VersionEvent::Write,
+            Some(&chapr_proto::PreImage {
+                version: pre.version.clone(),
+                size: human.len() as u64,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Zero grace: nothing survives merely for being freshly written.
+        sweep(&st, &cfg(90, 10, u64::MAX)).await.unwrap();
+
+        assert!(
+            exists(&st, &pre.version).await,
+            "GC deleted the only copy of the file's pre-agent contents"
+        );
+        // Surviving is half of it — history must name the version, or nothing can
+        // restore to it.
+        let hist = history::history(&st.pool, &path()).await.unwrap();
+        assert!(
+            hist.entries
+                .iter()
+                .any(|e| e.version == pre.version
+                    && e.event == chapr_proto::VersionEvent::Baseline),
+            "the pre-agent version is not offered by chapr.history"
+        );
+    }
+
     #[tokio::test]
     async fn write_grace_protects_a_fresh_orphan() {
         let tmp = tempfile::tempdir().unwrap();

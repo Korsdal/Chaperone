@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             writer_principal: who.clone(),
             size: content.len() as u64,
             event: VersionEvent::Create,
+            pre_image: None,
         })
         .await?;
     println!("version_log   -> event={:?} prev={:?}", entry.event, entry.prev_hash);

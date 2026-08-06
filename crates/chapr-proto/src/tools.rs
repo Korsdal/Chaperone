@@ -448,6 +448,23 @@ pub struct AppendVersionLogRequest {
     pub writer_principal: Principal,
     pub size: u64,
     pub event: VersionEvent,
+    /// The pre-image this operation snapshotted into the blob store, when there
+    /// was one. Coord records a [`VersionEvent::Baseline`] entry for it if the
+    /// chain does not already name it; see [`PreImage`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_image: Option<PreImage>,
+}
+
+/// A snapshotted pre-image, named so coord can reference its blob from the
+/// version log.
+///
+/// Carries the size explicitly because the version log records it and coord does
+/// no file I/O of its own (invariant 1) — it cannot derive it, and the blob is
+/// the endpoint's upload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreImage {
+    pub version: VersionToken,
+    pub size: u64,
 }
 
 /// Query a file's version log (concept §6.5, backing `chapr.history`). Carries
@@ -530,6 +547,12 @@ pub struct MovePathsRequest {
     pub overwrite: bool,
     pub principal: Principal,
     pub session_id: SessionId,
+    /// The destination's pre-image, present only on an overwrite-move. Those are
+    /// bytes the rename destroys, so the endpoint snapshots them — and that blob
+    /// needs the same [`VersionEvent::Baseline`] reference a write's pre-image
+    /// does, or GC reclaims the only copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_pre_image: Option<PreImage>,
 }
 
 /// Recover a dangling in-flight write (concept §8.1). Called by the read path

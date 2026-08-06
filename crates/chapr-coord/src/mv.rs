@@ -30,6 +30,7 @@ pub async fn move_paths(
     overwrite: bool,
     principal: &Principal,
     session_id: &SessionId,
+    dst_pre_image: Option<&chapr_proto::PreImage>,
 ) -> Result<(), ChaprError> {
     let _guard = st.acquire_lock.lock().await;
     let now_ms = Utc::now().timestamp_millis();
@@ -56,6 +57,46 @@ pub async fn move_paths(
             .bind(src.as_str()).bind(dst.as_str()).execute(&mut *tx).await.map_err(db)?;
         sqlx::query("UPDATE conflicts SET base_path = ?2 WHERE base_path = ?1")
             .bind(src.as_str()).bind(dst.as_str()).execute(&mut *tx).await.map_err(db)?;
+    }
+
+    // An overwrite-move destroys the destination's bytes, and the endpoint
+    // snapshotted them before renaming. The `move` entry below names the *source*
+    // version as dst's new head, so without a baseline entry that blob is
+    // referenced by nothing and GC reclaims the only copy of what was replaced.
+    // Recorded before the move entry so the chain reads in true order.
+    if let Some(pre) = dst_pre_image {
+        let already_named =
+            sqlx::query("SELECT 1 FROM version_log WHERE path = ?1 AND blob_hash = ?2 LIMIT 1")
+                .bind(dst.as_str())
+                .bind(pre.version.as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?
+                .is_some();
+        if !already_named {
+            let head: Option<String> = sqlx::query(
+                "SELECT blob_hash FROM version_log WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(dst.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .map(|r| r.get::<String, _>("blob_hash"));
+            sqlx::query(
+                "INSERT INTO version_log
+                   (path, timestamp_ms, blob_hash, writer_principal, prev_hash, size, event)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'baseline')",
+            )
+            .bind(dst.as_str())
+            .bind(now_ms)
+            .bind(pre.version.as_str())
+            .bind(crate::history::BASELINE_PRINCIPAL)
+            .bind(head)
+            .bind(pre.size as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
     }
 
     // Append the Move entry, chained to dst's current head.
@@ -126,7 +167,7 @@ mod tests {
     async fn plain_move_rekeys_history_and_conflicts() {
         let st = AppState::new(db::test_pool().await);
         let v1 = VersionToken::hash(b"v1");
-        history::append_version_log(&st, &src(), &v1, &who(), 2, VersionEvent::Create)
+        history::append_version_log(&st, &src(), &v1, &who(), 2, VersionEvent::Create, None)
             .await
             .unwrap();
         conflict::register(
@@ -139,7 +180,7 @@ mod tests {
         .await
         .unwrap();
 
-        move_paths(&st, &src(), &dst(), &v1, 2, false, &who(), &sess())
+        move_paths(&st, &src(), &dst(), &v1, 2, false, &who(), &sess(), None)
             .await
             .unwrap();
 
@@ -165,14 +206,14 @@ mod tests {
         let st = AppState::new(db::test_pool().await);
         let sv = VersionToken::hash(b"src");
         let dv = VersionToken::hash(b"dst-old");
-        history::append_version_log(&st, &src(), &sv, &who(), 3, VersionEvent::Create)
+        history::append_version_log(&st, &src(), &sv, &who(), 3, VersionEvent::Create, None)
             .await
             .unwrap();
-        history::append_version_log(&st, &dst(), &dv, &who(), 4, VersionEvent::Create)
+        history::append_version_log(&st, &dst(), &dv, &who(), 4, VersionEvent::Create, None)
             .await
             .unwrap();
 
-        move_paths(&st, &src(), &dst(), &sv, 3, true, &who(), &sess())
+        move_paths(&st, &src(), &dst(), &sv, 3, true, &who(), &sess(), None)
             .await
             .unwrap();
 

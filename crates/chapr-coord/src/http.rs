@@ -193,8 +193,13 @@ async fn recover_journal(
     caller: crate::auth::Caller,
     Json(req): Json<RecoverJournalRequest>,
 ) -> Result<Json<RecoveredFrom>, ApiError> {
-    let principal = caller.0.unwrap_or(req.principal);
-    let recovered = journal::recover(&st, &req.path, &principal, &req.session_id).await?;
+    // `principal`/`session_id` on the request are no longer consumed here: the
+    // `crash_recover` audit event moved to the endpoint, which is the only side
+    // that can hash the file and so the only side that knows whether a recovery
+    // actually happened. Kept on the wire — re-binding them costs nothing and
+    // removing them would break older endpoints for no gain.
+    let _ = caller;
+    let recovered = journal::recover(&st, &req.path).await?;
     Ok(Json(recovered))
 }
 
@@ -240,6 +245,7 @@ async fn append_version_log(
         &writer_principal,
         req.size,
         req.event,
+        req.pre_image.as_ref(),
     )
     .await?;
     Ok(Json(entry))
@@ -338,6 +344,7 @@ async fn move_paths(
         req.overwrite,
         &principal,
         &req.session_id,
+        req.dst_pre_image.as_ref(),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)

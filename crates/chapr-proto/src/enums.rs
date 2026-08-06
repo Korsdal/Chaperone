@@ -89,6 +89,17 @@ pub enum AuditKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionEvent {
+    /// Content Chaperone did not author, recorded the first time a write
+    /// snapshots it. A file that existed before any agent touched it — or one a
+    /// human edited out of band between two agent writes — enters the chain
+    /// here.
+    ///
+    /// Without this entry the snapshotted pre-image blob is named by nothing:
+    /// the version log records the version a write *produced*, while the blob
+    /// store holds the one it *replaced*, so an unreferenced pre-image is
+    /// reclaimed by blob GC and the file's pre-agent state becomes
+    /// unrecoverable — the one thing history exists to prevent.
+    Baseline,
     /// First version of a newly created file (`chapr.create`).
     Create,
     /// An ordinary in-place overwrite (`chapr.write`).
