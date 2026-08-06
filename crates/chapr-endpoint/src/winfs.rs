@@ -16,7 +16,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, MoveFileExW, ReadFile, SetEndOfFile, SetFilePointerEx, WriteFile,
-    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_NONE, MOVEFILE_COPY_ALLOWED,
+    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_NONE,
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 
@@ -143,10 +143,21 @@ pub fn create_new_file(path: &str, bytes: &[u8]) -> io::Result<()> {
 /// identity and ACL (unlike read+create+delete). `replace` allows overwriting
 /// an existing destination. `WRITE_THROUGH` makes the move durable before
 /// returning.
+///
+/// Deliberately **without** `MOVEFILE_COPY_ALLOWED`. That flag makes Win32
+/// silently fall back to CopyFile+DeleteFile whenever the destination is on
+/// another volume or share — which is not a rename at all: the destination
+/// becomes a *new* file inheriting the target directory's ACEs, losing the
+/// original's, and the operation stops being atomic. That is precisely the ACL
+/// loss the "never temp-rename" rule exists to prevent, and it contradicted the
+/// promise in this doc comment. Without the flag a cross-volume move fails with
+/// `ERROR_NOT_SAME_DEVICE` instead of quietly doing the wrong thing; a
+/// cross-volume move needs an explicit copy verb with its own ACL story, not a
+/// silent one.
 pub fn move_file(src: &str, dst: &str, replace: bool) -> io::Result<()> {
     let s = wide(src);
     let d = wide(dst);
-    let mut flags = MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
+    let mut flags = MOVEFILE_WRITE_THROUGH;
     if replace {
         flags |= MOVEFILE_REPLACE_EXISTING;
     }

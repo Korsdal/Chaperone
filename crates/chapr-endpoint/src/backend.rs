@@ -378,8 +378,23 @@ fn write_cas_core<P: FsPrimitives>(
 
     // Step 11: clear the journal (gated). Version log + audit are the tool
     // layer's uniform post-close tail (built from this receipt).
+    //
+    // NOT fatal. The bytes are durable and the handle is closed, so failing here
+    // would tell the caller its write failed when it committed — the lie
+    // `commit_tail` exists to prevent, except this call sits inside the core and
+    // so was never covered by it. An agent acting on that lie re-writes, CAS
+    // mismatches against its own bytes, and a spurious conflict sidecar appears.
+    // The entry left behind is self-healing: the next read hashes the file,
+    // matches it against the journal's `intended_version`, and clears it
+    // (`read::serve_dangling`).
     if !atomic_writes {
-        rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))?;
+        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        {
+            tracing::warn!(
+                path = %path, error = %e,
+                "write committed but its journal entry could not be cleared; the next read resolves it"
+            );
+        }
     }
 
     Ok(CommitReceipt {
@@ -478,8 +493,17 @@ fn delete_cas_core<P: FsPrimitives>(
 
     std::fs::remove_file(path.as_str()).map_err(|e| map_os_err(path, e))?;
 
+    // Not fatal — the file is already gone, so reporting a failed delete would be
+    // false. A read of the path now fails at `stat` before the journal is ever
+    // consulted, and a later `create` supersedes the entry (INSERT OR REPLACE).
     if !atomic_writes {
-        rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))?;
+        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        {
+            tracing::warn!(
+                path = %path, error = %e,
+                "delete committed but its journal entry could not be cleared"
+            );
+        }
     }
     Ok(CommitReceipt {
         from_version: Some(v_now),
@@ -546,8 +570,16 @@ fn restore_in_place_core<P: FsPrimitives>(
     file.overwrite(&args.bytes).map_err(|e| map_os_err(path, e))?;
     drop(file);
 
+    // Not fatal, for the same reason as `write_cas_core`: the restored bytes are
+    // durable, and the next read reconciles the entry against `intended_version`.
     if !atomic_writes {
-        rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))?;
+        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        {
+            tracing::warn!(
+                path = %path, error = %e,
+                "restore committed but its journal entry could not be cleared; the next read resolves it"
+            );
+        }
     }
     Ok(CommitReceipt {
         from_size: Some(current.len() as u64),
@@ -689,7 +721,7 @@ fn check_human_lock(
     g: &dyn crate::pathgrammar::PathGrammar,
     path: &CanonicalPath,
 ) -> Result<(), ChaprError> {
-    if let Some(lock) = g.human_lock_path(path) {
+    for lock in g.human_lock_paths(path) {
         if std::path::Path::new(lock.as_str()).exists() {
             return Err(ChaprError::OfficeLockPresent {
                 path: path.clone(),
