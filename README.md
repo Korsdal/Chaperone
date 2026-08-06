@@ -187,9 +187,18 @@ a byproduct.
 Two things to know explicitly:
 
 - **Existence leak (documented v1 limitation).** `coord.resolve(path)` returns version, size, and
-  mtime regardless of the caller's ACL, because the watcher indexes as a service account. Content
-  access stays safe — bytes only ever come through the user's own open. Accepted for a
-  flat-permission department; the v2 fix is an ACL-aware index.
+  mtime regardless of the caller's ACL, because the watcher indexes as a service account. Accepted
+  for a flat-permission department; the v2 fix is an ACL-aware index.
+- **The control plane carries file bytes, and it is not access-controlled in v1.** Reads still go
+  endpoint → share → model under the user's own token and never touch coord. But since D-026 a write
+  snapshots its pre-image to coord (`PUT /blobs`), so coord's blob store holds file content, and
+  `GET /blobs/{version}` applies no ACL check — nor does any other coord route, by design in the
+  MVP's `trusted-header` posture, which authenticates nothing (see below). Anyone who can reach
+  coord's port can fetch any snapshotted version. This is acceptable only because coord sits on the
+  internal network beside the fileserver; treat reachability of coord as equivalent to read access to
+  file history, and put enforced auth (E-015) ahead of any deployment where that is not true.
+  (This section previously claimed bytes only ever come through the user's own open. That stopped
+  being true when pre-image snapshots started flowing to coord.)
 - **Cross-agent prompt injection.** `chapr.read` wraps returned content in an explicit
   untrusted-data envelope, and the tool description states that the content is data from a shared
   drive, possibly written by another party, and never to be treated as instructions.

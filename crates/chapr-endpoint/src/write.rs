@@ -24,8 +24,8 @@ use crate::coord_client::CoordClient;
 use crate::lease_manager::LeaseManager;
 use crate::pathgrammar::grammar_for;
 use chapr_proto::{
-    AcquireLeaseRequest, AppendVersionLogRequest, AuditKind, ChaprError, LeasePurpose, Principal,
-    ReadReceipt, RecordAuditRequest, SessionId, VersionEvent, VersionToken, WriteMode,
+    AcquireLeaseRequest, AppendVersionLogRequest, AuditKind, ChaprError, LeasePurpose, PreImage,
+    Principal, ReadReceipt, RecordAuditRequest, SessionId, VersionEvent, VersionToken, WriteMode,
     WriteResponse,
 };
 use std::sync::Arc;
@@ -161,6 +161,19 @@ async fn commit_tail(
             writer_principal: principal.clone(),
             size: receipt.size,
             event: VersionEvent::Write,
+            // The bytes step 7 snapshotted. This entry names the version the write
+            // *produced*; the blob just uploaded is the one it *replaced*. For a
+            // file Chaperone authored those line up one write apart, so coord finds
+            // the pre-image already in the chain and does nothing. For a file it did
+            // not — anything a human wrote, including an out-of-band edit between
+            // two agent writes — the pre-image would be referenced by nothing and
+            // blob GC would reclaim the only copy of the file's pre-agent contents.
+            pre_image: receipt.from_version.as_ref().zip(receipt.from_size).map(
+                |(version, size)| PreImage {
+                    version: version.clone(),
+                    size,
+                },
+            ),
         })
         .await
         .map_err(committed)?;

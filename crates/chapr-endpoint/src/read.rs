@@ -27,9 +27,10 @@ use crate::canon::canonicalize;
 use crate::coord_client::CoordClient;
 use crate::pathgrammar::grammar_for;
 use chapr_proto::{
-    BackendKind, CanonicalPath, ChaprError, ConflictsQuery, Integrity, JournalState, ListEntry,
-    ListResponse, Principal, ReadContent, ReadReceipt, ReadResponse, RecoverJournalRequest,
-    RefreshIndexRequest, ResolveRequest, SessionId, StatResponse, VersionToken,
+    AuditKind, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest, ConflictsQuery,
+    Integrity, JournalState, ListEntry, ListResponse, Principal, ReadContent, ReadReceipt,
+    ReadResponse, RecordAuditRequest, RecoverJournalRequest, RefreshIndexRequest, ResolveRequest,
+    SessionId, StatResponse, VersionToken,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -130,7 +131,17 @@ pub async fn read(
             .await?
         }
         JournalState::Live => serve_live(coord, fs, cfg, principal, session_id, &path).await?,
-        JournalState::Dangling => serve_dangling(coord, principal, session_id, &path).await?,
+        JournalState::Dangling => {
+            serve_dangling(
+                coord,
+                fs,
+                principal,
+                session_id,
+                &path,
+                resolved.open_conflicts,
+            )
+            .await?
+        }
     };
 
     // Record the read so a subsequent write can present this version as its
@@ -221,7 +232,15 @@ async fn serve_live(
                 .await
             }
             JournalState::Dangling => {
-                return serve_dangling(coord, principal, session_id, path).await
+                return serve_dangling(
+                    coord,
+                    fs,
+                    principal,
+                    session_id,
+                    path,
+                    resolved.open_conflicts,
+                )
+                .await
             }
             JournalState::Live => continue,
         }
@@ -232,13 +251,33 @@ async fn serve_live(
     })
 }
 
-/// Dangling: recover-then-serve. Serve the pre-image from the blob store, never
-/// the torn file on disk.
+/// Dangling: a journal entry is open but its owning lease is dead. Two very
+/// different situations produce that, and `intended_version` — recorded at
+/// journal-open and, until now, never read back anywhere — is what tells them
+/// apart.
+///
+/// - **The write committed and only failed to clear.** Its bytes are durable on
+///   the share; step 11 (`journal_clear`) failed afterwards, e.g. coord blipped.
+///   The file hashes to `intended_version`. Nothing is torn, and serving the
+///   pre-image here would hand the reader *older* content than the file
+///   genuinely holds — so clear the stale entry and serve the file.
+/// - **The write is genuinely torn.** Serve the pre-image, and **leave the entry
+///   in place.** Clearing it would protect only this reader: the next read would
+///   see a Clean path, hash the still-torn bytes and return them as
+///   [`Integrity::Verified`]. Nothing repairs the file, so the marker has to
+///   outlive the read. It is superseded by the next real write (`journal::open`
+///   is `INSERT OR REPLACE`), which is what actually re-establishes ground truth.
+///
+/// The blob is fetched only after that decision, and the entry is never cleared
+/// before the bytes are in hand — previously a failed `get_blob` destroyed the
+/// marker and served nothing, leaving the file torn and unflagged.
 async fn serve_dangling(
     coord: &CoordClient,
+    fs: &dyn FileSource,
     principal: &Principal,
     session_id: &SessionId,
     path: &CanonicalPath,
+    open_conflicts: Option<u32>,
 ) -> Result<ReadResponse, ChaprError> {
     let recovered = coord
         .recover_journal(&RecoverJournalRequest {
@@ -247,13 +286,51 @@ async fn serve_dangling(
             session_id: session_id.clone(),
         })
         .await?;
+
+    // One read serves both purposes: the completion check, and — in the committed
+    // case — the bytes to return.
+    let on_disk = fs.read(path).map_err(|e| map_os_err(path, e))?;
+    let on_disk_version = VersionToken::hash(&on_disk);
+
+    if recovered.intended_version.as_ref() == Some(&on_disk_version) {
+        // Committed, not torn. Clearing is best-effort: if it fails, the next
+        // reader simply repeats this check and reaches the same conclusion.
+        let _ = coord
+            .journal_clear(&ClearJournalRequest { path: path.clone() })
+            .await;
+        return Ok(ReadResponse {
+            content: ReadContent::Inline { bytes: on_disk },
+            version: Some(on_disk_version),
+            integrity: Integrity::Verified,
+            recovered_from: None,
+            open_conflicts,
+        });
+    }
+
     let bytes = coord.get_blob(&recovered.version).await?;
+    // Audited here rather than coord-side, because only the endpoint can hash the
+    // file and therefore only the endpoint knows a recovery actually happened.
+    // Best-effort — a failed audit write must not fail the read.
+    let _ = coord
+        .record_audit(&RecordAuditRequest {
+            principal: principal.clone(),
+            session_id: session_id.clone(),
+            path: path.clone(),
+            kind: AuditKind::CrashRecover,
+            from_version: Some(recovered.version.clone()),
+            to_version: None,
+            detail: format!(
+                "served pre-image after interrupted write by {}",
+                recovered.interrupted_writer
+            ),
+        })
+        .await;
     Ok(ReadResponse {
         content: ReadContent::Inline { bytes },
         version: Some(recovered.version.clone()),
         integrity: Integrity::Recovered,
         recovered_from: Some(recovered),
-        open_conflicts: None,
+        open_conflicts,
     })
 }
 

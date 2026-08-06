@@ -1136,6 +1136,7 @@ mod tests {
                 version: pre,
                 interrupted_writer: chapr_proto::Principal::new_unchecked("CONTOSO\\crashed"),
                 at: chrono::Utc::now(),
+                intended_version: None,
             }),
             open_conflicts: None,
         };

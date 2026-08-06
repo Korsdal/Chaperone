@@ -139,6 +139,14 @@ pub struct RecoveredFrom {
     pub interrupted_writer: Principal,
     /// When the recovery happened.
     pub at: DateTime<Utc>,
+    /// The version the interrupted write was trying to produce, as recorded at
+    /// journal-open. The reader hashes the file and compares: an equal hash means
+    /// the write actually committed and only failed to clear its journal entry,
+    /// so the file is **not** torn and its own bytes are the newest content.
+    /// Unequal — or `None`, when the writer died before hashing its content —
+    /// means genuinely torn, and the pre-image is what may be served.
+    #[serde(default)]
+    pub intended_version: Option<VersionToken>,
 }
 
 #[cfg(test)]

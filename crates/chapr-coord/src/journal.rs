@@ -30,7 +30,7 @@
 use crate::state::AppState;
 use chapr_proto::{
     CanonicalPath, ChaprError, JournalEntry, JournalState, LeaseId, Principal, RecoveredFrom,
-    SessionId, VersionToken,
+    VersionToken,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
@@ -161,31 +161,42 @@ pub async fn scan_dangling(
     Ok(dangling)
 }
 
-/// Recover a dangling in-flight write (concept §8.1). Confirms the entry is
-/// truly dangling (present, owning lease dead), clears it, records a
-/// `crash_recover` audit event, and returns the [`RecoveredFrom`] the reader
-/// uses to fetch and serve the pre-image. Coord does not touch the file bytes —
-/// serving the recovered pre-image is the endpoint's job.
+/// Inspect a dangling in-flight write (concept §8.1). Confirms the entry is
+/// truly dangling (present, owning lease dead) and returns the [`RecoveredFrom`]
+/// the reader needs: the pre-image to serve, who was interrupted, and the
+/// `intended_version` that write was trying to produce. Coord does not touch the
+/// file bytes — deciding what to serve, and serving it, is the endpoint's job.
 ///
-/// Errors: [`ChaprError::NotFound`] if there is no journal entry for the path
-/// (nothing to recover, or already recovered); [`ChaprError::Internal`] if the
-/// owning lease is in fact still alive (the write is `Live`, not dangling —
-/// the caller should re-read).
-pub async fn recover(
-    st: &AppState,
-    path: &CanonicalPath,
-    principal: &Principal,
-    session_id: &SessionId,
-) -> Result<RecoveredFrom, ChaprError> {
+/// **This does not clear the entry, and deliberately so.** It used to, in the
+/// same transaction as a `crash_recover` audit event. But nothing anywhere
+/// repairs the torn file, so deleting the marker protected only the *first*
+/// reader: the next read found a Clean path, hashed the still-torn bytes, and
+/// returned them as [`chapr_proto::Integrity::Verified`] — silent corruption
+/// handed to a model, and the exact inversion of "the reader never sees torn
+/// bytes". The entry now persists until something genuinely re-establishes
+/// ground truth, which is a real write: [`open`] is `INSERT OR REPLACE`, so the
+/// next write to the path supersedes it and clears it on commit.
+///
+/// The audit event moved to the endpoint for the same reason: only the endpoint
+/// can hash the file, so only the endpoint knows whether a recovery actually
+/// happened or the write had in fact committed and merely failed to clear.
+///
+/// Errors: [`ChaprError::NotFound`] if there is no journal entry for the path;
+/// [`ChaprError::Internal`] if the owning lease is in fact still alive (the write
+/// is `Live`, not dangling — the caller should re-read).
+pub async fn recover(st: &AppState, path: &CanonicalPath) -> Result<RecoveredFrom, ChaprError> {
     let _guard = st.acquire_lock.lock().await;
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
 
-    let row = sqlx::query("SELECT lease_id, principal, pre_image_version FROM journal WHERE path = ?1")
-        .bind(path.as_str())
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(internal)?;
+    let row = sqlx::query(
+        "SELECT lease_id, principal, pre_image_version, intended_version
+         FROM journal WHERE path = ?1",
+    )
+    .bind(path.as_str())
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(internal)?;
     let Some(row) = row else {
         return Err(ChaprError::NotFound { path: path.clone() });
     };
@@ -195,6 +206,10 @@ pub async fn recover(
         return Err(ChaprError::Internal {
             message: "corrupt journal pre_image_version".into(),
         });
+    };
+    let intended_version = match row.get::<Option<String>, _>("intended_version") {
+        Some(hex) => VersionToken::from_hex(hex),
+        None => None,
     };
 
     // Confirm dangling: the owning lease must be dead. If it is alive, this is a
@@ -213,45 +228,11 @@ pub async fn recover(
         });
     }
 
-    // Clearing the entry and auditing the recovery are one atomic step. Done
-    // separately, a failure between them leaves the journal row already gone —
-    // so a retry hits the NotFound arm above and the recovery is both
-    // unrepeatable AND unaudited, on a trail that is a primary deliverable.
-    // The audit INSERT is hand-rolled to join the transaction, following the
-    // same precedent as `mv::move_paths`.
-    let mut tx = st.pool.begin().await.map_err(internal)?;
-
-    sqlx::query("DELETE FROM journal WHERE path = ?1")
-        .bind(path.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-
-    sqlx::query(
-        "INSERT INTO audit_log
-           (event_id, timestamp_ms, principal, session_id, canonical_path,
-            kind, from_version, to_version, detail)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'crash_recover', ?6, NULL, ?7)",
-    )
-    .bind(format!("evt-{}", uuid::Uuid::new_v4()))
-    .bind(now_ms)
-    .bind(principal.as_str())
-    .bind(session_id.as_str())
-    .bind(path.as_str())
-    .bind(pre_image.as_str())
-    .bind(format!(
-        "recovered pre-image after interrupted write by {interrupted_writer}"
-    ))
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?;
-
-    tx.commit().await.map_err(internal)?;
-
     Ok(RecoveredFrom {
         version: pre_image,
         interrupted_writer,
         at: now,
+        intended_version,
     })
 }
 
@@ -266,7 +247,7 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::lease;
-    use chapr_proto::{AuditKind, LeasePurpose};
+    use chapr_proto::{LeasePurpose, SessionId};
 
     fn path() -> CanonicalPath {
         CanonicalPath::new_unchecked("\\\\srv\\share\\wip.md")
@@ -376,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_clears_dangling_and_audits_crash_recover() {
+    async fn recover_reports_the_pre_image_and_the_intended_version() {
         let st = AppState::new(db::test_pool().await);
         let lease_id = open_live(&st).await;
         // Writer "crashes": its lease goes away → the entry is now dangling.
@@ -386,41 +367,78 @@ mod tests {
             JournalState::Dangling
         );
 
-        let recovered = recover(
-            &st,
-            &path(),
-            &Principal::new_unchecked("CONTOSO\\reader"),
-            &SessionId::new_unchecked("sess-r"),
-        )
-        .await
-        .unwrap();
+        let recovered = recover(&st, &path()).await.unwrap();
         assert_eq!(recovered.version, VersionToken::hash(b"pre-image"));
         assert_eq!(recovered.interrupted_writer, who());
+        // The endpoint needs this to tell a torn write from one that committed and
+        // only failed to clear. It was recorded at open and, before this change,
+        // read back by nothing.
+        assert_eq!(
+            recovered.intended_version,
+            Some(VersionToken::hash(b"intended"))
+        );
+    }
 
-        // Journal is now clean, and a crash_recover event was audited.
+    /// The marker must survive the read. It used to be deleted here, which left
+    /// the *file* still torn but the path reporting Clean — so the second reader
+    /// got torn bytes back as `Integrity::Verified`. Nothing repairs the file, so
+    /// nothing may retract the warning either.
+    #[tokio::test]
+    async fn recover_leaves_the_entry_so_later_readers_are_also_protected() {
+        let st = AppState::new(db::test_pool().await);
+        let lease_id = open_live(&st).await;
+        crate::lease::release(&st, &lease_id).await.unwrap();
+
+        for _ in 0..3 {
+            recover(&st, &path()).await.unwrap();
+            assert_eq!(
+                state_for_path(&st.pool, &path(), now_ms()).await.unwrap(),
+                JournalState::Dangling,
+                "a recover must not clear the entry"
+            );
+        }
+    }
+
+    /// Recovery is no longer audited coord-side: only the endpoint can hash the
+    /// file, so only the endpoint knows whether a recovery actually happened or
+    /// the write had in fact committed. Coord must not claim one either way.
+    #[tokio::test]
+    async fn recover_does_not_audit() {
+        let st = AppState::new(db::test_pool().await);
+        let lease_id = open_live(&st).await;
+        crate::lease::release(&st, &lease_id).await.unwrap();
+        let before = crate::audit::query(&st.pool, &path()).await.unwrap().len();
+        recover(&st, &path()).await.unwrap();
+        let after = crate::audit::query(&st.pool, &path()).await.unwrap();
+        assert_eq!(after.len(), before);
+    }
+
+    /// A real write is what re-establishes ground truth, and `open` is
+    /// INSERT OR REPLACE — so the next write supersedes the dangling entry and
+    /// clears it on commit. That is the path back to Clean.
+    #[tokio::test]
+    async fn a_later_write_supersedes_the_dangling_entry() {
+        let st = AppState::new(db::test_pool().await);
+        let lease_id = open_live(&st).await;
+        crate::lease::release(&st, &lease_id).await.unwrap();
+        recover(&st, &path()).await.unwrap();
+
+        open_live(&st).await; // a fresh write on the same path
+        assert_eq!(
+            state_for_path(&st.pool, &path(), now_ms()).await.unwrap(),
+            JournalState::Live
+        );
+        clear(&st, &path()).await.unwrap();
         assert_eq!(
             state_for_path(&st.pool, &path(), now_ms()).await.unwrap(),
             JournalState::Clean
         );
-        // Newest-first: crash_recover, then the earlier lease_grant from open_live.
-        let events = crate::audit::query(&st.pool, &path()).await.unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, AuditKind::CrashRecover);
-        assert_eq!(events[0].from_version, Some(VersionToken::hash(b"pre-image")));
-        assert_eq!(events[1].kind, AuditKind::LeaseGrant);
     }
 
     #[tokio::test]
     async fn recover_with_no_entry_is_not_found() {
         let st = AppState::new(db::test_pool().await);
-        let err = recover(
-            &st,
-            &path(),
-            &Principal::new_unchecked("CONTOSO\\reader"),
-            &SessionId::new_unchecked("sess-r"),
-        )
-        .await
-        .unwrap_err();
+        let err = recover(&st, &path()).await.unwrap_err();
         assert!(matches!(err, ChaprError::NotFound { .. }));
     }
 
@@ -428,14 +446,7 @@ mod tests {
     async fn recover_refuses_a_live_entry() {
         let st = AppState::new(db::test_pool().await);
         open_live(&st).await; // lease still alive → Live, not dangling
-        let err = recover(
-            &st,
-            &path(),
-            &Principal::new_unchecked("CONTOSO\\reader"),
-            &SessionId::new_unchecked("sess-r"),
-        )
-        .await
-        .unwrap_err();
+        let err = recover(&st, &path()).await.unwrap_err();
         assert!(matches!(err, ChaprError::Internal { .. }));
     }
 

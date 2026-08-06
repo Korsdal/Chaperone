@@ -40,8 +40,8 @@ use crate::read::{system_time_to_utc, FileSource, FileStat, RawDirEntry};
 use crate::winfs::{create_new_file, move_file, ExclusiveFile};
 use chapr_proto::{
     BackendDescriptor, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest, HistoryQuery,
-    LeaseId, MovePathsRequest, OpenJournalRequest, Principal, ReadReceipt, RegisterConflictRequest,
-    SessionId, VersionToken, WriteMode,
+    LeaseId, MovePathsRequest, OpenJournalRequest, PreImage, Principal, ReadReceipt,
+    RegisterConflictRequest, SessionId, VersionToken, WriteMode,
 };
 use chrono::{DateTime, Utc};
 use std::io;
@@ -111,6 +111,11 @@ pub struct CommitReceipt {
     pub from_version: Option<VersionToken>, // None for create
     pub to_version: Option<VersionToken>,   // None for delete
     pub size: u64,
+    /// Size of the pre-image this operation snapshotted into the blob store, when
+    /// it snapshotted one. With `from_version` it names the blob the endpoint
+    /// uploaded — which the version log must reference or GC reclaims it. Coord
+    /// cannot derive the size itself (it does no file I/O, invariant 1).
+    pub from_size: Option<u64>,
 }
 
 /// A move reports nothing to the tool layer: its version-log entry + audit are
@@ -373,14 +378,30 @@ fn write_cas_core<P: FsPrimitives>(
 
     // Step 11: clear the journal (gated). Version log + audit are the tool
     // layer's uniform post-close tail (built from this receipt).
+    //
+    // NOT fatal. The bytes are durable and the handle is closed, so failing here
+    // would tell the caller its write failed when it committed — the lie
+    // `commit_tail` exists to prevent, except this call sits inside the core and
+    // so was never covered by it. An agent acting on that lie re-writes, CAS
+    // mismatches against its own bytes, and a spurious conflict sidecar appears.
+    // The entry left behind is self-healing: the next read hashes the file,
+    // matches it against the journal's `intended_version`, and clears it
+    // (`read::serve_dangling`).
     if !atomic_writes {
-        rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))?;
+        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        {
+            tracing::warn!(
+                path = %path, error = %e,
+                "write committed but its journal entry could not be cleared; the next read resolves it"
+            );
+        }
     }
 
     Ok(CommitReceipt {
         from_version: Some(v_now),
         to_version: Some(v_new),
         size: content.len() as u64,
+        from_size: Some(current.len() as u64),
     })
 }
 
@@ -422,6 +443,7 @@ fn create_core<P: FsPrimitives>(
         from_version: None,
         to_version: Some(VersionToken::hash(content)),
         size: content.len() as u64,
+        from_size: None, // a create replaces nothing
     })
 }
 
@@ -471,13 +493,25 @@ fn delete_cas_core<P: FsPrimitives>(
 
     std::fs::remove_file(path.as_str()).map_err(|e| map_os_err(path, e))?;
 
+    // Not fatal — the file is already gone, so reporting a failed delete would be
+    // false. A read of the path now fails at `stat` before the journal is ever
+    // consulted, and a later `create` supersedes the entry (INSERT OR REPLACE).
     if !atomic_writes {
-        rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))?;
+        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        {
+            tracing::warn!(
+                path = %path, error = %e,
+                "delete committed but its journal entry could not be cleared"
+            );
+        }
     }
     Ok(CommitReceipt {
         from_version: Some(v_now),
         to_version: None,
         size: current.len() as u64,
+        // A delete's own version-log entry is keyed by the pre-image hash, so
+        // the snapshot is already referenced — no baseline entry is needed.
+        from_size: None,
     })
 }
 
@@ -504,10 +538,19 @@ fn restore_in_place_core<P: FsPrimitives>(
     ctx: &WriteCtx,
     args: &RestoreInPlaceArgs,
 ) -> Result<CommitReceipt, ChaprError> {
+    let g = grammar_for(prims.kind());
     let rt = ctx.rt;
     let coord = ctx.coord;
     let principal = ctx.principal;
     let path = &args.path;
+
+    // Office pre-flight — humans always win (concept §7 step 3, §10). A restore
+    // in place is the one mutating verb that was missing this, and it does no CAS
+    // by design ("a restore is a deliberate overwrite"), so this check was the
+    // only thing standing between an agent restore and a document a human has
+    // open. The exclusive open is not a substitute: the `~$F` sibling also
+    // outlives an Office crash, which is a case the rule exists to respect.
+    check_human_lock(g, path)?;
 
     let file = prims.open_existing(path.as_str()).map_err(|e| map_os_err(path, e))?;
     let current = file.read_all().map_err(|e| map_os_err(path, e))?;
@@ -527,10 +570,19 @@ fn restore_in_place_core<P: FsPrimitives>(
     file.overwrite(&args.bytes).map_err(|e| map_os_err(path, e))?;
     drop(file);
 
+    // Not fatal, for the same reason as `write_cas_core`: the restored bytes are
+    // durable, and the next read reconciles the entry against `intended_version`.
     if !atomic_writes {
-        rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))?;
+        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        {
+            tracing::warn!(
+                path = %path, error = %e,
+                "restore committed but its journal entry could not be cleared; the next read resolves it"
+            );
+        }
     }
     Ok(CommitReceipt {
+        from_size: Some(current.len() as u64),
         from_version: Some(v_prev),
         to_version: Some(args.version.clone()),
         size: args.bytes.len() as u64,
@@ -575,6 +627,7 @@ fn move_cas_core<P: FsPrimitives>(
 
     // Overwrite? Then CAS the destination too (concept §6.3).
     let overwrite = std::path::Path::new(dst.as_str()).exists();
+    let mut dst_pre_image = None;
     if overwrite {
         check_human_lock(g, dst)?;
         let dbv = args
@@ -590,9 +643,9 @@ fn move_cas_core<P: FsPrimitives>(
         let dfile = prims.open_existing(dst.as_str()).map_err(|e| map_os_err(dst, e))?;
         let dbytes = dfile.read_all().map_err(|e| map_os_err(dst, e))?;
         let dst_now = VersionToken::hash(&dbytes);
-        drop(dfile);
         if dst_now != *dbv {
             let (last_writer, when) = last_writer_of(rt, coord, dst, principal);
+            drop(dfile);
             return Err(ChaprError::Conflict {
                 current_version: dst_now,
                 last_writer,
@@ -615,7 +668,29 @@ fn move_cas_core<P: FsPrimitives>(
                 ),
             });
         }
+        // Upload while the exclusive handle is STILL HELD, then close immediately
+        // before the rename. Win32 cannot rename a file held with
+        // `FILE_SHARE_NONE` (`MoveFileExW` → ERROR_SHARING_VIOLATION), so a
+        // handle-free instant before the rename is unavoidable here — but it must
+        // be an instant. Closing first and *then* uploading, as this did, stretched
+        // it across a network round-trip of up to `MAX_PRE_IMAGE_BYTES`, during
+        // which a non-Chaperone writer's bytes could land in `dst` and be destroyed
+        // by the rename with no snapshot and no conflict. Other Chaperone sessions
+        // are already excluded by the all-or-none `{src,dst}` lease; this narrows
+        // the window for everyone else to two adjacent syscalls.
+        //
+        // The residual window is a true invariant-4 gap: version-check and mutation
+        // are not under one handle. Closing it properly means renaming *through*
+        // the held handle via `SetFileInformationByHandle(FileRenameInfo)`, which
+        // requires `DELETE` in the open's access mask — deferred, and tracked,
+        // because it needs verifying against the real SMB target.
+        let dst_size = dbytes.len() as u64;
         rt.block_on(coord.put_blob(dbytes))?;
+        dst_pre_image = Some(PreImage {
+            version: dst_now,
+            size: dst_size,
+        });
+        drop(dfile);
     }
 
     // Ground truth first: the rename.
@@ -630,6 +705,10 @@ fn move_cas_core<P: FsPrimitives>(
         overwrite,
         principal: principal.clone(),
         session_id: session_id.clone(),
+        // The bytes the rename destroyed. `move_paths` logs the *source* version
+        // as dst's new head, so without this the snapshot above is named by
+        // nothing and GC reclaims the only copy of what the overwrite replaced.
+        dst_pre_image,
     }))?;
 
     Ok(MoveReceipt)
@@ -642,7 +721,7 @@ fn check_human_lock(
     g: &dyn crate::pathgrammar::PathGrammar,
     path: &CanonicalPath,
 ) -> Result<(), ChaprError> {
-    if let Some(lock) = g.human_lock_path(path) {
+    for lock in g.human_lock_paths(path) {
         if std::path::Path::new(lock.as_str()).exists() {
             return Err(ChaprError::OfficeLockPresent {
                 path: path.clone(),
@@ -970,5 +1049,110 @@ mod tests {
         };
         assert_eq!(select_backend(Some(&d)), BackendKind::Smb);
         assert_eq!(select_backend(None), BackendKind::default());
+    }
+
+    /// A [`FsPrimitives`] that never mutates anything. `open_existing` fails with
+    /// a distinctive I/O error rather than panicking: reaching the open is the
+    /// *correct* outcome when no human holds the file, and it has to be
+    /// distinguishable from the pre-flight refusal.
+    struct StubFs;
+
+    struct NeverOpened;
+    impl LockedFile for NeverOpened {
+        fn read_all(&self) -> io::Result<Vec<u8>> {
+            unreachable!("no handle is ever produced")
+        }
+        fn overwrite(&self, _bytes: &[u8]) -> io::Result<()> {
+            unreachable!("no handle is ever produced")
+        }
+    }
+
+    impl FsPrimitives for StubFs {
+        type File = NeverOpened;
+        fn kind(&self) -> BackendKind {
+            BackendKind::Smb // the grammar with a `~$F` convention
+        }
+        fn open_existing(&self, _path: &str) -> io::Result<Self::File> {
+            Err(io::Error::other("reached the exclusive open"))
+        }
+        fn create_new(&self, _path: &str, _bytes: &[u8]) -> io::Result<()> {
+            unreachable!("a restore in place creates nothing")
+        }
+        fn rename(&self, _s: &str, _d: &str, _o: bool) -> io::Result<()> {
+            unreachable!("a restore in place renames nothing — never temp-rename")
+        }
+    }
+
+    /// Drive `restore_in_place_core` against [`StubFs`] and return the error.
+    /// A success is impossible here (the stub never yields a handle), so an `Ok`
+    /// means the core committed something it should not have.
+    fn restore_against_stub(path: &CanonicalPath) -> ChaprError {
+        let coord = CoordClient::new("http://127.0.0.1:1"); // unroutable on purpose
+        let principal = Principal::new_unchecked("CONTOSO\\agent");
+        let session_id = SessionId::new_unchecked("sess-restore");
+        let rt = Handle::current();
+        let ctx = WriteCtx {
+            rt: &rt,
+            coord: &coord,
+            principal: &principal,
+            session_id: &session_id,
+        };
+        match restore_in_place_core(
+            &StubFs,
+            false,
+            &ctx,
+            &RestoreInPlaceArgs {
+                path: path.clone(),
+                lease_id: LeaseId::new_unchecked("lease-1"),
+                bytes: b"an old version the agent wants back".to_vec(),
+                version: VersionToken::hash(b"an old version the agent wants back"),
+            },
+        ) {
+            Ok(_) => panic!("restore reported a commit against a stub that writes nothing"),
+            Err(e) => e,
+        }
+    }
+
+    /// `chapr.restore mode=in_place` overwrote a document a human had open in
+    /// Word or Excel. It was the only mutating verb missing the `~$F` pre-flight,
+    /// and it deliberately performs no CAS ("a restore is a deliberate
+    /// overwrite"), so that check was the sole guard on the path — humans always
+    /// win (concept §7 step 3, §10).
+    #[tokio::test]
+    async fn restore_in_place_refuses_while_a_human_has_the_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("q3.xlsx");
+        std::fs::write(&doc, b"the human's work").unwrap();
+        // Excel's owner file — what "a human has this open" looks like on SMB.
+        std::fs::write(dir.path().join("~$q3.xlsx"), b"lock").unwrap();
+
+        let path = CanonicalPath::new_unchecked(doc.to_string_lossy().to_string());
+        let err = restore_against_stub(&path);
+
+        assert!(
+            matches!(err, ChaprError::OfficeLockPresent { .. }),
+            "expected OfficeLockPresent, got {err:?}"
+        );
+        // And the human's bytes are still theirs.
+        assert_eq!(std::fs::read(&doc).unwrap(), b"the human's work");
+    }
+
+    /// The mirror of the above: with no lock file the pre-flight lets the core
+    /// through to the exclusive open, so the refusal really is the lock's doing
+    /// rather than a test that passes for any input.
+    #[tokio::test]
+    async fn restore_in_place_proceeds_past_the_preflight_without_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("q3.xlsx");
+        std::fs::write(&doc, b"the human's work").unwrap();
+        // No `~$q3.xlsx` this time.
+
+        let path = CanonicalPath::new_unchecked(doc.to_string_lossy().to_string());
+        let err = restore_against_stub(&path);
+
+        assert!(
+            !matches!(err, ChaprError::OfficeLockPresent { .. }),
+            "pre-flight refused with no lock file present: {err:?}"
+        );
     }
 }

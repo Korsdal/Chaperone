@@ -18,8 +18,8 @@ use crate::lease_manager::LeaseManager;
 use crate::pathgrammar::grammar_for;
 use chapr_proto::{
     AcquireLeaseRequest, AppendVersionLogRequest, AuditKind, ChaprError, CreateResponse,
-    DeleteResponse, LeasePurpose, MoveResponse, Principal, ReadReceipt, RecordAuditRequest,
-    RestoreMode, RestoreResponse, SessionId, VersionEvent, VersionToken,
+    DeleteResponse, LeasePurpose, MoveResponse, PreImage, Principal, ReadReceipt,
+    RecordAuditRequest, RestoreMode, RestoreResponse, SessionId, VersionEvent, VersionToken,
 };
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -83,6 +83,7 @@ pub async fn create(
                 writer_principal: principal.clone(),
                 size: receipt.size,
                 event: VersionEvent::Create,
+                pre_image: None, // a create replaces nothing
             })
             .await
             .map_err(&committed)?;
@@ -183,6 +184,9 @@ pub async fn delete(
                 writer_principal: principal.clone(),
                 size: receipt.size,
                 event: VersionEvent::Delete,
+                // This entry is itself keyed by the pre-image hash, so the
+                // snapshot is already referenced — no baseline needed.
+                pre_image: None,
             })
             .await
             .map_err(&committed)?;
@@ -255,6 +259,8 @@ pub async fn restore(
                     writer_principal: principal.clone(),
                     size,
                     event: VersionEvent::Restore,
+                    // Restore-to-copy writes a new sibling; nothing is replaced.
+                    pre_image: None,
                 })
                 .await?;
             coord
@@ -319,6 +325,16 @@ pub async fn restore(
                         writer_principal: principal.clone(),
                         size: receipt.size,
                         event: VersionEvent::Restore,
+                        // An in-place restore overwrites live bytes and snapshots
+                        // them first; this entry names the version being
+                        // reinstated, not the one replaced, so the snapshot needs
+                        // its own baseline reference or GC reclaims it.
+                        pre_image: receipt.from_version.as_ref().zip(receipt.from_size).map(
+                            |(version, size)| PreImage {
+                                version: version.clone(),
+                                size,
+                            },
+                        ),
                     })
                     .await
                     .map_err(&committed)?;

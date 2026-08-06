@@ -27,11 +27,22 @@ pub trait PathGrammar: Send + Sync {
     /// the result in a [`CanonicalPath`].
     fn normalize(&self, raw: &str) -> Result<String, String>;
 
-    /// The "humans always win" lock sibling to pre-flight before a write (SMB's
-    /// Office `~$F`). `None` for backends with no such convention (POSIX), where
-    /// the exclusive lock is merely advisory (accepted trade-off, D-F/D-019).
-    fn human_lock_path(&self, _path: &CanonicalPath) -> Option<CanonicalPath> {
-        None
+    /// Every "humans always win" lock sibling to pre-flight before a write (SMB's
+    /// Office owner files). Empty for backends with no such convention (POSIX),
+    /// where the exclusive lock is merely advisory (accepted trade-off,
+    /// D-F/D-019).
+    ///
+    /// A list, not one name (refining D-F), because Office has **two** owner-file
+    /// conventions and only one of them was implemented. Excel and PowerPoint
+    /// prepend `~$` to the whole filename; **Word replaces the first two
+    /// characters** — `Master_ISO.docx` → `~$ster_ISO.docx`. Checking only the
+    /// prepended form meant the pre-flight never fired for any `.docx`, so
+    /// "humans always win" silently did not hold for Word on write, delete, move
+    /// or restore. Rather than branch on extension — which drifts, and guesses
+    /// which app has the file open — every backend returns all the shapes its
+    /// convention can produce and the caller refuses if any of them exists.
+    fn human_lock_paths(&self, _path: &CanonicalPath) -> Vec<CanonicalPath> {
+        Vec::new()
     }
 
     /// A uniquely-named conflict sidecar `F.conflict-{user}-{ts}-{id}.ext`
@@ -123,12 +134,24 @@ impl PathGrammar for WinGrammar {
         })
     }
 
-    fn human_lock_path(&self, path: &CanonicalPath) -> Option<CanonicalPath> {
+    fn human_lock_paths(&self, path: &CanonicalPath) -> Vec<CanonicalPath> {
         let s = path.as_str();
-        Some(match s.rfind('\\') {
-            Some(i) => CanonicalPath::new_unchecked(format!("{}~${}", &s[..=i], &s[i + 1..])),
-            None => CanonicalPath::new_unchecked(format!("~${s}")),
-        })
+        let (dir, name) = match s.rfind('\\') {
+            Some(i) => (&s[..=i], &s[i + 1..]),
+            None => ("", s),
+        };
+
+        // Excel / PowerPoint: `~$` + the whole filename.
+        let mut out = vec![CanonicalPath::new_unchecked(format!("{dir}~${name}"))];
+
+        // Word: `~$` + the filename minus its first two characters. Counted in
+        // `char`s, not bytes — these are user-named business documents and
+        // slicing mid-codepoint would panic on the first accented filename.
+        let tail: String = name.chars().skip(2).collect();
+        if !tail.is_empty() {
+            out.push(CanonicalPath::new_unchecked(format!("{dir}~${tail}")));
+        }
+        out
     }
 }
 
@@ -216,19 +239,49 @@ fn insert_tag(path: &str, tag: &str, sep: char) -> String {
 mod tests {
     use super::*;
 
+    fn locks(p: &str) -> Vec<String> {
+        WinGrammar
+            .human_lock_paths(&CanonicalPath::new_unchecked(p))
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect()
+    }
+
+    /// Excel and PowerPoint prepend `~$` to the whole filename.
     #[test]
-    fn win_office_lock_is_the_tilde_dollar_sibling() {
-        let p = CanonicalPath::new_unchecked("\\\\srv\\share\\dir\\report.xlsx");
-        assert_eq!(
-            WinGrammar.human_lock_path(&p).unwrap().as_str(),
-            "\\\\srv\\share\\dir\\~$report.xlsx"
-        );
+    fn win_office_lock_covers_the_prepended_excel_form() {
+        assert!(locks("\\\\srv\\share\\dir\\report.xlsx")
+            .contains(&"\\\\srv\\share\\dir\\~$report.xlsx".to_string()));
+    }
+
+    /// Word replaces the **first two characters** instead, so checking only the
+    /// prepended form meant the pre-flight never fired for any `.docx` and
+    /// "humans always win" silently did not hold for Word documents.
+    #[test]
+    fn win_office_lock_covers_the_word_minus_two_form() {
+        assert!(locks("\\\\srv\\share\\dir\\Quarterly.docx")
+            .contains(&"\\\\srv\\share\\dir\\~$arterly.docx".to_string()));
+    }
+
+    /// Business filenames carry accents and the slice is by `char`, not byte —
+    /// a byte slice would panic mid-codepoint on exactly these names.
+    #[test]
+    fn win_office_lock_slices_by_char_not_byte() {
+        let got = locks("\\\\srv\\share\\Årsrapport.docx");
+        assert!(got.contains(&"\\\\srv\\share\\~$srapport.docx".to_string()), "{got:?}");
+    }
+
+    /// Nothing to drop two characters from — emit only the prepended form rather
+    /// than a bare `~$`, which would match an unrelated file.
+    #[test]
+    fn win_office_lock_skips_the_word_form_for_very_short_names() {
+        assert_eq!(locks("\\\\srv\\share\\ab"), vec!["\\\\srv\\share\\~$ab".to_string()]);
     }
 
     #[test]
     fn posix_has_no_human_lock() {
         let p = CanonicalPath::new_unchecked("/mnt/share/report.xlsx");
-        assert!(PosixGrammar.human_lock_path(&p).is_none());
+        assert!(PosixGrammar.human_lock_paths(&p).is_empty());
     }
 
     #[test]
