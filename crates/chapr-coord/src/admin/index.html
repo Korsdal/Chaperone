@@ -126,6 +126,52 @@
   footer { padding: 0 22px 30px; color: var(--muted); font-size: 12.5px; max-width: 1400px; }
   .err-banner { background: #fdf3f2; border: 1px solid #eebfbb; color: var(--error); padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; }
   [hidden] { display: none !important; }
+
+  /* login gate */
+  #login { position: fixed; inset: 0; background: var(--ink); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  .login-card { background: #fff; border-radius: 14px; padding: 26px 28px; max-width: 520px; }
+  .login-card h2 { font-size: 17px; margin-bottom: 10px; }
+  .login-card p { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .login-card p.fine { font-size: 12.5px; margin: 12px 0 0; }
+  .login-card input {
+    width: 100%; font: inherit; font-family: ui-monospace, Consolas, monospace;
+    padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+  }
+  .login-card button, .btn {
+    margin-top: 12px; background: var(--accent); color: #fff; border: 0; font: inherit;
+    font-weight: 600; padding: 9px 16px; border-radius: 8px; cursor: pointer;
+  }
+  .login-card button:hover, .btn:hover { background: #1f7768; }
+  .btn[disabled] { background: #b9cdc9; cursor: not-allowed; }
+  .btn.secondary { background: none; color: var(--accent); border: 1px solid #b7ded6; }
+  .btn.secondary:hover { background: #f1faf7; }
+  .login-err { color: var(--error); font-size: 13px; margin-top: 10px; }
+
+  /* settings */
+  .fields { padding: 6px 16px 16px; }
+  .field { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 14px; align-items: start; padding: 9px 0; border-bottom: 1px solid #f2f6f7; }
+  .field:last-child { border-bottom: 0; }
+  .field > label { font-size: 13px; padding-top: 7px; }
+  .field .help { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .field input, .field select, .field textarea {
+    width: 100%; font: inherit; font-size: 13px; padding: 7px 10px;
+    border: 1px solid var(--line); border-radius: 7px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .field input:disabled, .field select:disabled { background: #f4f7f8; color: var(--muted); }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); margin-left: 6px; }
+  .tag.live { color: var(--accent); border-color: #b7ded6; background: #f1faf7; }
+  .tag.restart { color: var(--warn); border-color: #ecd9a8; background: #fdf9ef; }
+  .tag.locked { color: var(--error); border-color: #eebfbb; background: #fdf3f2; }
+  .actions { padding: 14px 16px; border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .save-note { font-size: 13px; }
+  .save-note.ok { color: var(--accent); }
+  .save-note.bad { color: var(--error); }
+  .cutover { padding: 12px 16px; }
+  .cutover table { width: auto; min-width: 300px; }
+  .gate { margin-top: 10px; font-size: 13px; }
+  .gate.open { color: var(--accent); }
+  .gate.shut { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -135,7 +181,26 @@
   <span class="spacer"></span>
   <span id="live"></span>
   <button class="link" id="refresh">Refresh</button>
+  <button class="link" id="logout">Log out</button>
 </header>
+
+<!-- The login gate. The page itself is served without the token — it has to be,
+     since this is where the token is entered. Only the data routes are gated. -->
+<div id="login" hidden>
+  <div class="login-card">
+    <h2>Administrator token</h2>
+    <p>This coordinator keeps its admin token in its own data directory, beside the
+      database — a directory the installer restricts to administrators and the
+      service account. The setup wizard prints it; you can also read the
+      <code>admin-token</code> file there.</p>
+    <input type="password" id="token-input" placeholder="Paste the token" autocomplete="off" spellcheck="false">
+    <div class="login-err" id="login-err" hidden></div>
+    <button id="token-save">Continue</button>
+    <p class="fine">The token does not depend on the connection auth mode, which is
+      deliberate: it means a mistake made on the Settings tab can always be undone
+      from this page.</p>
+  </div>
+</div>
 
 <nav id="tabs" role="tablist"></nav>
 
@@ -215,6 +280,49 @@
     </section>
   </div>
 
+  <!-- Settings -->
+  <div data-panel="settings" hidden>
+    <section class="card">
+      <h2>Changing the connection auth mode</h2>
+      <p class="hint">Run the new mode as the primary with the old one as a fallback,
+        watch the endpoints arrive on the new mode, then remove the fallback. Both
+        numbers below matter: a client that <em>cannot</em> authenticate under the new
+        mode never appears as fallback use — it appears as a rejection.</p>
+      <div class="cutover">
+        <div class="scroll"><table>
+          <thead><tr><th>Admitted by</th><th>Of the last 100</th></tr></thead>
+          <tbody id="cutover-modes"></tbody>
+        </table></div>
+        <dl class="facts" id="cutover-facts"></dl>
+        <div class="gate" id="cutover-gate"></div>
+        <button class="btn secondary" id="drop-fallback" hidden>Remove the fallback</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Configuration</h2>
+      <p class="hint" id="settings-where"></p>
+      <div class="fields" id="settings-fields"></div>
+      <div class="actions">
+        <button class="btn" id="settings-save">Save</button>
+        <button class="btn secondary" id="settings-reload">Discard changes</button>
+        <span class="save-note" id="settings-note"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Administrator token</h2>
+      <p class="hint">Permanent by design — it is the way back in when the auth mode
+        is wrong. It cannot be switched off, so rotation is how you answer "someone
+        who has left may still have a copy". Rotating invalidates the current token
+        immediately, including on this page.</p>
+      <div class="actions">
+        <button class="btn secondary" id="rotate-token">Rotate the token</button>
+        <span class="save-note" id="rotate-note"></span>
+      </div>
+    </section>
+  </div>
+
   <!-- Audit -->
   <div data-panel="audit" hidden>
     <section class="card">
@@ -239,21 +347,36 @@
 <script>
 "use strict";
 
-// Every request carries a principal header because the coordinator's read routes
-// are attributed. `admin-ui` is honest about what it is: we know the request came
-// from this page, not who was looking at it.
-const HEADERS = { "content-type": "application/json", "x-chapr-principal": "admin-ui" };
+// The admin token. It gates every data route, and it is the credential that makes
+// changing the auth mode safe: it does not depend on the auth mode, so a
+// misconfigured cutover cannot lock the administrator out of the page they need in
+// order to undo it.
+//
+// Kept in localStorage rather than a cookie: there is no session to forge and no
+// cross-site request that could carry it, and it survives a reload without the
+// coordinator having to track state.
+const TOKEN_KEY = "chapr-admin-token";
+let token = localStorage.getItem(TOKEN_KEY) || "";
 
-async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: HEADERS, body: JSON.stringify(body || {}) });
-  if (!r.ok) throw new Error(path + " → HTTP " + r.status + " " + (await r.text()).slice(0, 200));
-  return r.json();
+function headers() {
+  return { "content-type": "application/json", authorization: "Bearer " + token };
 }
-async function get(path) {
-  const r = await fetch(path, { headers: HEADERS });
-  if (!r.ok) throw new Error(path + " → HTTP " + r.status);
-  return r.json();
+
+/// Thrown when the coordinator rejects the token, so the caller shows the login
+/// screen rather than a generic error.
+class Unauthorized extends Error {}
+
+async function request(path, init) {
+  const r = await fetch(path, { ...init, headers: headers() });
+  if (r.status === 401 || r.status === 503) {
+    throw new Unauthorized(await r.text());
+  }
+  if (!r.ok) throw new Error(path + " → HTTP " + r.status + " " + (await r.text()).slice(0, 300));
+  return r.status === 204 ? null : r.json();
 }
+const get = (path) => request(path, { method: "GET" });
+const post = (path, body) => request(path, { method: "POST", body: JSON.stringify(body || {}) });
+const put = (path, body) => request(path, { method: "PUT", body: JSON.stringify(body || {}) });
 
 // --- DOM helpers. `text` is the only way data enters the page: textContent,
 // never innerHTML, because every string below comes off a shared drive.
@@ -312,6 +435,7 @@ const TABS = [
   ["conflicts", "Conflicts"],
   ["leases", "Leases"],
   ["audit", "Audit trail"],
+  ["settings", "Settings"],
 ];
 let current = "overview";
 
@@ -505,34 +629,219 @@ function renderAudit(list) {
   }
 }
 
+// --- settings
+//
+// Field metadata lives here rather than being inferred, because two properties are
+// not derivable from the value and both change what the operator may do: whether a
+// save takes effect without a restart, and whether the environment owns the field.
+const FIELDS = [
+  ["auth", "Connection auth", "select", ["disabled", "trusted-header", "negotiate"],
+   "How endpoints identify themselves. `trusted-header` accepts whatever the client asserts — attribution, not proof."],
+  ["auth_fallback", "Auth fallback", "select", ["", "disabled", "trusted-header", "negotiate"],
+   "Tried when the primary rejects. Set this while changing the primary; remove it when the panel above says it is safe."],
+  ["admin_principals", "Administrators", "list", null,
+   "One principal per line. Enforced once the auth mode actually authenticates; recorded but not enforced under trusted-header."],
+  ["addr", "Listen address", "text", null, "host:port the laptops connect to."],
+  ["db_url", "Database", "text", null, "SQLite URL. Also decides where the admin token lives."],
+  ["blob_root", "Blob store", "text", null, "Holds file history. Moving it is a data migration, not a setting."],
+  ["backend", "Fileserver backend", "select", ["smb", "posix"],
+   "What coord announces to endpoints; they confirm it against their own capabilities."],
+  ["reap_secs", "Lease reaper interval", "number", null, "Seconds. The default suits ~20 users."],
+  ["gc_secs", "Blob GC interval", "number", null, "Seconds. Daily by default."],
+  ["watch_dir", "Watch directory", "text", null, "Enables the change-watcher. Windows only."],
+  ["share_unc", "Share UNC prefix", "text", null, "How watched local paths map to canonical UNC."],
+];
+
+let settings = null;   // the last GET
+let draft = null;      // what the form currently holds
+
+function fieldTag(name) {
+  if (settings.overridden_by_env.includes(name)) return ["locked", "set by the environment"];
+  if (settings.reloadable_fields.includes(name)) return ["live", "applies immediately"];
+  return ["restart", "needs a restart"];
+}
+
+function renderSettings(s) {
+  settings = s;
+  draft = JSON.parse(JSON.stringify(s.config));
+
+  const where = document.getElementById("settings-where");
+  clear(where);
+  where.appendChild(
+    el("span", null,
+      s.config_path
+        ? "Saved to " + s.config_path + ". "
+        : "This coordinator was started without a config file, so there is nowhere to save — run chapr-coord setup to create one. "));
+  where.appendChild(el("span", null,
+    "A field marked as needing a restart is written to the file and picked up next start; nothing pretends otherwise."));
+
+  const host = document.getElementById("settings-fields");
+  clear(host);
+  for (const [name, label, kind, options, help] of FIELDS) {
+    const [tagCls, tagText] = fieldTag(name);
+    const locked = tagCls === "locked";
+
+    const row = el("div", "field");
+    const lab = el("label", null, label);
+    lab.appendChild(el("span", "tag " + tagCls, tagText));
+    lab.appendChild(el("span", "help", help));
+    row.appendChild(lab);
+
+    let input;
+    if (kind === "select") {
+      input = el("select");
+      for (const o of options) {
+        const opt = el("option", null, o === "" ? "(none)" : o);
+        opt.value = o;
+        input.appendChild(opt);
+      }
+      input.value = draft[name] === null || draft[name] === undefined ? "" : String(draft[name]);
+    } else if (kind === "list") {
+      input = el("textarea");
+      input.rows = 3;
+      input.value = (draft[name] || []).join("\n");
+    } else {
+      input = el("input");
+      input.type = kind === "number" ? "number" : "text";
+      input.value = draft[name] === null || draft[name] === undefined ? "" : String(draft[name]);
+    }
+    input.disabled = locked || !s.config_path;
+    input.addEventListener("change", () => {
+      if (kind === "list") {
+        draft[name] = input.value.split("\n").map((x) => x.trim()).filter(Boolean);
+      } else if (kind === "number") {
+        draft[name] = Number(input.value);
+      } else {
+        // An empty optional field is absent, not the empty string — `auth_fallback`
+        // of "" would fail validation as an unknown mode.
+        draft[name] = input.value === "" ? null : input.value;
+      }
+    });
+    row.appendChild(input);
+    host.appendChild(row);
+  }
+
+  renderCutover(s.auth_usage, s.config);
+}
+
+function renderCutover(usage, cfg) {
+  const modes = document.getElementById("cutover-modes");
+  clear(modes);
+  if (!usage.recent_by_mode.length) {
+    emptyRow(modes, 2, "No requests seen yet.");
+  } else {
+    for (const m of usage.recent_by_mode) {
+      const tr = el("tr");
+      tr.appendChild(cell(m.mode, "mono"));
+      tr.appendChild(cell(m.count));
+      modes.appendChild(tr);
+    }
+  }
+
+  const facts = document.getElementById("cutover-facts");
+  clear(facts);
+  const rows = [
+    ["Primary", cfg.auth],
+    ["Fallback", cfg.auth_fallback || "(none)"],
+    ["Admitted since start", usage.total_admitted],
+    ["Rejected since start", usage.total_rejected],
+    ["Last rejection", usage.last_rejection ? stamp(usage.last_rejection) : "never"],
+  ];
+  for (const [k, v] of rows) {
+    const d = el("div");
+    d.appendChild(el("dt", null, k));
+    d.appendChild(el("dd", "mono", v));
+    facts.appendChild(d);
+  }
+
+  const gate = document.getElementById("cutover-gate");
+  const drop = document.getElementById("drop-fallback");
+  if (!cfg.auth_fallback) {
+    gate.className = "gate";
+    gate.textContent = "No fallback configured — nothing to retire.";
+    drop.hidden = true;
+    return;
+  }
+  if (usage.safe_to_remove_fallback) {
+    gate.className = "gate open";
+    gate.textContent = "The primary is admitting everything and nothing is being rejected. Safe to remove the fallback.";
+    drop.hidden = false;
+  } else {
+    gate.className = "gate shut";
+    gate.textContent = "Not safe to remove yet — " + (usage.blocked_reason || "waiting for evidence") + ".";
+    drop.hidden = true;
+  }
+}
+
+function settingsNote(id, text, cls) {
+  const n = document.getElementById(id);
+  n.className = "save-note" + (cls ? " " + cls : "");
+  n.textContent = text;
+}
+
+async function saveSettings(overrides) {
+  const body = { ...draft, ...(overrides || {}) };
+  try {
+    const r = await put("/admin/settings", body);
+    const parts = [];
+    if (r.applied.length) parts.push("applied now: " + r.applied.join(", "));
+    if (r.needs_restart.length) parts.push("waiting for a restart: " + r.needs_restart.join(", "));
+    settingsNote("settings-note", parts.length ? "Saved — " + parts.join("; ") + "." : "Saved — nothing changed.", "ok");
+    await refresh();
+  } catch (e) {
+    if (e instanceof Unauthorized) return showLogin(e.message);
+    settingsNote("settings-note", "Not saved: " + e.message, "bad");
+  }
+}
+
+// --- login gate
+function showLogin(message) {
+  document.getElementById("login").hidden = false;
+  const err = document.getElementById("login-err");
+  err.hidden = !message;
+  err.textContent = message || "";
+  document.getElementById("token-input").value = "";
+}
+function hideLogin() {
+  document.getElementById("login").hidden = true;
+}
+
 // --- load
 let inFlight = false;
 async function refresh() {
+  if (!token) return showLogin();
   if (inFlight) return;
   inFlight = true;
   const banner = document.getElementById("banner");
   try {
-    const [overview, diags, conflicts, leases, audit] = await Promise.all([
+    const [overview, diags, conflicts, leases, audit, settingsResp] = await Promise.all([
       get("/admin/overview"),
       post("/diagnostics/query", {}),
       // `scope` is a path prefix, and the empty prefix is every open conflict.
       post("/conflicts/query", { scope: "" }),
       post("/leases/query", {}),
       post("/audit/query", { limit: 200 }),
+      get("/admin/settings"),
     ]);
+    hideLogin();
     renderOverview(overview);
     renderAttention(diags.groups || []);
     renderErrors(diags.groups || []);
     renderConflicts(conflicts.conflicts || []);
     renderLeases(leases || []);
     renderAudit(audit || []);
+    renderSettings(settingsResp);
     banner.hidden = true;
     const live = document.getElementById("live");
     clear(live);
     live.appendChild(el("span", null, "updated " + new Date().toLocaleTimeString()));
   } catch (e) {
-    banner.hidden = false;
-    banner.textContent = "Could not load from the coordinator: " + e.message;
+    if (e instanceof Unauthorized) {
+      showLogin(e.message);
+    } else {
+      banner.hidden = false;
+      banner.textContent = "Could not load from the coordinator: " + e.message;
+    }
   } finally {
     inFlight = false;
   }
@@ -541,8 +850,53 @@ async function refresh() {
 buildTabs();
 selectTab("overview");
 document.getElementById("refresh").addEventListener("click", refresh);
-refresh();
-setInterval(refresh, 15000);
+document.getElementById("logout").addEventListener("click", () => {
+  localStorage.removeItem(TOKEN_KEY);
+  token = "";
+  showLogin();
+});
+document.getElementById("token-save").addEventListener("click", () => {
+  const v = document.getElementById("token-input").value.trim();
+  if (!v) return;
+  token = v;
+  localStorage.setItem(TOKEN_KEY, v);
+  refresh();
+});
+document.getElementById("token-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("token-save").click();
+});
+document.getElementById("settings-save").addEventListener("click", () => saveSettings());
+document.getElementById("settings-reload").addEventListener("click", () => {
+  settingsNote("settings-note", "");
+  refresh();
+});
+// Retiring the fallback is just a save with that one field cleared — the same
+// validated path as any other change, not a special back door.
+document.getElementById("drop-fallback").addEventListener("click", () =>
+  saveSettings({ auth_fallback: null }));
+document.getElementById("rotate-token").addEventListener("click", async () => {
+  try {
+    const r = await post("/admin/token/rotate", {});
+    token = r.token;
+    localStorage.setItem(TOKEN_KEY, r.token);
+    settingsNote("rotate-note", "New token: " + r.token + " — copy it now; the old one has stopped working.", "ok");
+    await refresh();
+  } catch (e) {
+    if (e instanceof Unauthorized) return showLogin(e.message);
+    settingsNote("rotate-note", "Not rotated: " + e.message, "bad");
+  }
+});
+
+if (token) {
+  refresh();
+} else {
+  showLogin();
+}
+setInterval(() => {
+  // Do not poll while the operator is mid-edit on Settings: a refresh would
+  // overwrite the draft they are typing into.
+  if (token && current !== "settings") refresh();
+}, 15000);
 </script>
 </body>
 </html>

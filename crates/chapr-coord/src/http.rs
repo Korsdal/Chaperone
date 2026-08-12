@@ -171,6 +171,8 @@ pub fn router(state: AppState) -> Router {
         .route("/leases/query", post(query_leases))
         .route("/admin", get(admin_page))
         .route("/admin/overview", get(admin_overview))
+        .route("/admin/settings", get(get_settings).put(put_settings))
+        .route("/admin/token/rotate", post(rotate_admin_token))
         .with_state(state)
 }
 
@@ -342,19 +344,19 @@ async fn report_diagnostic(
 ///
 /// Ungated beyond `Caller` for now. The **admin role** that should own this is
 /// E-024a, deliberately deferred with the dashboard (D-030): this slice exists so
-/// that when something breaks at the customer we can find out *what*, and gating
-/// it behind a role nobody can hold yet would defeat that.
+/// that when something breaks at the customer we can find out *what*.
+///
+/// **Now gated by the admin token** (slice 6). It was reachable by any
+/// authenticated caller while the admin surface was read-only and there was no
+/// credential to hold; there is one now, and this route serves the whole fleet's
+/// failure detail.
 async fn query_diagnostics(
     State(st): State<AppState>,
-    caller: crate::auth::Caller,
+    _admin: crate::auth::AdminAuth,
     Json(req): Json<DiagnosticsQuery>,
 ) -> Result<Json<DiagnosticsResponse>, ApiError> {
     let resp = crate::diagnostics::query(&st.pool, &req).await?;
-    tracing::info!(
-        principal = %caller_label(&caller),
-        groups = resp.groups.len(),
-        "diagnostics query"
-    );
+    tracing::info!(groups = resp.groups.len(), "diagnostics query (admin)");
     Ok(Json(resp))
 }
 
@@ -364,17 +366,233 @@ async fn query_diagnostics(
 /// in `lease_acquire` and the background reaper own that.
 async fn query_leases(
     State(st): State<AppState>,
-    caller: crate::auth::Caller,
+    _admin: crate::auth::AdminAuth,
     Json(req): Json<LeasesQuery>,
 ) -> Result<Json<Vec<lease::LeaseView>>, ApiError> {
     let limit = req.limit.unwrap_or(200) as i64;
     let leases = lease::list_held(&st.pool, limit).await?;
-    tracing::debug!(
-        principal = %caller_label(&caller),
-        leases = leases.len(),
-        "leases query"
-    );
+    tracing::debug!(leases = leases.len(), "leases query (admin)");
     Ok(Json(leases))
+}
+
+/// Response of `GET /admin/settings` — the config plus everything the operator
+/// needs to know before editing it.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminSettings {
+    /// The effective configuration, exactly as it would be written back.
+    pub config: crate::config::Config,
+    /// Where a save would go. `None` means this coordinator was started without a
+    /// config file, so there is nowhere to write.
+    pub config_path: Option<String>,
+    /// Fields the environment is overriding. Editing one of these is refused —
+    /// the file value would be silently discarded on the next load.
+    pub overridden_by_env: Vec<&'static str>,
+    /// Fields a save applies without a restart. Everything else waits.
+    pub reloadable_fields: &'static [&'static str],
+    /// The auth cutover picture.
+    pub auth_usage: AuthUsageView,
+}
+
+/// What has been admitting requests lately, and what has been rejected.
+///
+/// Both numbers, because either alone misleads: a client that cannot authenticate
+/// under a new mode does not appear as fallback use, it appears as a rejection.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthUsageView {
+    /// Recent admitted requests per mode, most-used first.
+    pub recent_by_mode: Vec<AuthModeCount>,
+    pub total_admitted: u64,
+    pub total_rejected: u64,
+    pub last_rejection: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the fallback looks safe to remove: nothing recent used it **and**
+    /// nothing has been rejected recently. One condition without the other cannot
+    /// tell a finished cutover from a broken one.
+    pub safe_to_remove_fallback: bool,
+    /// Why not, when it is not.
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthModeCount {
+    pub mode: String,
+    pub count: usize,
+}
+
+/// Result of `PUT /admin/settings`.
+#[derive(Clone, Debug, Serialize)]
+pub struct SettingsSaved {
+    pub written_to: String,
+    /// Changed fields that are live now.
+    pub applied: Vec<&'static str>,
+    /// Changed fields the running process is still ignoring.
+    pub needs_restart: Vec<&'static str>,
+}
+
+/// A rejection must not be able to leave the file changed and the process not, or
+/// the reverse — so validation happens before anything is written.
+fn settings_error(message: impl Into<String>) -> ApiError {
+    ApiError(ChaprError::Internal {
+        message: message.into(),
+    })
+}
+
+/// How long a rejection keeps the fallback pinned.
+///
+/// A cutover cannot be judged finished while requests are still being turned away:
+/// the endpoints failing under the new mode are exactly the thing a fallback exists
+/// to protect, and they are invisible in the fallback's own usage count.
+const REJECTION_QUIET_PERIOD_S: i64 = 15 * 60;
+
+fn auth_usage_view(st: &AppState) -> AuthUsageView {
+    let recent = st.auth_usage.recent_by_mode();
+    let (admitted, rejected) = st.auth_usage.totals();
+    let last_rejection = st.auth_usage.last_failure();
+
+    let primary = st.authenticator().mode();
+    let fallback_in_recent = recent.iter().any(|(m, n)| m != primary && *n > 0);
+    let recent_rejection = last_rejection
+        .map(|t| (chrono::Utc::now() - t).num_seconds() < REJECTION_QUIET_PERIOD_S)
+        .unwrap_or(false);
+
+    let blocked_reason = if recent.is_empty() {
+        Some("no requests seen yet — let the endpoints talk to coord first".to_string())
+    } else if fallback_in_recent {
+        Some("the fallback is still admitting requests".to_string())
+    } else if recent_rejection {
+        Some(
+            "requests are still being rejected, so the clients may be failing rather \
+             than moving over"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    AuthUsageView {
+        recent_by_mode: recent
+            .into_iter()
+            .map(|(mode, count)| AuthModeCount { mode, count })
+            .collect(),
+        total_admitted: admitted,
+        total_rejected: rejected,
+        last_rejection,
+        safe_to_remove_fallback: blocked_reason.is_none(),
+        blocked_reason,
+    }
+}
+
+/// `GET /admin/settings` — the config, plus what may be edited and what applies.
+async fn get_settings(
+    State(st): State<AppState>,
+    _admin: crate::auth::AdminAuth,
+) -> Result<Json<AdminSettings>, ApiError> {
+    let cfg = st.config();
+    Ok(Json(AdminSettings {
+        config_path: cfg.source.as_ref().map(|p| p.display().to_string()),
+        overridden_by_env: cfg.overridden_by_env.clone(),
+        reloadable_fields: crate::config::RELOADABLE_FIELDS,
+        auth_usage: auth_usage_view(&st),
+        config: cfg,
+    }))
+}
+
+/// `PUT /admin/settings` — validate, persist, and apply what can be applied.
+///
+/// Order matters and is the whole safety story: validate, then refuse an
+/// env-captive edit, then write, then apply. A rejection therefore never leaves the
+/// file and the process disagreeing.
+async fn put_settings(
+    State(st): State<AppState>,
+    _admin: crate::auth::AdminAuth,
+    Json(incoming): Json<crate::config::Config>,
+) -> Result<Json<SettingsSaved>, ApiError> {
+    let current = st.config();
+
+    let Some(path) = current.source.clone() else {
+        return Err(settings_error(
+            "this coordinator was started without a config file, so there is nowhere to save. \
+             Run `chapr-coord setup` to create one, then restart against it.",
+        ));
+    };
+
+    // Carry over the fields that are not part of the config format.
+    let mut next = incoming;
+    next.source = current.source.clone();
+    next.overridden_by_env = current.overridden_by_env.clone();
+
+    next.validate().map_err(|e| settings_error(e.0))?;
+
+    let changed = current.changed_fields(&next);
+    // Refuse loudly rather than write a value the environment will discard. The UI
+    // marks these read-only, so a well-behaved client never gets here — but a value
+    // that saves and does nothing is exactly the failure this slice exists to avoid.
+    let captive: Vec<&str> = changed
+        .iter()
+        .copied()
+        .filter(|f| current.overridden_by_env.contains(f))
+        .collect();
+    if !captive.is_empty() {
+        return Err(settings_error(format!(
+            "{} is set by an environment variable on this coordinator, so saving it here would \
+             have no effect. Change the environment, or unset it and restart.",
+            captive.join(", ")
+        )));
+    }
+
+    next.write_to(&path).map_err(|e| settings_error(e.0))?;
+
+    let (applied, needs_restart): (Vec<&'static str>, Vec<&'static str>) = changed
+        .iter()
+        .copied()
+        .partition(|f| crate::config::RELOADABLE_FIELDS.contains(f));
+
+    if applied.contains(&"auth") || applied.contains(&"auth_fallback") {
+        st.set_auth(crate::auth::from_config(&next));
+        tracing::warn!(
+            auth = %next.auth,
+            fallback = next.auth_fallback.as_deref().unwrap_or("-"),
+            "auth mode changed live from the admin surface"
+        );
+    }
+    st.set_config(next);
+
+    tracing::info!(
+        path = %path.display(),
+        applied = applied.len(),
+        needs_restart = needs_restart.len(),
+        "settings saved"
+    );
+    Ok(Json(SettingsSaved {
+        written_to: path.display().to_string(),
+        applied,
+        needs_restart,
+    }))
+}
+
+/// `POST /admin/token/rotate` — replace the admin token and return the new one.
+///
+/// The token is permanent break-glass and cannot be turned off, which leaves one
+/// thing to answer: a former administrator may have kept a copy. Rotation is that
+/// answer. Presenting the current token is required, so this is a change of
+/// credential rather than a way to obtain one.
+async fn rotate_admin_token(
+    State(st): State<AppState>,
+    _admin: crate::auth::AdminAuth,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(dir) = st.config().data_dir() else {
+        return Err(settings_error(
+            "this coordinator has no data directory (an in-memory database?), so there is no \
+             token file to rotate",
+        ));
+    };
+    let token = crate::admin_token::rotate(&dir)
+        .map_err(|e| settings_error(format!("rotating the admin token: {e}")))?;
+    st.set_admin_token(token.clone());
+    tracing::warn!("admin token rotated; the previous one no longer works");
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "note": "Copy this now — it is not shown again. The previous token stopped working."
+    })))
 }
 
 /// The admin page itself — one self-contained file, embedded in the binary.
@@ -387,7 +605,10 @@ async fn admin_page() -> impl IntoResponse {
 }
 
 /// `GET /admin/overview` — the stat tiles plus this coordinator's configuration.
-async fn admin_overview(State(st): State<AppState>) -> Result<Json<AdminOverview>, ApiError> {
+async fn admin_overview(
+    State(st): State<AppState>,
+    _admin: crate::auth::AdminAuth,
+) -> Result<Json<AdminOverview>, ApiError> {
     let (errors, warnings) = crate::diagnostics::count_open(&st.pool).await?;
     let conflicts_open = crate::conflict::count_open_all(&st.pool).await?;
     // Reuse the same listing the Leases tab renders, so a tile can never disagree
@@ -403,6 +624,9 @@ async fn admin_overview(State(st): State<AppState>) -> Result<Json<AdminOverview
         .fetch_one(&st.pool)
         .await
         .unwrap_or(0);
+    // The live config, so the overview and the settings surface can never show
+    // different answers to "what is this coordinator set up for".
+    let cfg = st.config();
 
     Ok(Json(AdminOverview {
         version: env!("CARGO_PKG_VERSION"),
@@ -415,8 +639,8 @@ async fn admin_overview(State(st): State<AppState>) -> Result<Json<AdminOverview
         leases_held: count(lease::LeaseHealth::Held),
         leases_expiring: count(lease::LeaseHealth::Expiring),
         leases_stale: count(lease::LeaseHealth::Stale),
-        config_path: st.config_path.as_ref().map(|p| p.display().to_string()),
-        auth_mode: st.auth_mode.clone(),
+        config_path: cfg.source.as_ref().map(|p| p.display().to_string()),
+        auth_mode: cfg.auth.clone(),
         backend: st.backend_default.to_string(),
         blob_root: st.blob_root.display().to_string(),
         backend_routes: st
@@ -509,6 +733,7 @@ async fn record_audit(
 /// silently truncated. The fleet-wide form is a browsable list and is bounded.
 async fn query_audit(
     State(st): State<AppState>,
+    _admin: crate::auth::AdminAuth,
     Json(req): Json<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
     let events = match &req.path {
@@ -689,6 +914,19 @@ mod tests {
 
     fn body_json(v: &serde_json::Value) -> Body {
         Body::from(serde_json::to_vec(v).unwrap())
+    }
+
+    /// The admin token the gated-route tests present.
+    const TEST_TOKEN: &str = "test-admin-token";
+
+    /// State whose administrative surface is reachable with [`TEST_TOKEN`].
+    async fn admin_state() -> AppState {
+        AppState::new(db::test_pool().await).with_admin_token(TEST_TOKEN)
+    }
+
+    /// The header an admin request carries.
+    fn bearer() -> String {
+        format!("Bearer {TEST_TOKEN}")
     }
 
     #[tokio::test]
@@ -1037,6 +1275,385 @@ mod tests {
         assert_eq!(clean.journal_state, chapr_proto::JournalState::Clean);
     }
 
+    /// State with a real config file on disk, so settings can be saved.
+    async fn settings_state(dir: &std::path::Path, cfg: crate::config::Config) -> AppState {
+        let path = dir.join("coord.toml");
+        std::fs::write(&path, cfg.to_toml()).unwrap();
+        let mut cfg = cfg;
+        cfg.source = Some(path);
+        AppState::new(db::test_pool().await)
+            .with_admin_token(TEST_TOKEN)
+            .with_auth(crate::auth::from_config(&cfg))
+            .with_config(cfg)
+    }
+
+    fn base_cfg() -> crate::config::Config {
+        crate::config::Config {
+            addr: "127.0.0.1:8787".into(),
+            auth: "trusted-header".into(),
+            ..Default::default()
+        }
+    }
+
+    async fn put_settings_req(app: Router, cfg: &crate::config::Config) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/settings")
+                .header("content-type", "application/json")
+                .header("authorization", bearer())
+                .body(Body::from(serde_json::to_vec(cfg).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_saves_to_the_file_and_applies_auth_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = settings_state(tmp.path(), base_cfg()).await;
+        let path = state.config().source.clone().unwrap();
+
+        // Start a cutover: negotiate primary, the working mode as fallback.
+        let mut next = base_cfg();
+        next.auth = "negotiate".into();
+        next.auth_fallback = Some("trusted-header".into());
+        next.gc_secs = 1234; // a restart-required field, changed in the same save
+
+        let resp = put_settings_req(router(state.clone()), &next).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+        // The two halves are reported separately — that honesty is the point.
+        let applied: Vec<String> = serde_json::from_value(saved["applied"].clone()).unwrap();
+        let restart: Vec<String> = serde_json::from_value(saved["needs_restart"].clone()).unwrap();
+        assert!(applied.contains(&"auth".to_string()));
+        assert!(applied.contains(&"auth_fallback".to_string()));
+        assert!(
+            restart.contains(&"gc_secs".to_string()),
+            "a field wired into a running ticker must be reported as pending, not applied"
+        );
+
+        // Persisted…
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("negotiate"));
+        // …and live: the layered authenticator is in place, so a request the new
+        // primary rejects is admitted by the fallback.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-chapr-principal", "CONTOSO\\a".parse().unwrap());
+        let outcome = state.authenticator().authenticate(&h).unwrap();
+        assert_eq!(outcome.mode, "trusted-header", "the fallback admitted it");
+    }
+
+    #[tokio::test]
+    async fn settings_refuses_a_config_that_cannot_mean_what_it_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = settings_state(tmp.path(), base_cfg()).await;
+        let path = state.config().source.clone().unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // `disabled` never rejects, so the fallback would be unreachable.
+        let mut bad = base_cfg();
+        bad.auth = "disabled".into();
+        bad.auth_fallback = Some("trusted-header".into());
+
+        let resp = put_settings_req(router(state), &bad).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected save must not have touched the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_refuses_to_save_a_field_the_environment_owns() {
+        // The trap this whole mechanism exists for: overrides land on top of the
+        // file, so saving an overridden field would write a value that is silently
+        // discarded on the next load. Refuse loudly instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_cfg();
+        cfg.overridden_by_env = vec!["auth"];
+        let state = settings_state(tmp.path(), cfg).await;
+
+        let mut next = base_cfg();
+        next.overridden_by_env = vec!["auth"];
+        next.auth = "negotiate".into();
+
+        let resp = put_settings_req(router(state), &next).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("environment variable"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn settings_without_a_config_file_says_so_instead_of_pretending() {
+        let state = AppState::new(db::test_pool().await).with_admin_token(TEST_TOKEN);
+        let resp = put_settings_req(router(state), &base_cfg()).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("nowhere to save"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_fallback_gate_needs_both_conditions() {
+        // The sharpest point in the design. Fallback usage alone cannot tell a
+        // finished cutover from one where every client is simply being rejected —
+        // a rejected client never appears in the fallback's own count.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_cfg();
+        cfg.auth = "negotiate".into();
+        cfg.auth_fallback = Some("trusted-header".into());
+        let state = settings_state(tmp.path(), cfg).await;
+        let app = router(state.clone());
+
+        let read_gate = |st: AppState| async move {
+            let resp = router(st)
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/settings")
+                        .header("authorization", bearer())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let v: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            v["auth_usage"].clone()
+        };
+
+        // Nothing seen yet: not safe, and it says why rather than showing a green light.
+        let usage = read_gate(state.clone()).await;
+        assert_eq!(usage["safe_to_remove_fallback"], false);
+        assert!(usage["blocked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no requests seen"));
+
+        // A request the primary rejects and the fallback admits: fallback in use.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/leases")
+                    .header("content-type", "application/json")
+                    .header("x-chapr-principal", "CONTOSO\\a")
+                    .body(body_json(&serde_json::json!({
+                        "principal": "CONTOSO\\a", "session_id": "s",
+                        "purpose": "write", "paths": ["\\\\srv\\share\\a.md"]
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let usage = read_gate(state.clone()).await;
+        assert_eq!(usage["safe_to_remove_fallback"], false);
+        assert!(usage["blocked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("still admitting"));
+
+        // Now a request nothing admits — a client failing under the new mode. Even
+        // once the fallback stops being used, this must keep the gate shut.
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/leases")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({
+                        "principal": "CONTOSO\\a", "session_id": "s",
+                        "purpose": "write", "paths": ["\\\\srv\\share\\b.md"]
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let usage = read_gate(state).await;
+        assert_eq!(usage["safe_to_remove_fallback"], false);
+        assert!(usage["total_rejected"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn rotating_the_token_invalidates_the_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("coord.db");
+        let mut cfg = base_cfg();
+        cfg.db_url = format!("sqlite:{}?mode=rwc", db.display());
+        let state = settings_state(tmp.path(), cfg).await;
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/token/rotate")
+                    .header("authorization", bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let new_token = v["token"].as_str().unwrap().to_string();
+        assert_ne!(new_token, TEST_TOKEN);
+
+        // The old token stops working…
+        let old = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/overview")
+                    .header("authorization", bearer())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+
+        // …and the new one works.
+        let new = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/overview")
+                    .header("authorization", format!("Bearer {new_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_data_routes_refuse_without_the_token() {
+        let app = router(admin_state().await);
+        let cases: Vec<(&str, &str, Body)> = vec![
+            ("GET", "/admin/overview", Body::empty()),
+            ("POST", "/diagnostics/query", body_json(&serde_json::json!({}))),
+            ("POST", "/leases/query", body_json(&serde_json::json!({}))),
+            ("POST", "/audit/query", body_json(&serde_json::json!({}))),
+        ];
+        for (method, uri, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} must refuse a request with no admin token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_token_is_refused() {
+        let app = router(admin_state().await);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/overview")
+                    .header("authorization", "Bearer not-the-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_coordinator_with_no_token_refuses_rather_than_opens() {
+        // Fail closed. This is the state after the data directory could not be
+        // written, and serving the fleet's failure detail to anyone in that state
+        // would be the wrong direction entirely.
+        let app = router(AppState::new(db::test_pool().await));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/overview")
+                    .header("authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn the_routes_the_endpoint_uses_are_not_gated() {
+        // Load-bearing: the admin token belongs to a person, and endpoints do not
+        // have it. Gating a route the endpoint calls would break every laptop.
+        let state = admin_state().await;
+        let app = router(state);
+
+        // `chapr.conflicts` — shared with the admin page, so it cannot be gated.
+        let conflicts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/conflicts/query")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({"scope": ""})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflicts.status(), StatusCode::OK);
+
+        // The endpoint's own diagnostics reporting.
+        let report = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diagnostics")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({
+                        "code": "IO", "title": "t", "severity": "error",
+                        "principal": "CONTOSO\\a", "detail": "d", "remedy": "r"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_admin_page_itself_is_not_gated() {
+        // It must not be: the page is where the token is entered, so requiring the
+        // token to fetch it would be a closed loop.
+        let app = router(admin_state().await);
+        let resp = app
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn the_admin_page_is_served_and_self_contained() {
         let app = router(AppState::new(db::test_pool().await));
@@ -1065,6 +1682,27 @@ mod tests {
             !html.contains(".innerHTML ="),
             "the admin page must not assign innerHTML"
         );
+
+        // The login gate and the settings surface are the slice-6 additions. Assert
+        // they are present and wired to the routes that exist, so a broken
+        // find-and-replace in a 900-line file fails here rather than in a browser.
+        for needed in [
+            "id=\"login\"",             // the token screen
+            "id=\"token-input\"",
+            "data-panel=\"settings\"",  // the settings tab
+            "id=\"cutover-gate\"",      // the fallback gate
+            "id=\"drop-fallback\"",
+            "/admin/settings",          // the routes it calls
+            "/admin/token/rotate",
+            "Bearer ",                  // how it presents the token
+        ] {
+            assert!(html.contains(needed), "the admin page is missing {needed}");
+        }
+        // The slice-5 sentinel is gone: the page presents a real credential now.
+        assert!(
+            !html.contains("x-chapr-principal"),
+            "the admin page should no longer assert a principal; it holds a token"
+        );
     }
 
     #[tokio::test]
@@ -1072,7 +1710,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = AppState::new(db::test_pool().await)
             .with_blob_root(tmp.path().to_path_buf())
-            .with_deployment(Some(std::path::PathBuf::from("C:/data/coord.toml")), "trusted-header");
+            .with_admin_token(TEST_TOKEN)
+            .with_config(crate::config::Config {
+                auth: "trusted-header".into(),
+                source: Some(std::path::PathBuf::from("C:/data/coord.toml")),
+                ..Default::default()
+            });
 
         // One open diagnostic and one open conflict, so the tiles have something
         // to be right about.
@@ -1106,6 +1749,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/overview")
+                    .header("authorization", bearer())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1128,7 +1772,7 @@ mod tests {
 
     #[tokio::test]
     async fn leases_query_returns_held_leases_over_http() {
-        let state = AppState::new(db::test_pool().await);
+        let state = admin_state().await;
         let app = router(state.clone());
         let acq = app
             .clone()
@@ -1153,6 +1797,7 @@ mod tests {
                     .method("POST")
                     .uri("/leases/query")
                     .header("content-type", "application/json")
+                    .header("authorization", bearer())
                     .body(body_json(&serde_json::json!({})))
                     .unwrap(),
             )
@@ -1172,7 +1817,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_query_serves_both_the_per_path_and_the_fleet_wide_form() {
-        let state = AppState::new(db::test_pool().await);
+        let state = admin_state().await;
         for path in ["\\\\srv\\share\\a.md", "\\\\srv\\share\\b.md"] {
             crate::audit::record(
                 &state,
@@ -1197,6 +1842,7 @@ mod tests {
                     .method("POST")
                     .uri("/audit/query")
                     .header("content-type", "application/json")
+                    .header("authorization", bearer())
                     .body(body_json(&serde_json::json!({"path": "\\\\srv\\share\\a.md"})))
                     .unwrap(),
             )
@@ -1214,6 +1860,7 @@ mod tests {
                     .method("POST")
                     .uri("/audit/query")
                     .header("content-type", "application/json")
+                    .header("authorization", bearer())
                     .body(body_json(&serde_json::json!({"limit": 50})))
                     .unwrap(),
             )
@@ -1226,7 +1873,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reported_diagnostic_comes_back_from_the_query() {
-        let app = router(AppState::new(db::test_pool().await));
+        let app = router(admin_state().await);
         let body = serde_json::json!({
             "code": "SHARING_VIOLATION",
             "title": "A file could not be opened exclusively",
@@ -1258,6 +1905,7 @@ mod tests {
                     .method("POST")
                     .uri("/diagnostics/query")
                     .header("content-type", "application/json")
+                    .header("authorization", bearer())
                     .body(body_json(&serde_json::json!({})))
                     .unwrap(),
             )
