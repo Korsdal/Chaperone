@@ -74,9 +74,12 @@ Crash safety comes from the journal plus the snapshot, not from an atomic rename
 
 Two independent limits, deliberately not one number:
 
-- **`DEFAULT_MAX_INLINE_BYTES`** (512 KiB, override with `CHAPR_MAX_INLINE_BYTES`) is a *context*
+- **`DEFAULT_MAX_INLINE_BYTES`** (1 MiB, override with `CHAPR_MAX_INLINE_BYTES`) is a *context*
   limit — how much of a file usefully enters the model's input window. Over it, the read is refused
-  rather than truncated: a silently shortened body written back destroys the file's tail.
+  rather than truncated: a silently shortened body written back destroys the file's tail. The refusal
+  is a **tool-level** result, not a protocol error, and it says what the caller can do instead —
+  raising the cap is an operator action on that machine, so it is phrased as something to pass on
+  rather than something to attempt.
 - **`WRITEBACK_BUDGET_BYTES`** (128 KiB) is what a model can realistically echo back through
   `chapr_write` in one call. It refuses nothing; it reports `writable_inline=` in the envelope
   header, so a body too large to write back is still served for analysis while the model is told
@@ -91,7 +94,12 @@ back base64-encoded with `encoding=base64` in the envelope, so byte-exact round-
 there is no text extraction, and a compressed PDF is not analysable in that form at any size. Reading
 tender PDFs *as documents* is therefore not something `chapr_read` delivers today; `ReadContent::Ref`
 is defined in the proto for this and is not yet produced anywhere. Chaperone coordinates the files;
-getting a PDF's text in front of a model is a separate, open problem.
+getting a PDF's text in front of a model is a separate problem.
+
+In practice it is solved **upstream**: the workflow extracts each PDF, spreadsheet and document to a
+text mirror first, and the model reads those. That is why the inline cap is sized for one extracted
+document rather than for a source PDF — and why the cap, not the base64 path, is the limit that
+actually matters day to day.
 
 ## Layout
 

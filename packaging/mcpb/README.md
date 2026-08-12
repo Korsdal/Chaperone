@@ -3,8 +3,10 @@
 The Chaperone endpoint ships to laptops as an **MCPB** — a one-click MCP bundle
 that Claude Desktop installs (Settings → Extensions). An `.mcpb` is a zip of a
 `manifest.json` + the compiled `chapr-endpoint` binary. Because Chaperone derives
-identity from the OS logon (D-024), the **only** thing a user configures is the
-coordinator URL.
+identity from the OS logon (D-024), a user configures only **two** things: the
+coordinator URL, and the **coordinated location** — the share path the endpoint is
+allowed to act on, which is also announced to the model so it routes writes through
+Chaperone (E-025). A packager can set defaults for both so users type nothing.
 
 > Spec: <https://github.com/modelcontextprotocol/mcpb> · manifest reference:
 > `MANIFEST.md` in that repo. CLI: `npm i -g @anthropic-ai/mcpb`.
@@ -35,7 +37,16 @@ same template produces macOS/Linux (POSIX) bundles.
    `server/chapr-endpoint.exe`), then `validate`s + `pack`s it (omit `-Pack` to
    stop after assembly and run `mcpb pack` yourself).
 3. Distribute the resulting `.mcpb`. Users double-click it in Claude Desktop and
-   enter the coordinator URL when prompted.
+   enter the coordinator URL and coordinated location when prompted.
+
+`-Output <path>` writes the packed bundle straight to a customer deployable's
+committed location, which is how a customer deployable's committed bundle is produced.
+
+**Upgrading an installed bundle.** Claude Desktop identifies a bundle by `name` and
+`version`. While the version is held at `0.1.0` (a human decision, per the project's
+versioning rule) a rebuild is indistinguishable from the old one, so users must
+remove the existing extension before installing a new build. Say so in the customer
+guide rather than letting them discover a stale binary.
 
 ## Signing & provenance
 Claude Desktop reports **signature** (code-signed & trusted?) and **provenance**
