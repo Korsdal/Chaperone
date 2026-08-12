@@ -33,6 +33,7 @@ pub mod lease_manager;
 pub mod mount;
 pub mod ops;
 pub mod pathgrammar;
+pub mod pathlock;
 pub mod posixfs;
 pub mod read;
 pub mod server;

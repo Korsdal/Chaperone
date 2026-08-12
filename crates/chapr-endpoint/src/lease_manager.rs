@@ -20,10 +20,11 @@
 //! lease degrades to the conflict path, never to data loss (invariant 3).
 
 use crate::coord_client::CoordClient;
+use crate::pathlock::{PathGuards, PathLocks};
 use chapr_proto::{AcquireLeaseRequest, ChaprError, LeaseAcquireResponse, LeaseId};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -31,8 +32,25 @@ use tokio::task::JoinHandle;
 /// the lease.
 pub const RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long to keep waiting for a lease another *process* holds before handing
+/// the caller a "still busy" answer (E-027).
+///
+/// Bounded on purpose (CLAUDE.md failure directions: "bounded retries, exp
+/// backoff + jitter, per-file budget, terminal ask-the-human state" — an LLM will
+/// otherwise retry forever). Generous on purpose too: data integrity over speed,
+/// and a salesperson running a workflow already expects it to take time.
+pub const DEFAULT_ACQUIRE_BUDGET: Duration = Duration::from_secs(30);
+
+/// First backoff step; doubles up to [`MAX_BACKOFF`].
+const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_BACKOFF: Duration = Duration::from_secs(4);
+
 struct Held {
     lost: bool,
+    /// The in-process path locks this lease was granted under (E-027). Held for
+    /// exactly the lease's lifetime, so they are dropped by `release` — which is
+    /// what lets the next waiter through in the right order.
+    _guards: PathGuards,
 }
 
 /// Owns the set of leases this endpoint holds and renews them in the background.
@@ -40,6 +58,9 @@ pub struct LeaseManager {
     coord: CoordClient,
     held: Mutex<HashMap<LeaseId, Held>>,
     interval: Duration,
+    /// Local per-path queueing, applied *before* coord is asked (E-027).
+    locks: PathLocks,
+    budget: Duration,
 }
 
 impl LeaseManager {
@@ -48,6 +69,8 @@ impl LeaseManager {
             coord,
             held: Mutex::new(HashMap::new()),
             interval: RENEWAL_INTERVAL,
+            locks: PathLocks::new(),
+            budget: DEFAULT_ACQUIRE_BUDGET,
         }
     }
 
@@ -57,16 +80,88 @@ impl LeaseManager {
         self
     }
 
+    /// Override how long `acquire` waits out a lease held elsewhere.
+    pub fn with_acquire_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
+    }
+
     /// Acquire a lease via coord and start renewing it.
+    ///
+    /// Two layers of contention handling sit here, and they address different
+    /// problems:
+    ///
+    /// 1. **Local queueing** ([`PathLocks`]) — subagents of *this* process take
+    ///    the path in turn, so a session cannot collide with itself. This is the
+    ///    common case in a parallel fan-out and it is resolved without a single
+    ///    round-trip to coord.
+    /// 2. **Bounded retry** — a lease held by another *process* (the genuine
+    ///    cross-user contention Chaperone exists for) is waited out with
+    ///    exponential backoff plus jitter, up to the configured budget.
+    ///
+    /// **Only `LeaseHeld` is retried.** That response proves nothing was granted
+    /// (coord rolls its transaction back before returning it), so a retry has no
+    /// side effect. A transport failure is *not* retried: coord may have granted
+    /// a lease whose response was lost, and retrying would spin against our own
+    /// invisible lease until the budget expired. Writes fail closed on an
+    /// unreachable coord anyway (concept §10), which is the safe direction.
     pub async fn acquire(
         &self,
         req: &AcquireLeaseRequest,
     ) -> Result<LeaseAcquireResponse, ChaprError> {
-        let resp = self.coord.lease_acquire(req).await?;
-        self.held
-            .lock()
-            .await
-            .insert(resp.lease_id.clone(), Held { lost: false });
+        // Layer 1. Waits as long as necessary — a sibling subagent holds this for
+        // one write, not indefinitely, and queueing is the whole point.
+        let guards = self.locks.lock_all(&req.paths).await;
+
+        // Layer 2.
+        let started = Instant::now();
+        let mut backoff = FIRST_BACKOFF;
+        let mut attempts: u32 = 0;
+        let resp = loop {
+            attempts += 1;
+            match self.coord.lease_acquire(req).await {
+                Ok(resp) => break resp,
+                Err(ChaprError::LeaseHeld { holder, paths }) => {
+                    let spent = started.elapsed();
+                    if spent + backoff > self.budget {
+                        tracing::warn!(
+                            waited_ms = spent.as_millis(),
+                            attempts,
+                            %holder,
+                            "giving up waiting for a lease held elsewhere"
+                        );
+                        // The terminal "ask the human" state, not a bare failure —
+                        // its whole reason for existing is that an LLM handed a
+                        // retryable error will retry forever (§10). Names the path
+                        // that was actually unavailable, which for an all-or-none
+                        // set is more useful than the set.
+                        return Err(ChaprError::RetryBudgetExhausted {
+                            path: paths.into_iter().next().unwrap_or_else(|| {
+                                req.paths.first().cloned().expect("acquire requires a path")
+                            }),
+                            attempts,
+                        });
+                    }
+                    tracing::info!(
+                        waited_ms = spent.as_millis(),
+                        retry_in_ms = backoff.as_millis(),
+                        attempts,
+                        "path is being written by another session; waiting"
+                    );
+                    tokio::time::sleep(jittered(backoff)).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        self.held.lock().await.insert(
+            resp.lease_id.clone(),
+            Held {
+                lost: false,
+                _guards: guards,
+            },
+        );
         Ok(resp)
     }
 
@@ -79,7 +174,12 @@ impl LeaseManager {
     /// must not turn a completed write into an error), so log it here or the
     /// failure is invisible everywhere.
     pub async fn release(&self, lease_id: &LeaseId) -> Result<(), ChaprError> {
-        self.held.lock().await.remove(lease_id);
+        // Taken out of the map (so the renewer stops seeing it) but deliberately
+        // kept alive across the await: the entry owns this lease's path locks, and
+        // dropping them before coord has released the lease would let the next
+        // waiter through only to be told `LeaseHeld` by our own expiring lease.
+        // Holding them until after the DELETE makes the handover ordered.
+        let entry = self.held.lock().await.remove(lease_id);
         let result = self.coord.lease_release(lease_id).await;
         if let Err(e) = &result {
             tracing::warn!(
@@ -87,6 +187,7 @@ impl LeaseManager {
                 "lease release failed; it will lapse at the heartbeat TTL"
             );
         }
+        drop(entry);
         result
     }
 
@@ -134,6 +235,20 @@ impl LeaseManager {
             }
         })
     }
+}
+
+/// Spread `base` over `[base, 1.5 × base)`.
+///
+/// Jitter matters more than its quality here: several subagents released at the
+/// same instant would otherwise retry in lockstep and keep colliding. Derived
+/// from the clock rather than pulling in an RNG dependency — nothing about this
+/// needs to be unpredictable, only uncorrelated.
+fn jittered(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    base + base.mul_f64(0.5 * (nanos % 1_000) as f64 / 1_000.0)
 }
 
 #[cfg(test)]
@@ -202,6 +317,118 @@ mod tests {
         assert!(!mgr.is_held(&lease.lease_id).await, "renewal failure ⇒ lost");
     }
 
+    /// A `LEASE_HELD` that clears is waited out, not surfaced.
+    ///
+    /// This is the cross-process case: another person's laptop holds the file.
+    /// Before E-027 the first refusal came straight back to the model as a
+    /// protocol-level internal error.
+    #[tokio::test]
+    async fn a_lease_held_by_another_session_is_waited_out() {
+        let server = MockServer::start().await;
+        // Higher priority + a single use, so it wins once and then stops matching.
+        Mock::given(method("POST"))
+            .and(path("/leases"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "code": "LEASE_HELD",
+                "holder": "CONTOSO\\someone-else",
+                "paths": ["\\\\srv\\share\\a.md"]
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_acquire(&server, "lease-after-wait").await;
+
+        let mgr = LeaseManager::new(CoordClient::new(server.uri()));
+        let lease = mgr.acquire(&acquire_req()).await.expect("should wait, not fail");
+        assert_eq!(lease.lease_id.as_str(), "lease-after-wait");
+    }
+
+    /// A lease that never clears becomes the terminal ask-the-human state.
+    #[tokio::test]
+    async fn an_unavailable_lease_ends_as_retry_budget_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/leases"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "code": "LEASE_HELD",
+                "holder": "CONTOSO\\someone-else",
+                "paths": ["\\\\srv\\share\\a.md"]
+            })))
+            .mount(&server)
+            .await;
+
+        let mgr = LeaseManager::new(CoordClient::new(server.uri()))
+            .with_acquire_budget(Duration::from_millis(300));
+        let err = mgr.acquire(&acquire_req()).await.unwrap_err();
+        match err {
+            // Not `LeaseHeld`: that reads as retryable, and an LLM handed a
+            // retryable error retries forever (§10). This variant is the contract's
+            // terminal state and names the path that was actually unavailable.
+            ChaprError::RetryBudgetExhausted { path, attempts } => {
+                assert_eq!(path.as_str(), "\\\\srv\\share\\a.md");
+                assert!(attempts >= 1, "attempts should be counted, got {attempts}");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    /// A transport failure must NOT be retried.
+    #[tokio::test]
+    async fn an_unreachable_coord_fails_immediately_rather_than_retrying() {
+        // Coord may have granted a lease whose response was lost; retrying would
+        // spin against our own invisible lease until the budget expired. Writes
+        // fail closed on an unreachable coord anyway (concept §10).
+        let mgr = LeaseManager::new(CoordClient::new("http://127.0.0.1:1"))
+            .with_acquire_budget(Duration::from_secs(30));
+        let started = Instant::now();
+        let err = mgr.acquire(&acquire_req()).await.unwrap_err();
+        assert!(
+            matches!(err, ChaprError::CoordUnreachable),
+            "wrong error: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a transport error was retried: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Two concurrent acquires for one path are serialised locally, so the second
+    /// never reaches coord while the first holds the lease.
+    #[tokio::test]
+    async fn same_path_acquires_are_serialised_within_the_process() {
+        let server = MockServer::start().await;
+        mount_acquire(&server, "lease-shared").await;
+        let mgr = Arc::new(LeaseManager::new(CoordClient::new(server.uri())));
+
+        let first = mgr.acquire(&acquire_req()).await.unwrap();
+
+        // A second acquire for the same path must block on the local lock. It
+        // would otherwise sail through, because this mock always grants.
+        let mgr2 = mgr.clone();
+        let blocked = tokio::spawn(async move { mgr2.acquire(&acquire_req()).await });
+        let raced = tokio::time::timeout(Duration::from_millis(300), async {
+            // `blocked` cannot finish while the first lease is held.
+        })
+        .await;
+        assert!(raced.is_ok());
+        assert!(!blocked.is_finished(), "the second acquire was not serialised");
+
+        // Releasing the first hands the path over.
+        Mock::given(method("DELETE"))
+            .and(path("/leases/lease-shared"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let _ = mgr.release(&first.lease_id).await;
+        let second = tokio::time::timeout(Duration::from_secs(5), blocked)
+            .await
+            .expect("second acquire should proceed once the first released")
+            .unwrap();
+        assert!(second.is_ok(), "second acquire failed: {second:?}");
+    }
+
     #[tokio::test]
     async fn release_stops_tracking() {
         let server = MockServer::start().await;
@@ -232,7 +459,13 @@ mod tests {
         dead.held
             .lock()
             .await
-            .insert(lease.lease_id.clone(), Held { lost: false });
+            .insert(
+                lease.lease_id.clone(),
+                Held {
+                    lost: false,
+                    _guards: Vec::new(),
+                },
+            );
         dead.renew_all_once().await;
         assert!(!dead.is_held(&lease.lease_id).await);
     }
