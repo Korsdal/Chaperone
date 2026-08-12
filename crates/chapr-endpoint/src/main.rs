@@ -88,8 +88,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => tracing::warn!("local diagnostics log disabled; failures before coord is reachable will not be recorded anywhere"),
     }
 
-    let mut server = ChaprServer::new(coord, backend, principal, session_id).with_diagnostics(
-        std::sync::Arc::new(chapr_endpoint::diag::Diagnostics::new(diag_log)),
+    let diagnostics = std::sync::Arc::new(chapr_endpoint::diag::Diagnostics::new(diag_log));
+
+    // Preflight. Not a gate — reads degrade open and work without coord, so
+    // refusing to start would be the wrong direction (concept §10). This exists so
+    // the cause of "writes are refused" is on screen at start-up rather than
+    // discovered mid-task, and it lands in the diagnostics log too.
+    let probe = std::time::Instant::now();
+    match coord.healthz().await {
+        Ok(()) => tracing::info!(
+            %coord_url,
+            ms = probe.elapsed().as_millis(),
+            "coordinator reachable"
+        ),
+        Err(e) => {
+            tracing::error!(
+                %coord_url, error = %e,
+                "coordinator NOT reachable — reads will work, writes will be refused. \
+                 Check the coordinator service is running, that this URL is right, and that \
+                 nothing between this machine and it blocks the port."
+            );
+            diagnostics.report(&coord, &principal, &e).await;
+        }
+    }
+
+    let mut server = ChaprServer::with_diagnostics(
+        coord,
+        backend,
+        principal,
+        session_id,
+        diagnostics,
     );
     if let Some(cap) = std::env::var("CHAPR_MAX_INLINE_BYTES")
         .ok()

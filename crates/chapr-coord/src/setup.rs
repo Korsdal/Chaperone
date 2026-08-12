@@ -43,6 +43,17 @@ pub struct SetupArgs {
     pub tls_cert: Option<String>,
     #[arg(long)]
     pub tls_key: Option<String>,
+    /// Generate a self-signed certificate instead of supplying one.
+    ///
+    /// For a customer with no internal CA. It removes the "make a certificate by
+    /// hand" step; it does **not** remove the need to trust the result on the
+    /// laptops, which is the half nobody can automate away from here.
+    #[arg(long)]
+    pub tls_generate: bool,
+    /// Host name the generated certificate is for. Defaults to this machine's
+    /// name — which is what the laptops will be connecting to.
+    #[arg(long)]
+    pub tls_hostname: Option<String>,
     /// Fileserver backend kind this coord fronts (§14). Only `smb` today.
     #[arg(long)]
     pub backend: Option<String>,
@@ -87,8 +98,38 @@ fn config_from_args(args: &SetupArgs) -> Config {
 pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("── Chaperone coordination service — setup ──\n");
     let mut cfg = config_from_args(&args);
+    let mut generate_tls = args.tls_generate;
     if !args.non_interactive {
-        interactive_fill(&mut cfg)?;
+        generate_tls |= interactive_fill(&mut cfg)?;
+    }
+
+    // Before `probe`, which checks the certificate files exist — so a generated
+    // pair is validated by the same check as a supplied one rather than trusted.
+    if generate_tls && cfg.tls.is_none() {
+        let dir = args
+            .config_out
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .join("tls");
+        let host = args
+            .tls_hostname
+            .clone()
+            .or_else(machine_hostname)
+            .unwrap_or_else(|| "localhost".to_string());
+        println!("\nGenerating a self-signed certificate for {host}…");
+        cfg.tls = Some(generate_self_signed(&dir, &host)?);
+        println!("  cert → {}", dir.join("coord.crt").display());
+        println!("  key  → {}", dir.join("coord.key").display());
+        println!(
+            "  valid until {} — note the date; TLS stops working that day.",
+            (chrono::Utc::now() + chrono::Duration::days(CERT_VALID_DAYS))
+                .format("%Y-%m-%d")
+        );
+        println!(
+            "  ! Self-signed: install this certificate as trusted on the laptops, or they\n  \
+               will refuse the connection. An internal CA is the better answer if you have one."
+        );
     }
 
     println!("\nChecking the environment…");
@@ -137,7 +178,7 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn interactive_fill(cfg: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
+fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>> {
     use dialoguer::{Confirm, Input, Select};
 
     cfg.addr = Input::new()
@@ -200,14 +241,26 @@ fn interactive_fill(cfg: &mut Config) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    let mut generate_tls = false;
     if Confirm::new().with_prompt("Enable TLS (HTTPS)?").default(true).interact()? {
-        let cert_path: String = Input::new().with_prompt("TLS certificate path (PEM)").interact_text()?;
-        let key_path: String = Input::new().with_prompt("TLS private key path (PEM)").interact_text()?;
-        cfg.tls = Some(TlsConfig { cert_path, key_path });
+        // Asking rather than assuming: a customer with an internal CA should use
+        // it, and a self-signed certificate still has to be trusted on every
+        // laptop — which is work the wizard cannot do for them.
+        if Confirm::new()
+            .with_prompt("Generate a self-signed certificate? (No = supply your own from your CA)")
+            .default(true)
+            .interact()?
+        {
+            generate_tls = true;
+        } else {
+            let cert_path: String = Input::new().with_prompt("TLS certificate path (PEM)").interact_text()?;
+            let key_path: String = Input::new().with_prompt("TLS private key path (PEM)").interact_text()?;
+            cfg.tls = Some(TlsConfig { cert_path, key_path });
+        }
     } else {
         println!("  ! warning: serving plaintext HTTP — not for production.");
     }
-    Ok(())
+    Ok(generate_tls)
 }
 
 /// Validate the host can actually run this config, before we commit to it.
@@ -238,6 +291,89 @@ fn ensure_writable_dir(dir: &str) -> Result<(), String> {
     std::fs::write(&probe, b"ok").map_err(|e| format!("{dir} is not writable: {e}"))?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
+}
+
+// ---- self-signed TLS (E-016 residual) ------------------------------------
+
+/// How long a generated certificate is valid.
+///
+/// Five years: long enough that a pilot and its successor do not trip over it,
+/// short enough to be an honest date rather than rcgen's default of the year 4096.
+/// The expiry is printed at generation so it is a known date rather than a
+/// surprise TLS failure years later.
+const CERT_VALID_DAYS: i64 = 5 * 365;
+
+/// This machine's name — what the laptops will actually be connecting to.
+fn machine_hostname() -> Option<String> {
+    let key = if cfg!(windows) { "COMPUTERNAME" } else { "HOSTNAME" };
+    std::env::var(key).ok().filter(|h| !h.is_empty()).or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|h| !h.is_empty())
+    })
+}
+
+/// Write a self-signed cert/key pair into `dir` and return the paths.
+///
+/// Deliberately does **not** restrict the directory itself — [`harden_data_dirs`]
+/// does that, together with the database and blob store, and it runs *after*
+/// `probe` has validated the files. Locking the directory here instead locked the
+/// wizard out of the pair it had just written, so `probe` then reported the
+/// certificate as missing: a confusing failure with a correct-looking cause.
+///
+/// The private key is therefore unrestricted for the few seconds between being
+/// written and being locked down, inside one wizard run on the administrator's own
+/// machine. That is the right trade against validating a key nobody can read.
+fn generate_self_signed(dir: &Path, hostname: &str) -> Result<TlsConfig, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+
+    // localhost and the loopback address are included so the wizard's own
+    // `/healthz` self-test and any on-box check work against the same cert.
+    let sans = vec![
+        hostname.to_string(),
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ];
+    // Built by hand rather than via `generate_simple_self_signed`, which leaves
+    // rcgen's defaults in place: a subject of "rcgen self signed cert" and a
+    // validity of 1975–4096. Neither survives an administrator looking at the
+    // certificate, and a millennium-long validity is the kind of thing a client
+    // policy rejects for good reason.
+    let mut params = rcgen::CertificateParams::new(sans)
+        .map_err(|e| format!("building certificate parameters: {e}"))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, hostname);
+    use chrono::Datelike;
+    let today = chrono::Utc::now().date_naive();
+    // A day of slack backwards absorbs clock skew between this host and a laptop.
+    let start = today - chrono::Duration::days(1);
+    let end = today + chrono::Duration::days(CERT_VALID_DAYS);
+    let ymd = |d: chrono::NaiveDate| {
+        rcgen::date_time_ymd(d.year(), d.month() as u8, d.day() as u8)
+    };
+    params.not_before = ymd(start);
+    params.not_after = ymd(end);
+
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("generating a key: {e}"))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("self-signing the certificate: {e}"))?;
+    let key = rcgen::CertifiedKey { cert, key_pair };
+
+    let cert_path = dir.join("coord.crt");
+    let key_path = dir.join("coord.key");
+    std::fs::write(&cert_path, key.cert.pem())
+        .map_err(|e| format!("writing {}: {e}", cert_path.display()))?;
+    std::fs::write(&key_path, key.key_pair.serialize_pem())
+        .map_err(|e| format!("writing {}: {e}", key_path.display()))?;
+
+    Ok(TlsConfig {
+        cert_path: cert_path.display().to_string(),
+        key_path: key_path.display().to_string(),
+    })
 }
 
 // ---- data-directory hardening (D-029) ------------------------------------
@@ -317,6 +453,15 @@ fn is_unsafe_to_harden(p: &Path) -> bool {
 /// integration.
 fn harden_data_dirs(cfg: &Config) -> Vec<String> {
     let mut targets: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&cfg.blob_root)];
+    // The TLS directory belongs here for the same reason: a private key readable
+    // by every user on the fileserver makes the certificate pointless.
+    if let Some(tls) = &cfg.tls {
+        if let Some(parent) = Path::new(&tls.key_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                targets.push(parent.to_path_buf());
+            }
+        }
+    }
     if let Some(db) = db_file_path(&cfg.db_url) {
         if let Some(parent) = db.parent() {
             // The WAL and SHM siblings are created fresh by SQLite and inherit
@@ -490,20 +635,54 @@ fn print_manual_start(config_path: &Path) {
     );
 }
 
+/// The handover: everything the person who ran setup has to know or pass on.
+///
+/// Written as one block on purpose. The failure mode this replaces is not a
+/// missing feature — it is an installer that finishes successfully and leaves the
+/// administrator with no idea that an admin page exists, what to give the users,
+/// or where to look when a laptop misbehaves. Each line below is something that
+/// was previously only discoverable by reading source or docs.
 fn print_endpoint_snippet(cfg: &Config) {
     let scheme = if cfg.tls.is_some() { "https" } else { "http" };
-    println!("\n── Endpoint (MCPB) configuration ──");
-    println!("Point each chapr-endpoint at coord:");
-    println!("  CHAPR_COORD_URL={scheme}://{}", cfg.addr);
+    let base = format!("{scheme}://{}", cfg.addr);
+
+    println!("\n── Where to watch this ──");
+    println!("  Admin page:   {base}/admin");
+    println!("    Overview, failures with what fixes them, conflicts, leases, audit trail.");
+    println!("    Read-only, and it changes nothing.");
+    println!("  Health check: {base}/healthz");
+
+    println!("\n── Give this to the users ──");
+    println!("  Coordinator URL:      {base}");
+    println!("  Coordinated location: the share path, as UNC (e.g. \\\\FILESRV\\AICollab)");
+    println!("    Both are fields in the endpoint bundle's own install dialog. A mapped");
+    println!("    drive letter is fine — it is resolved to its UNC form, so users with");
+    println!("    different letters still agree on which file is which.");
     println!(
-        "  identity: auto-derived from the OS logon (auth mode: {}); set CHAPR_PRINCIPAL only to override.",
+        "  Identity is auto-derived from each user's OS logon (auth mode: {}). Nothing to type.",
         cfg.auth
     );
     println!(
-        "  backend: auto-selected per endpoint OS, confirmed against coord's announcement ({}).",
+        "  Backend is auto-selected per endpoint OS and confirmed against coord's announcement ({}).",
         cfg.backend
     );
-    println!("Health check: {scheme}://{}/healthz", cfg.addr);
+
+    println!("\n── When something breaks ──");
+    println!("  Whole fleet:  the admin page's Errors tab.");
+    println!("  One laptop:   %LOCALAPPDATA%\\Chaperone\\diagnostics.jsonl on that machine.");
+    println!("    That second one matters: a laptop that cannot reach the coordinator");
+    println!("    cannot report it to the coordinator.");
+    println!("  Only unexpected faults appear there. A write that lost a compare-and-swap,");
+    println!("  or a document someone has open in Word, is a designed outcome — look under");
+    println!("  Conflicts and Leases for those.");
+
+    println!("\n── Back up together ──");
+    println!("  Database:   {}", cfg.db_url);
+    println!("  Blob store: {}", cfg.blob_root);
+    println!("    History is only restorable if both are restored from the same moment.");
+    if cfg.tls.is_none() {
+        println!("\n  ! Serving plain HTTP. Restrict the port to the machines that need it.");
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +767,27 @@ mod tests {
             ..Config::default()
         };
         assert!(probe(&cfg).is_err());
+    }
+
+    #[test]
+    fn generate_self_signed_writes_a_usable_pem_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("chapr").join("tls");
+        let tls = generate_self_signed(&dir, "coord-01.example.com").unwrap();
+
+        let cert = std::fs::read_to_string(&tls.cert_path).unwrap();
+        let key = std::fs::read_to_string(&tls.key_path).unwrap();
+        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(key.contains("PRIVATE KEY-----"));
+        // `probe` is what the wizard uses to validate a supplied certificate, so a
+        // generated one has to satisfy the same check rather than be trusted.
+        let cfg = Config {
+            addr: "127.0.0.1:0".into(),
+            blob_root: tmp.path().join("blobs").display().to_string(),
+            tls: Some(tls),
+            ..Config::default()
+        };
+        probe(&cfg).expect("a generated pair must pass the same check as a supplied one");
     }
 
     #[test]

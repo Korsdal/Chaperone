@@ -328,6 +328,121 @@ fn purpose_to_str(p: LeasePurpose) -> &'static str {
 /// Collapse an unexpected `sqlx` error into the protocol's internal-error
 /// variant. A DB failure here is a bug or an operational fault, not an expected
 /// branch of the lease state machine.
+/// A held lease as the admin view shows it (E-024 read side).
+///
+/// Coord-local rather than a proto type: the consumer is the admin page's
+/// JavaScript, and the precedent (D-022) is to defer proto promotion until a
+/// second *Rust* consumer exists. It is deliberately **not** proto's
+/// [`chapr_proto::LeaseRecord`] either — that has no `session_id`, which is
+/// exactly the column an administrator needs when several agents share one user's
+/// identity, and it is already in use on the endpoint's path.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LeaseView {
+    pub lease_id: String,
+    /// Every path this lease covers. One lease over an all-or-none set is one
+    /// row here, not N — the set is the unit that was granted.
+    pub paths: Vec<String>,
+    pub principal: String,
+    pub session_id: String,
+    pub purpose: String,
+    pub granted_at: DateTime<Utc>,
+    pub renewed_at: DateTime<Utc>,
+    pub expiry: DateTime<Utc>,
+    pub hard_expiry: DateTime<Utc>,
+    /// Seconds until the heartbeat expiry; negative once past it.
+    pub renews_in_s: i64,
+    /// How long it has been held, in seconds.
+    pub held_for_s: i64,
+    pub state: LeaseHealth,
+}
+
+/// How healthy a held lease looks, for the admin view's status chip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseHealth {
+    /// Renewing normally.
+    Held,
+    /// Approaching its heartbeat expiry — one more renewal is due imminently.
+    Expiring,
+    /// **Renewal has stopped.** Past a full TTL since the last renewal but not
+    /// yet reaped, which means nobody is heartbeating it any more. Before the
+    /// I-008 fix this was the visible symptom of a single failed renewal
+    /// permanently ending renewal for that lease.
+    Stale,
+}
+
+/// Classify a lease from its timestamps. Pure, so the thresholds are testable
+/// without a database.
+pub fn classify(now_ms: i64, renewed_at_ms: i64, expiry_ms: i64, ttl_s: u32) -> LeaseHealth {
+    let ttl_ms = ttl_s as i64 * 1000;
+    // Renewal runs at TTL/3, so missing a whole TTL means it is not running.
+    if now_ms - renewed_at_ms > ttl_ms {
+        return LeaseHealth::Stale;
+    }
+    // Inside the last third of the heartbeat: a renewal is due about now.
+    if expiry_ms - now_ms < ttl_ms / 3 {
+        return LeaseHealth::Expiring;
+    }
+    LeaseHealth::Held
+}
+
+/// Every currently-held lease, newest first, grouped by `lease_id`.
+///
+/// Expired rows are filtered by time rather than deleted: this is a read, and a
+/// read must not mutate coordination state. The lazy sweep in [`acquire`] and the
+/// background reaper are what remove them.
+pub async fn list_held(pool: &SqlitePool, limit: i64) -> Result<Vec<LeaseView>, ChaprError> {
+    let now = Utc::now();
+    let now_ms = now.timestamp_millis();
+
+    let rows = sqlx::query(
+        "SELECT lease_id, path, principal, session_id, purpose,
+                granted_at_ms, ttl_s, renewed_at_ms, hard_expiry_ms, expiry_ms
+           FROM leases
+          WHERE expiry_ms > ?1 AND hard_expiry_ms > ?1
+          ORDER BY granted_at_ms DESC, lease_id, path",
+    )
+    .bind(now_ms)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+
+    // Fold the per-path rows back into one entry per lease, preserving the
+    // ordering the query established.
+    let mut out: Vec<LeaseView> = Vec::new();
+    for row in rows {
+        let lease_id: String = row.get("lease_id");
+        let path: String = row.get("path");
+        if let Some(existing) = out.iter_mut().find(|v| v.lease_id == lease_id) {
+            existing.paths.push(path);
+            continue;
+        }
+        if out.len() >= limit.max(0) as usize {
+            continue;
+        }
+        let granted_at_ms: i64 = row.get("granted_at_ms");
+        let renewed_at_ms: i64 = row.get("renewed_at_ms");
+        let expiry_ms: i64 = row.get("expiry_ms");
+        let hard_expiry_ms: i64 = row.get("hard_expiry_ms");
+        let ttl_s: u32 = row.get::<i64, _>("ttl_s") as u32;
+        out.push(LeaseView {
+            lease_id,
+            paths: vec![path],
+            principal: row.get("principal"),
+            session_id: row.get("session_id"),
+            purpose: row.get("purpose"),
+            granted_at: ms_to_dt(granted_at_ms),
+            renewed_at: ms_to_dt(renewed_at_ms),
+            expiry: ms_to_dt(expiry_ms),
+            hard_expiry: ms_to_dt(hard_expiry_ms),
+            renews_in_s: (expiry_ms - now_ms) / 1000,
+            held_for_s: (now_ms - granted_at_ms) / 1000,
+            state: classify(now_ms, renewed_at_ms, expiry_ms, ttl_s),
+        });
+    }
+    Ok(out)
+}
+
 fn internal(e: sqlx::Error) -> ChaprError {
     ChaprError::Internal {
         message: format!("coord db error: {e}"),
@@ -347,6 +462,78 @@ mod tests {
     }
     fn sess() -> SessionId {
         SessionId::new_unchecked("sess-t")
+    }
+
+    #[test]
+    fn classify_separates_healthy_from_stopped_renewal() {
+        let ttl = HEARTBEAT_TTL_S; // 90 s
+        let now = 1_000_000_000_i64;
+        let s = |renewed_ago_s: i64, expires_in_s: i64| {
+            classify(now, now - renewed_ago_s * 1000, now + expires_in_s * 1000, ttl)
+        };
+        // Renewed recently, plenty of heartbeat left.
+        assert_eq!(s(5, 85), LeaseHealth::Held);
+        // Inside the last third of the TTL: a renewal is due about now. Normal.
+        assert_eq!(s(70, 20), LeaseHealth::Expiring);
+        // Past a whole TTL since the last renewal — the renewer is not running.
+        // This is I-008's visible symptom, and it must not be reported as merely
+        // "expiring", because the two call for different responses.
+        assert_eq!(s(120, 40), LeaseHealth::Stale);
+    }
+
+    #[tokio::test]
+    async fn list_held_groups_a_set_into_one_entry() {
+        // A lease over an all-or-none set is one grant, so it is one row in the
+        // admin view rather than N rows that look like N leases.
+        let st = AppState::new(db::test_pool().await);
+        acquire(
+            &st,
+            who("CONTOSO\\a"),
+            sess(),
+            LeasePurpose::Move,
+            vec![p("\\\\srv\\share\\b.md"), p("\\\\srv\\share\\a.md")],
+        )
+        .await
+        .unwrap();
+
+        let held = list_held(&st.pool, 100).await.unwrap();
+        assert_eq!(held.len(), 1, "one lease, not one per path");
+        assert_eq!(held[0].paths.len(), 2);
+        assert_eq!(held[0].principal, "CONTOSO\\a");
+        assert_eq!(held[0].session_id, "sess-t");
+        assert_eq!(held[0].state, LeaseHealth::Held);
+        assert!(held[0].renews_in_s > 0, "a fresh lease has heartbeat left");
+        assert!(held[0].held_for_s >= 0);
+    }
+
+    #[tokio::test]
+    async fn list_held_hides_an_expired_lease_without_deleting_it() {
+        // A read must not mutate coordination state; the lazy sweep in `acquire`
+        // and the background reaper own removal.
+        let st = AppState::new(db::test_pool().await);
+        let lease = acquire(
+            &st,
+            who("CONTOSO\\a"),
+            sess(),
+            LeasePurpose::Write,
+            vec![p("\\\\srv\\share\\a.md")],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE leases SET expiry_ms = 1 WHERE lease_id = ?1")
+            .bind(lease.lease_id.as_str())
+            .execute(&st.pool)
+            .await
+            .unwrap();
+
+        assert!(list_held(&st.pool, 100).await.unwrap().is_empty());
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leases WHERE lease_id = ?1")
+                .bind(lease.lease_id.as_str())
+                .fetch_one(&st.pool)
+                .await
+                .unwrap();
+        assert_eq!(still_there, 1, "the read must not have swept the row");
     }
 
     #[tokio::test]

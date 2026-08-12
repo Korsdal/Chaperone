@@ -84,6 +84,19 @@ pub async fn count_open(pool: &SqlitePool, base_path: &CanonicalPath) -> Result<
     Ok(n as u32)
 }
 
+/// Count every open conflict, for the admin overview.
+///
+/// Distinct from [`count_open`], which answers "does *this file* have conflicts"
+/// on every `coord.resolve` — the hot path. This one is fleet-wide.
+pub async fn count_open_all(pool: &SqlitePool) -> Result<i64, ChaprError> {
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM conflicts WHERE state = 'open'")
+        .fetch_one(pool)
+        .await
+        .map_err(internal)?
+        .get("n");
+    Ok(n)
+}
+
 /// List open conflicts under a canonical path prefix (the governance artifact,
 /// `chapr.conflicts`). Newest first.
 pub async fn list(pool: &SqlitePool, scope: &CanonicalPath) -> Result<Vec<ConflictEntry>, ChaprError> {

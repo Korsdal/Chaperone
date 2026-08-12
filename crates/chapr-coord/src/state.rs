@@ -12,6 +12,7 @@
 use crate::auth::{Authenticator, DisabledAuth};
 use crate::config::BackendRoute;
 use chapr_proto::BackendKind;
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +37,17 @@ pub struct AppState {
     /// deployment topology, not per-resource ground truth — the swap-point for a
     /// future SQLite registry sits behind `index::backend_for`.
     pub backend_routes: Arc<Vec<BackendRoute>>,
+    /// When this process started serving, for the admin overview's uptime.
+    ///
+    /// A wall-clock instant rather than an `Instant`: it is rendered for a person
+    /// and has to survive being serialised, and a monotonic clock cannot be.
+    pub started_at: DateTime<Utc>,
+    /// The config file this coord was started from, if any, and the auth mode
+    /// name — both reported by the overview so an administrator can see *what
+    /// this coordinator is configured for* without opening a shell. Also the
+    /// hook the future Settings tab reads before it can offer to edit anything.
+    pub config_path: Option<PathBuf>,
+    pub auth_mode: String,
 }
 
 impl AppState {
@@ -49,7 +61,17 @@ impl AppState {
             auth: Arc::new(DisabledAuth),
             backend_default: BackendKind::default(),
             backend_routes: Arc::new(Vec::new()),
+            started_at: Utc::now(),
+            config_path: None,
+            auth_mode: "disabled".to_string(),
         }
+    }
+
+    /// Record what this coord was started from, for the admin overview.
+    pub fn with_deployment(mut self, config_path: Option<PathBuf>, auth_mode: &str) -> Self {
+        self.config_path = config_path;
+        self.auth_mode = auth_mode.to_string();
+        self
     }
 
     /// Point the blob store at `root`.

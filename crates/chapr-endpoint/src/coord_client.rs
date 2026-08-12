@@ -186,6 +186,28 @@ impl CoordClient {
         self.recv_json(self.http.post(self.url("/audit")).json(req)).await
     }
 
+    /// Liveness check against `GET /healthz`, for the start-up preflight.
+    ///
+    /// Worth doing eagerly: without it the first sign that a laptop cannot reach
+    /// its coordinator is a refused write in the middle of somebody's work, and
+    /// the cause — a wrong URL, a blocked port, an untrusted certificate — is
+    /// exactly the class of problem that is obvious at start-up and mystifying
+    /// later.
+    pub async fn healthz(&self) -> Result<(), ChaprError> {
+        let resp = self
+            .authed(self.http.get(self.url("/healthz")))
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(ChaprError::Internal {
+                message: format!("coord answered /healthz with HTTP {}", resp.status()),
+            })
+        }
+    }
+
     /// Report one unexpected failure to coord's diagnostics store (E-026).
     ///
     /// Separate from `record_audit` on purpose: audit records what a principal did

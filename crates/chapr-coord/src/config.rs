@@ -51,6 +51,15 @@ pub struct Config {
     /// Longest-prefix backend routes for static mixed-backend topology. Empty by
     /// default.
     pub backend_routes: Vec<BackendRoute>,
+    /// The file this config was read from, if any.
+    ///
+    /// Not part of the config *format* — `skip` keeps it out of both directions of
+    /// the TOML, so `to_toml` never emits it and a file containing it is not
+    /// rejected. It exists because "which file is this coordinator running from"
+    /// is the first question in any support call, and the admin overview answers
+    /// it without anyone opening a shell.
+    #[serde(skip)]
+    pub source: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -67,6 +76,7 @@ impl Default for Config {
             tls: None,
             backend: BackendKind::default(),
             backend_routes: Vec::new(),
+            source: None,
         }
     }
 }
@@ -83,6 +93,7 @@ impl Config {
             }
             None => Config::default(),
         };
+        cfg.source = path.map(|p| p.to_path_buf());
         cfg.apply_overrides(|k| std::env::var(k).ok());
         Ok(cfg)
     }

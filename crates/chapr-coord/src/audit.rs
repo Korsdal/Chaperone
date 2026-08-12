@@ -86,33 +86,66 @@ pub async fn query(pool: &SqlitePool, path: &CanonicalPath) -> Result<Vec<AuditE
     .await
     .map_err(internal)?;
 
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        let Some(kind) = kind_from_str(&row.get::<String, _>("kind")) else {
-            continue; // unknown kind ⇒ corrupt row; skip
-        };
-        let from_version = match row.get::<Option<String>, _>("from_version") {
-            Some(h) => VersionToken::from_hex(h),
-            None => None,
-        };
-        let to_version = match row.get::<Option<String>, _>("to_version") {
-            Some(h) => VersionToken::from_hex(h),
-            None => None,
-        };
-        events.push(AuditEvent {
-            event_id: EventId::new_unchecked(row.get::<String, _>("event_id")),
-            timestamp: DateTime::<Utc>::from_timestamp_millis(row.get::<i64, _>("timestamp_ms"))
-                .unwrap_or_default(),
-            principal: Principal::new_unchecked(row.get::<String, _>("principal")),
-            session_id: SessionId::new_unchecked(row.get::<String, _>("session_id")),
-            canonical_path: CanonicalPath::new_unchecked(row.get::<String, _>("canonical_path")),
-            kind,
-            from_version,
-            to_version,
-            detail: row.get::<String, _>("detail"),
-        });
-    }
-    Ok(events)
+    Ok(rows.into_iter().filter_map(row_to_event).collect())
+}
+
+/// The audit trail across every path, newest first — the admin view's read.
+///
+/// A sibling of [`query`] rather than a change to it: the per-path form is the
+/// governance read ("who changed *this* file") and is used by the endpoint and by
+/// tests, so its signature stays put. Filters are all optional and compose.
+///
+/// `ORDER BY id DESC` uses the primary key, so no index is needed for the plain
+/// listing; `idx_audit_principal` covers the `principal` filter.
+pub async fn query_recent(
+    pool: &SqlitePool,
+    principal: Option<&str>,
+    kind: Option<AuditKind>,
+    since_ms: Option<i64>,
+    limit: i64,
+) -> Result<Vec<AuditEvent>, ChaprError> {
+    let rows = sqlx::query(
+        "SELECT event_id, timestamp_ms, principal, session_id, canonical_path,
+                kind, from_version, to_version, detail
+           FROM audit_log
+          WHERE (?1 IS NULL OR principal = ?1)
+            AND (?2 IS NULL OR kind = ?2)
+            AND (?3 IS NULL OR timestamp_ms >= ?3)
+          ORDER BY id DESC
+          LIMIT ?4",
+    )
+    .bind(principal)
+    .bind(kind.map(kind_str))
+    .bind(since_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+
+    Ok(rows.into_iter().filter_map(row_to_event).collect())
+}
+
+/// One `audit_log` row as an [`AuditEvent`]. `None` for a row whose `kind` is
+/// unknown — a corrupt or future-version row is skipped rather than failing the
+/// whole read, which is what keeps a governance query answerable.
+fn row_to_event(row: sqlx::sqlite::SqliteRow) -> Option<AuditEvent> {
+    let kind = kind_from_str(&row.get::<String, _>("kind"))?;
+    let version = |col: &str| match row.get::<Option<String>, _>(col) {
+        Some(h) => VersionToken::from_hex(h),
+        None => None,
+    };
+    Some(AuditEvent {
+        event_id: EventId::new_unchecked(row.get::<String, _>("event_id")),
+        timestamp: DateTime::<Utc>::from_timestamp_millis(row.get::<i64, _>("timestamp_ms"))
+            .unwrap_or_default(),
+        principal: Principal::new_unchecked(row.get::<String, _>("principal")),
+        session_id: SessionId::new_unchecked(row.get::<String, _>("session_id")),
+        canonical_path: CanonicalPath::new_unchecked(row.get::<String, _>("canonical_path")),
+        kind,
+        from_version: version("from_version"),
+        to_version: version("to_version"),
+        detail: row.get::<String, _>("detail"),
+    })
 }
 
 fn kind_str(k: AuditKind) -> &'static str {
@@ -155,6 +188,86 @@ mod tests {
 
     fn path() -> CanonicalPath {
         CanonicalPath::new_unchecked("\\\\srv\\share\\a.md")
+    }
+
+    #[tokio::test]
+    async fn query_recent_lists_across_paths_and_filters() {
+        let st = AppState::new(db::test_pool().await);
+        let a = CanonicalPath::new_unchecked("\\\\srv\\share\\a.md");
+        let b = CanonicalPath::new_unchecked("\\\\srv\\share\\b.md");
+        for (who, path, kind) in [
+            ("CONTOSO\\one", &a, AuditKind::WriteCommit),
+            ("CONTOSO\\two", &b, AuditKind::LeaseGrant),
+            ("CONTOSO\\one", &b, AuditKind::WriteCommit),
+        ] {
+            record(
+                &st,
+                &Principal::new_unchecked(who),
+                &SessionId::new_unchecked("sess-t"),
+                path,
+                kind,
+                None,
+                None,
+                "d",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Fleet-wide, newest first.
+        let all = query_recent(&st.pool, None, None, None, 100).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].canonical_path, b, "newest first");
+
+        // Filters compose and are independent.
+        let by_who = query_recent(&st.pool, Some("CONTOSO\\one"), None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(by_who.len(), 2);
+        let by_kind = query_recent(&st.pool, None, Some(AuditKind::LeaseGrant), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(by_kind.len(), 1);
+        let capped = query_recent(&st.pool, None, None, None, 1).await.unwrap();
+        assert_eq!(capped.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_per_path_query_is_unchanged_by_the_fleet_wide_one() {
+        // The governance read ("who changed *this* file") keeps its exact
+        // behaviour, including being unbounded — a truncated answer to that
+        // question is a wrong answer.
+        let st = AppState::new(db::test_pool().await);
+        for _ in 0..3 {
+            record(
+                &st,
+                &Principal::new_unchecked("CONTOSO\\jsmith"),
+                &SessionId::new_unchecked("sess-t"),
+                &path(),
+                AuditKind::WriteCommit,
+                None,
+                None,
+                "d",
+            )
+            .await
+            .unwrap();
+        }
+        record(
+            &st,
+            &Principal::new_unchecked("CONTOSO\\jsmith"),
+            &SessionId::new_unchecked("sess-t"),
+            &CanonicalPath::new_unchecked("\\\\srv\\share\\other.md"),
+            AuditKind::WriteCommit,
+            None,
+            None,
+            "d",
+        )
+        .await
+        .unwrap();
+
+        let scoped = query(&st.pool, &path()).await.unwrap();
+        assert_eq!(scoped.len(), 3, "only this file's events");
+        assert!(scoped.iter().all(|e| e.canonical_path == path()));
     }
 
     #[tokio::test]
