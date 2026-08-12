@@ -15,6 +15,7 @@
       "args": [],
       "env": {
         "CHAPR_COORD_URL": "${user_config.coord_url}",
+        "CHAPR_ROOT": "${user_config.coordinated_root}",
         "RUST_LOG": "${user_config.log_level}"
       }
     }
@@ -25,6 +26,12 @@
       "title": "Coordinator URL",
       "description": "The address of the Chaperone coordinator (from your IT administrator, or your own coordinator setup). If you weren't given one, reach out before continuing. Example: http://coord-host:8787 (https:// if TLS is enabled). NOTE to packager: you MAY add a `default` here set to the REAL coordinator URL to pre-fill it for non-technical users — but never leave it as localhost.",
       "required": true
+    },
+    "coordinated_root": {
+      "type": "string",
+      "title": "Coordinated location",
+      "description": "The shared location Chaperone coordinates, as a UNC path — e.g. \\\\FILESRV\\AICollab. Separate several with commas. This does two things: the endpoint refuses to act on anything outside it, and it is announced to Claude so it knows which files must go through Chaperone rather than an ordinary write. A mapped drive letter is accepted and resolved to its UNC form, so users with different letters still agree. NOTE to packager: set a `default` here to the real share path — leaving it empty starts the endpoint unconfined, which works but drops the boundary.",
+      "required": false
     },
     "log_level": {
       "type": "string",

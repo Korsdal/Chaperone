@@ -30,6 +30,7 @@ pub mod canon;
 pub mod coord_client;
 pub mod identity;
 pub mod lease_manager;
+pub mod mount;
 pub mod ops;
 pub mod pathgrammar;
 pub mod posixfs;
