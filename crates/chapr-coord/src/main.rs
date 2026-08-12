@@ -88,6 +88,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Bring up all subsystems from a resolved config and serve until shutdown.
 /// Shared by `serve` and (on Windows) the SCM service main.
 pub(crate) async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
+    run_server_ready(cfg, None).await
+}
+
+/// As [`run_server`], but sends on `ready` once the listener is **bound**.
+///
+/// I-006: the Windows service main reported RUNNING to the SCM before any of
+/// this ran, so a failure to open the database, load a TLS certificate or bind
+/// the port left the SCM showing a healthy service with nothing listening — and
+/// the rustls provider panic (D-026 session) hit exactly that window. Ordering
+/// is the whole fix: every bring-up step that can fail happens before the signal,
+/// and a supervisor that never receives it knows startup failed.
+///
+/// A `std::sync::mpsc::Sender` rather than a `tokio::sync::oneshot`: the send is
+/// non-blocking and needs no runtime, so the caller can be a plain OS thread
+/// (which the SCM service main is), and coord's tokio does not carry the `sync`
+/// feature.
+pub(crate) async fn run_server_ready(
+    cfg: Config,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(db_url = %cfg.db_url, "opening coordination store");
     let pool = db::connect(&cfg.db_url, 5).await?;
     db::migrate(&pool).await?;
@@ -146,14 +166,20 @@ pub(crate) async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Er
                 &tls.key_path,
             )
             .await?;
+            // Bind explicitly instead of `bind_rustls`, which binds lazily inside
+            // `serve`: the readiness signal must not fire until the port is
+            // genuinely held, or I-006 reappears for the TLS path only.
+            let listener = std::net::TcpListener::bind(addr)?;
             tracing::info!(%addr, "chapr-coord listening (TLS)");
-            axum_server::bind_rustls(addr, rustls)
+            signal_ready(ready);
+            axum_server::from_tcp_rustls(listener, rustls)
                 .serve(app.into_make_service())
                 .await?;
         }
         None => {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!(%addr, "chapr-coord listening");
+            signal_ready(ready);
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
@@ -162,6 +188,14 @@ pub(crate) async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Er
 
     tracing::info!("chapr-coord shut down cleanly");
     Ok(())
+}
+
+/// Tell a waiting supervisor the listener is up (I-006). A dropped receiver just
+/// means nobody is waiting any more, which is not a reason to stop serving.
+fn signal_ready(ready: Option<std::sync::mpsc::Sender<()>>) {
+    if let Some(tx) = ready {
+        let _ = tx.send(());
+    }
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
