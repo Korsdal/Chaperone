@@ -1699,9 +1699,21 @@ mod tests {
             assert!(html.contains(needed), "the admin page is missing {needed}");
         }
         // The slice-5 sentinel is gone: the page presents a real credential now.
+        // Checked as a *word*, not just as a header name — the first version of
+        // this assertion looked only for `x-chapr-principal` and so missed a footer
+        // that still told the reader the page identifies itself as `admin-ui` and
+        // changes nothing. Both had stopped being true.
         assert!(
             !html.contains("x-chapr-principal"),
             "the admin page should no longer assert a principal; it holds a token"
+        );
+        assert!(
+            !html.contains("admin-ui"),
+            "the admin-ui sentinel is gone; no prose should still refer to it"
+        );
+        assert!(
+            !html.contains("Read-only view"),
+            "the page is no longer read-only — the Settings tab writes the config"
         );
     }
 
