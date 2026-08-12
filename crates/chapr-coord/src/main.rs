@@ -10,6 +10,7 @@
 //! See `config.rs` for the full surface. TLS: set `[tls]` in the config (or
 //! `CHAPR_COORD_TLS_CERT`/`_KEY`) to serve HTTPS via rustls.
 
+mod admin_token;
 mod audit;
 mod auth;
 mod config;
@@ -117,11 +118,42 @@ pub(crate) async fn run_server_ready(
     tokio::fs::create_dir_all(&cfg.blob_root).await?;
     tracing::info!(blob_root = %cfg.blob_root, "blob store ready");
 
-    let state = AppState::new(pool)
+    // The admin token lives in the coordinator's own data directory, which the
+    // installer already restricts to administrators and the service account
+    // (D-029) — so its confidentiality is a protection that already exists. If
+    // there is no data directory (an in-memory database) or it cannot be written,
+    // the administrative surface fails closed rather than open.
+    let admin_token = match cfg.data_dir() {
+        Some(dir) => match admin_token::load_or_create(&dir) {
+            Ok(t) => {
+                tracing::info!(path = %admin_token::path_in(&dir).display(), "admin token ready");
+                Some(t)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, dir = %dir.display(), "could not establish an admin token; the admin page will refuse to serve data");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("no data directory (in-memory database?); the admin page will refuse to serve data");
+            None
+        }
+    };
+
+    let mut state = AppState::new(pool)
         .with_blob_root(cfg.blob_root.as_str())
-        .with_auth(auth::from_name(&cfg.auth))
+        .with_auth(auth::from_config(&cfg))
         .with_backends(cfg.backend, cfg.backend_routes.clone())
-        .with_deployment(cfg.source.clone(), &cfg.auth);
+        .with_config(cfg.clone());
+    if let Some(t) = admin_token {
+        state = state.with_admin_token(t);
+    }
+    if let Some(fallback) = &cfg.auth_fallback {
+        tracing::warn!(
+            primary = %cfg.auth, %fallback,
+            "auth fallback active — a cutover is in progress; remove it once the primary is admitting everything"
+        );
+    }
     tracing::info!(auth = %cfg.auth, backend = %cfg.backend, "connection auth mode");
 
     // Proactive recovery scan (concept §15).

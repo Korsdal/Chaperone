@@ -378,19 +378,6 @@ fn generate_self_signed(dir: &Path, hostname: &str) -> Result<TlsConfig, String>
 
 // ---- data-directory hardening (D-029) ------------------------------------
 
-/// The on-disk SQLite file a `db_url` names, if it names one.
-///
-/// `sqlite:C:/data/coord.db?mode=rwc` → the path; `sqlite::memory:` → `None`.
-fn db_file_path(db_url: &str) -> Option<std::path::PathBuf> {
-    let rest = db_url.strip_prefix("sqlite:")?;
-    let rest = rest.strip_prefix("//").unwrap_or(rest);
-    let rest = rest.split('?').next()?;
-    // A leading ':' is a SQLite pseudo-target (`:memory:`), not a path.
-    if rest.is_empty() || rest.starts_with(':') {
-        return None;
-    }
-    Some(std::path::PathBuf::from(rest))
-}
 
 /// Directories we refuse to touch: hardening one of these locks down the machine
 /// rather than the coordinator.
@@ -462,7 +449,7 @@ fn harden_data_dirs(cfg: &Config) -> Vec<String> {
             }
         }
     }
-    if let Some(db) = db_file_path(&cfg.db_url) {
+    if let Some(db) = crate::config::db_file_path(&cfg.db_url) {
         if let Some(parent) = db.parent() {
             // The WAL and SHM siblings are created fresh by SQLite and inherit
             // from the directory, not from the .db file — so the directory is
@@ -648,9 +635,35 @@ fn print_endpoint_snippet(cfg: &Config) {
 
     println!("\n── Where to watch this ──");
     println!("  Admin page:   {base}/admin");
-    println!("    Overview, failures with what fixes them, conflicts, leases, audit trail.");
-    println!("    Read-only, and it changes nothing.");
+    println!("    Overview, failures with what fixes them, conflicts, leases, audit trail,");
+    println!("    and the settings — including how to change the connection auth mode safely.");
     println!("  Health check: {base}/healthz");
+
+    // The token, not just its path: the whole point of the handover is that the
+    // person running setup can hand over everything needed without going hunting.
+    match cfg.data_dir() {
+        Some(dir) => match crate::admin_token::load_or_create(&dir) {
+            Ok(token) => {
+                println!("\n── Sign in to the admin page with this ──");
+                println!("  {token}");
+                println!(
+                    "  Kept in {} — a directory restricted to administrators, so the file",
+                    crate::admin_token::path_in(&dir).display()
+                );
+                println!("  itself is the safe place for it. Read it again any time.");
+                println!("  It does not depend on the auth mode, which is deliberate: it is the");
+                println!("  way back in if a change to the auth setting turns out to be wrong.");
+            }
+            Err(e) => {
+                eprintln!("\n  ! could not create the admin token: {e}");
+                eprintln!("    The admin page will refuse to show anything until this is fixed.");
+            }
+        },
+        None => {
+            eprintln!("\n  ! no data directory (an in-memory database?), so no admin token —");
+            eprintln!("    the admin page will refuse to show anything.");
+        }
+    }
 
     println!("\n── Give this to the users ──");
     println!("  Coordinator URL:      {base}");
@@ -793,16 +806,16 @@ mod tests {
     #[test]
     fn db_file_path_finds_the_sqlite_file_and_ignores_pseudo_targets() {
         assert_eq!(
-            db_file_path("sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc"),
+            crate::config::db_file_path("sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc"),
             Some(std::path::PathBuf::from("C:/ProgramData/Chaperone/coord.db"))
         );
         assert_eq!(
-            db_file_path("sqlite:///var/lib/chapr/coord.db"),
+            crate::config::db_file_path("sqlite:///var/lib/chapr/coord.db"),
             Some(std::path::PathBuf::from("/var/lib/chapr/coord.db"))
         );
         // `:memory:` names no directory to restrict — must not be mistaken for one.
-        assert_eq!(db_file_path("sqlite::memory:"), None);
-        assert_eq!(db_file_path("postgres://host/db"), None);
+        assert_eq!(crate::config::db_file_path("sqlite::memory:"), None);
+        assert_eq!(crate::config::db_file_path("postgres://host/db"), None);
     }
 
     #[test]

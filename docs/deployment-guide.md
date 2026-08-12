@@ -59,10 +59,36 @@ touches coord.
 by coord itself, so there is nothing extra to install and it works on a network
 with no route out.
 
-Five tabs: **Overview** (counts, plus what this coordinator is configured for),
-**Errors**, **Conflicts**, **Leases**, **Audit trail**. It is **read-only** —
-acknowledging a failure, releasing a lease and editing settings need the
-administrator role, which is not built yet.
+Six tabs: **Overview** (counts, plus what this coordinator is configured for),
+**Errors**, **Conflicts**, **Leases**, **Audit trail**, **Settings**.
+
+**Signing in.** The page asks for the coordinator's admin token, kept as
+`admin-token` in the coordinator's data directory — the directory beside the
+database, which the installer restricts to administrators and the service account.
+The setup wizard prints it; you can read the file again at any time.
+
+The token deliberately does **not** depend on the connection auth mode. That is
+what makes changing the auth mode safe: a wrong setting cannot lock you out of the
+page you need in order to undo it. It cannot be switched off for the same reason,
+so **rotation** (a button on the Settings tab) is how you answer "someone who has
+left may still have a copy".
+
+**Changing the connection auth mode.** Do it as a cutover, not a switch:
+
+1. Set the new mode as the primary and keep the old one as the **fallback**.
+   Both apply immediately; no restart.
+2. Watch the Settings tab. It shows which mode has been admitting the recent
+   requests, and how many have been rejected.
+3. Remove the fallback when the page says it is safe — which needs **both** no
+   recent fallback use **and** no recent rejections. One without the other cannot
+   tell a finished cutover from one where every client is simply failing: a client
+   that cannot authenticate never appears in the fallback's own usage count.
+
+Other settings save to the config file. Only `auth` and `auth_fallback` take effect
+without a restart; the page says which of your changes are live and which are
+waiting, rather than implying everything reloads. A field held by a
+`CHAPR_COORD_*` environment variable is shown as locked — saving it would write a
+value the environment discards on the next start.
 
 ## When something breaks
 
@@ -97,6 +123,8 @@ that is the intended steady state.
 - [ ] Coord host + address + persistent DB/blob volumes
 - [ ] Auth mode (MVP `trusted-header` vs enforced)
 - [ ] Admin page URL passed to whoever supports this (`<coord>/admin`)
+- [ ] Admin token handed over (printed by `setup`; also `admin-token` in the data
+      directory). Rotate it when someone with access leaves.
 - [ ] Client OS(es) → which MCPB bundle(s) to build
 - [ ] Coordinator URL baked into the bundle default / comms to users
 - [ ] **Coordinated root** (`CHAPR_ROOT` / the bundle's "Coordinated location"):

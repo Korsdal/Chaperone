@@ -51,6 +51,31 @@ pub struct Config {
     /// Longest-prefix backend routes for static mixed-backend topology. Empty by
     /// default.
     pub backend_routes: Vec<BackendRoute>,
+    /// A second authenticator, tried when the primary rejects (slice 6).
+    ///
+    /// The safe way to change auth modes: run the new one as `auth` with the old
+    /// one here, watch the real endpoints come through on the new mode, then
+    /// remove this. Without it, a misconfigured cutover is discovered through
+    /// support calls from users whose writes started failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_fallback: Option<String>,
+    /// Principals allowed to administer this coordinator (D-029's role model).
+    ///
+    /// Enforced only when the auth mode actually authenticates (`negotiate`,
+    /// `oidc` — E-015). Under `trusted-header` the principal is asserted by the
+    /// client and unverifiable, so this is recorded but authorizes nothing; the
+    /// admin token is what gates mutations there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_principals: Vec<String>,
+    /// Config keys currently being overridden by the environment.
+    ///
+    /// Not part of the config format — it is derived at load. It exists because
+    /// `apply_overrides` layers `CHAPR_COORD_*` **on top of** the file, so a
+    /// settings UI that let someone edit an env-overridden field would save a
+    /// value that is silently discarded on the next load. Recording which keys
+    /// are captive lets the UI say so instead of lying.
+    #[serde(skip)]
+    pub overridden_by_env: Vec<&'static str>,
     /// The file this config was read from, if any.
     ///
     /// Not part of the config *format* — `skip` keeps it out of both directions of
@@ -76,6 +101,9 @@ impl Default for Config {
             tls: None,
             backend: BackendKind::default(),
             backend_routes: Vec::new(),
+            auth_fallback: None,
+            admin_principals: Vec::new(),
+            overridden_by_env: Vec::new(),
             source: None,
         }
     }
@@ -100,45 +128,181 @@ impl Config {
 
     /// Overlay env-style overrides via a lookup fn (real env in prod; a map in
     /// tests, so precedence is testable without touching process globals).
+    ///
+    /// Every override taken is recorded in [`Self::overridden_by_env`] under the
+    /// **config field name**, not the variable name — the settings UI marks fields,
+    /// and the operator reading it thinks in fields.
     fn apply_overrides(&mut self, get: impl Fn(&str) -> Option<String>) {
+        let mut captive = Vec::new();
         if let Some(v) = get("CHAPR_COORD_DB") {
             self.db_url = v;
+            captive.push("db_url");
         }
         if let Some(v) = get("CHAPR_COORD_ADDR") {
             self.addr = v;
+            captive.push("addr");
         }
         if let Some(v) = get("CHAPR_COORD_BLOBS") {
             self.blob_root = v;
+            captive.push("blob_root");
         }
         if let Some(v) = get("CHAPR_COORD_AUTH") {
             self.auth = v;
+            captive.push("auth");
         }
         if let Some(n) = get("CHAPR_COORD_REAP_SECS").and_then(|v| v.parse().ok()) {
             self.reap_secs = n;
+            captive.push("reap_secs");
         }
         if let Some(n) = get("CHAPR_COORD_GC_SECS").and_then(|v| v.parse().ok()) {
             self.gc_secs = n;
+            captive.push("gc_secs");
         }
         if let Some(v) = get("CHAPR_COORD_WATCH_DIR") {
             self.watch_dir = Some(v);
+            captive.push("watch_dir");
         }
         if let Some(v) = get("CHAPR_COORD_SHARE_UNC") {
             self.share_unc = Some(v);
+            captive.push("share_unc");
         }
         if let (Some(cert_path), Some(key_path)) =
             (get("CHAPR_COORD_TLS_CERT"), get("CHAPR_COORD_TLS_KEY"))
         {
             self.tls = Some(TlsConfig { cert_path, key_path });
+            captive.push("tls");
         }
         if let Some(k) = get("CHAPR_COORD_BACKEND").and_then(|v| v.parse().ok()) {
             self.backend = k;
+            captive.push("backend");
         }
+        self.overridden_by_env = captive;
     }
 
     /// Serialise to TOML for the wizard to write.
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
+
+    /// The coordinator's own data directory — where the database lives.
+    ///
+    /// Also where the admin token goes, which is the point: this directory is
+    /// already restricted to administrators and the service account by the
+    /// installer (D-029), so the token's confidentiality is a protection that
+    /// already exists rather than a new secret-management problem.
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        db_file_path(&self.db_url)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| !d.as_os_str().is_empty())
+    }
+
+    /// Which fields differ between `self` and `other`, by config field name.
+    ///
+    /// Used to tell an operator what a save actually changed, split into what took
+    /// effect and what is waiting for a restart.
+    pub fn changed_fields(&self, other: &Config) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut note = |cond: bool, name: &'static str| {
+            if cond {
+                out.push(name);
+            }
+        };
+        note(self.db_url != other.db_url, "db_url");
+        note(self.addr != other.addr, "addr");
+        note(self.blob_root != other.blob_root, "blob_root");
+        note(self.auth != other.auth, "auth");
+        note(self.auth_fallback != other.auth_fallback, "auth_fallback");
+        note(self.admin_principals != other.admin_principals, "admin_principals");
+        note(self.reap_secs != other.reap_secs, "reap_secs");
+        note(self.gc_secs != other.gc_secs, "gc_secs");
+        note(self.watch_dir != other.watch_dir, "watch_dir");
+        note(self.share_unc != other.share_unc, "share_unc");
+        note(self.tls != other.tls, "tls");
+        note(self.backend != other.backend, "backend");
+        note(self.backend_routes != other.backend_routes, "backend_routes");
+        out
+    }
+
+    /// Write this config to `path` without risking a truncated file.
+    ///
+    /// Temp-then-rename, which is the *opposite* of the rule for files on the share
+    /// (a rename there carries the source ACL and strips the target's). This is
+    /// coord's own local config on its own volume, and it is the file that decides
+    /// whether the service can start at all — a half-written one is a coordinator
+    /// that will not come back up.
+    pub fn write_to(&self, path: &std::path::Path) -> Result<(), ConfigError> {
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, self.to_toml())
+            .map_err(|e| ConfigError(format!("writing {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            ConfigError(format!("replacing {}: {e}", path.display()))
+        })
+    }
+
+    /// Reject a configuration that cannot mean what it says.
+    ///
+    /// Only rules that are *structurally* wrong live here — whether a path exists
+    /// is `setup::probe`'s job, and it runs against a candidate before it is saved.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // `disabled` never fails, so a fallback behind it is unreachable. Saving
+        // that would look like a configured cutover and be a no-op.
+        if self.auth == "disabled" && self.auth_fallback.is_some() {
+            return Err(ConfigError(
+                "auth = \"disabled\" never rejects a request, so auth_fallback would never be \
+                 reached. Remove the fallback, or make the primary a mode that authenticates."
+                    .into(),
+            ));
+        }
+        if self.auth_fallback.as_deref() == Some(self.auth.as_str()) {
+            return Err(ConfigError(
+                "auth_fallback is the same mode as auth, which tests nothing".into(),
+            ));
+        }
+        for name in [Some(self.auth.as_str()), self.auth_fallback.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !matches!(name, "disabled" | "trusted-header" | "negotiate") {
+                return Err(ConfigError(format!(
+                    "unknown auth mode {name:?}; expected disabled, trusted-header or negotiate"
+                )));
+            }
+        }
+        if self.addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(ConfigError(format!(
+                "addr {:?} is not a host:port address",
+                self.addr
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Fields a running coordinator can adopt without a restart.
+///
+/// Deliberately short. Everything else is wired into something built once at
+/// bring-up — the bound listener, the open pool, the watcher's OS thread, the
+/// background tickers — and pretending otherwise would be the worst kind of
+/// setting: one that reports success and changes nothing.
+///
+/// `auth` is here **because** the admin token is independent of the auth mode. You
+/// cannot lock yourself out, which is what makes changing it live safe, and what
+/// makes an auth cutover something you can attempt rather than commit to blind.
+pub const RELOADABLE_FIELDS: &[&str] = &["auth", "auth_fallback"];
+
+/// The on-disk SQLite file a `db_url` names, if it names one.
+///
+/// `sqlite:C:/data/coord.db?mode=rwc` → the path; `sqlite::memory:` → `None`.
+pub(crate) fn db_file_path(db_url: &str) -> Option<std::path::PathBuf> {
+    let rest = db_url.strip_prefix("sqlite:")?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let rest = rest.split('?').next()?;
+    // A leading ':' is a SQLite pseudo-target (`:memory:`), not a path.
+    if rest.is_empty() || rest.starts_with(':') {
+        return None;
+    }
+    Some(std::path::PathBuf::from(rest))
 }
 
 /// Config load error (bad path or malformed TOML).
@@ -156,6 +320,99 @@ impl std::error::Error for ConfigError {}
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn env_overrides_are_recorded_so_the_settings_ui_can_say_so() {
+        // The trap this exists for: overrides land *on top of* the file, so a UI
+        // that let someone edit an overridden field would save a value that is
+        // silently discarded on the next load.
+        let mut cfg = Config::default();
+        cfg.apply_overrides(overrides(&[
+            ("CHAPR_COORD_AUTH", "negotiate"),
+            ("CHAPR_COORD_ADDR", "0.0.0.0:9999"),
+        ]));
+        assert_eq!(cfg.auth, "negotiate");
+        assert!(cfg.overridden_by_env.contains(&"auth"));
+        assert!(cfg.overridden_by_env.contains(&"addr"));
+        assert!(
+            !cfg.overridden_by_env.contains(&"blob_root"),
+            "only keys actually taken from the environment are captive"
+        );
+    }
+
+    #[test]
+    fn nothing_is_captive_without_env_vars() {
+        let mut cfg = Config::default();
+        cfg.apply_overrides(overrides(&[]));
+        assert!(cfg.overridden_by_env.is_empty());
+    }
+
+    #[test]
+    fn data_dir_is_the_database_directory() {
+        let cfg = Config {
+            db_url: "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.data_dir(),
+            Some(std::path::PathBuf::from("C:/ProgramData/Chaperone"))
+        );
+        // An in-memory database has no directory — and so no admin token, which
+        // makes the admin surface fail closed rather than open.
+        let mem = Config {
+            db_url: "sqlite::memory:".into(),
+            ..Default::default()
+        };
+        assert_eq!(mem.data_dir(), None);
+    }
+
+    #[test]
+    fn validate_refuses_a_fallback_that_can_never_be_reached() {
+        // `disabled` never rejects, so a fallback behind it is dead config that
+        // looks like a configured cutover.
+        let cfg = Config {
+            auth: "disabled".into(),
+            auth_fallback: Some("trusted-header".into()),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.0.contains("never rejects"), "{}", err.0);
+    }
+
+    #[test]
+    fn validate_refuses_a_fallback_identical_to_the_primary() {
+        let cfg = Config {
+            auth: "trusted-header".into(),
+            auth_fallback: Some("trusted-header".into()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_refuses_an_unknown_mode_and_a_bad_address() {
+        let bad_mode = Config {
+            auth: "kerberos-ish".into(),
+            ..Default::default()
+        };
+        assert!(bad_mode.validate().unwrap_err().0.contains("unknown auth mode"));
+
+        let bad_addr = Config {
+            addr: "not-an-address".into(),
+            ..Default::default()
+        };
+        assert!(bad_addr.validate().unwrap_err().0.contains("host:port"));
+    }
+
+    #[test]
+    fn validate_accepts_a_real_cutover() {
+        let cfg = Config {
+            auth: "negotiate".into(),
+            auth_fallback: Some("trusted-header".into()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
 
     fn overrides(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> =
