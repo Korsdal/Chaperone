@@ -37,12 +37,67 @@ use serde::{Deserialize, Serialize};
 // `chapr-proto` — promoted from here in E-005 once the endpoint became the
 // second consumer, so both binaries share one definition.
 
-/// Body of `POST /audit/query` — the governance read of a file's audit trail.
-/// Coord-internal (there is no `chapr.*` audit tool); carries the canonical
-/// path in the body.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Body of `POST /audit/query` — the governance read of the audit trail.
+/// Coord-internal (there is no `chapr.*` audit tool).
+///
+/// Every field is optional and they compose. With `path` set this is the
+/// original per-file governance read ("who changed *this* and when"), which the
+/// admin view's file drill-down and the existing callers both use; without it,
+/// the trail across every path, which is what the admin view's Audit tab lists.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AuditQuery {
-    pub path: CanonicalPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<CanonicalPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<chapr_proto::AuditKind>,
+    /// Only events at or after this instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Body of `POST /leases/query` — every currently-held lease.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LeasesQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Response of `GET /admin/overview` — the stat tiles, plus what this coordinator
+/// is actually configured for.
+///
+/// The deployment half is not decoration. "What is this coord set up for" is the
+/// first question in any support call, and it is also what a future Settings tab
+/// has to render before it can offer to change anything (the parked follow-on).
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminOverview {
+    pub version: &'static str,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub uptime_s: i64,
+    /// Database size from `page_count × page_size` rather than a file stat: it
+    /// needs no path on `AppState` and works for an in-memory database too.
+    pub db_bytes: i64,
+    pub diagnostics_open_errors: i64,
+    pub diagnostics_open_warnings: i64,
+    pub conflicts_open: i64,
+    pub leases_held: usize,
+    pub leases_expiring: usize,
+    pub leases_stale: usize,
+    // ---- deployment ----
+    pub config_path: Option<String>,
+    pub auth_mode: String,
+    pub backend: String,
+    pub blob_root: String,
+    pub backend_routes: Vec<AdminBackendRoute>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminBackendRoute {
+    pub prefix: String,
+    pub kind: String,
 }
 
 /// Body of `POST /watch/event` — an external watcher (a non-Windows coord's
@@ -113,6 +168,9 @@ pub fn router(state: AppState) -> Router {
         .route("/watch/event", post(watch_event))
         .route("/diagnostics", post(report_diagnostic))
         .route("/diagnostics/query", post(query_diagnostics))
+        .route("/leases/query", post(query_leases))
+        .route("/admin", get(admin_page))
+        .route("/admin/overview", get(admin_overview))
         .with_state(state)
 }
 
@@ -300,6 +358,78 @@ async fn query_diagnostics(
     Ok(Json(resp))
 }
 
+/// `POST /leases/query` — every currently-held lease (E-024 read side).
+///
+/// A read, so expired rows are filtered by time rather than swept: the lazy sweep
+/// in `lease_acquire` and the background reaper own that.
+async fn query_leases(
+    State(st): State<AppState>,
+    caller: crate::auth::Caller,
+    Json(req): Json<LeasesQuery>,
+) -> Result<Json<Vec<lease::LeaseView>>, ApiError> {
+    let limit = req.limit.unwrap_or(200) as i64;
+    let leases = lease::list_held(&st.pool, limit).await?;
+    tracing::debug!(
+        principal = %caller_label(&caller),
+        leases = leases.len(),
+        "leases query"
+    );
+    Ok(Json(leases))
+}
+
+/// The admin page itself — one self-contained file, embedded in the binary.
+///
+/// Embedded rather than served from disk so the deployment stays "one binary":
+/// nothing extra to copy, no path to get wrong, and it works on a closed network
+/// because the page loads nothing from anywhere else.
+async fn admin_page() -> impl IntoResponse {
+    axum::response::Html(include_str!("admin/index.html"))
+}
+
+/// `GET /admin/overview` — the stat tiles plus this coordinator's configuration.
+async fn admin_overview(State(st): State<AppState>) -> Result<Json<AdminOverview>, ApiError> {
+    let (errors, warnings) = crate::diagnostics::count_open(&st.pool).await?;
+    let conflicts_open = crate::conflict::count_open_all(&st.pool).await?;
+    // Reuse the same listing the Leases tab renders, so a tile can never disagree
+    // with the table below it.
+    let leases = lease::list_held(&st.pool, 1000).await?;
+    let count = |s: lease::LeaseHealth| leases.iter().filter(|l| l.state == s).count();
+
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or(0);
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or(0);
+
+    Ok(Json(AdminOverview {
+        version: env!("CARGO_PKG_VERSION"),
+        started_at: st.started_at,
+        uptime_s: (chrono::Utc::now() - st.started_at).num_seconds(),
+        db_bytes: page_count * page_size,
+        diagnostics_open_errors: errors,
+        diagnostics_open_warnings: warnings,
+        conflicts_open,
+        leases_held: count(lease::LeaseHealth::Held),
+        leases_expiring: count(lease::LeaseHealth::Expiring),
+        leases_stale: count(lease::LeaseHealth::Stale),
+        config_path: st.config_path.as_ref().map(|p| p.display().to_string()),
+        auth_mode: st.auth_mode.clone(),
+        backend: st.backend_default.to_string(),
+        blob_root: st.blob_root.display().to_string(),
+        backend_routes: st
+            .backend_routes
+            .iter()
+            .map(|r| AdminBackendRoute {
+                prefix: r.prefix.clone(),
+                kind: r.kind.to_string(),
+            })
+            .collect(),
+    }))
+}
+
 /// How to name the caller in a log line. `AuditEvent` cannot carry these two
 /// routes: it is keyed by `(canonical_path, session_id)`, and a blob fetch has
 /// neither — the version hash is content-addressed and deduplicated, so it may
@@ -372,11 +502,28 @@ async fn record_audit(
     Ok(Json(event))
 }
 
+/// `POST /audit/query` — the audit trail, per file or across every path.
+///
+/// `path` present keeps the original governance read exactly as it was, including
+/// its unbounded result: a "who changed this file" answer is incomplete if it is
+/// silently truncated. The fleet-wide form is a browsable list and is bounded.
 async fn query_audit(
     State(st): State<AppState>,
     Json(req): Json<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
-    let events = crate::audit::query(&st.pool, &req.path).await?;
+    let events = match &req.path {
+        Some(path) => crate::audit::query(&st.pool, path).await?,
+        None => {
+            crate::audit::query_recent(
+                &st.pool,
+                req.principal.as_deref(),
+                req.kind,
+                req.since.map(|t| t.timestamp_millis()),
+                req.limit.unwrap_or(200) as i64,
+            )
+            .await?
+        }
+    };
     Ok(Json(events))
 }
 
@@ -888,6 +1035,193 @@ mod tests {
         let clean: ResolveResponse =
             serde_json::from_slice(&to_bytes(clean.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(clean.journal_state, chapr_proto::JournalState::Clean);
+    }
+
+    #[tokio::test]
+    async fn the_admin_page_is_served_and_self_contained() {
+        let app = router(AppState::new(db::test_pool().await));
+        let resp = app
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("<!doctype html>"));
+        // Load-bearing: the page must work on a network with no route out, so it
+        // may not reference anything external. If someone adds a CDN font or a
+        // framework tag, this fails rather than the customer's install.
+        for offender in ["http://", "https://", "//unpkg", "//cdn"] {
+            assert!(
+                !html.contains(offender),
+                "the admin page must not reference {offender}"
+            );
+        }
+        // And it must never build DOM from data (paths and principals come off a
+        // shared drive that other people write to — concept §13.2).
+        assert!(
+            !html.contains(".innerHTML ="),
+            "the admin page must not assign innerHTML"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_overview_reports_counts_and_what_coord_is_configured_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(db::test_pool().await)
+            .with_blob_root(tmp.path().to_path_buf())
+            .with_deployment(Some(std::path::PathBuf::from("C:/data/coord.toml")), "trusted-header");
+
+        // One open diagnostic and one open conflict, so the tiles have something
+        // to be right about.
+        crate::diagnostics::record(
+            &state,
+            &chapr_proto::DiagnosticReport {
+                code: "IO".into(),
+                title: "t".into(),
+                severity: chapr_proto::Severity::Error,
+                path: Some(CanonicalPath::new_unchecked("\\\\srv\\share\\a.md")),
+                principal: chapr_proto::Principal::new_unchecked("CONTOSO\\a"),
+                host: None,
+                detail: "d".into(),
+                remedy: "r".into(),
+                facts: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::conflict::register(
+            &state,
+            &CanonicalPath::new_unchecked("\\\\srv\\share\\a.md"),
+            &CanonicalPath::new_unchecked("\\\\srv\\share\\a.conflict.md"),
+            &chapr_proto::Principal::new_unchecked("CONTOSO\\b"),
+            &chapr_proto::SessionId::new_unchecked("sess-t"),
+        )
+        .await
+        .unwrap();
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+        assert_eq!(v["diagnostics_open_errors"], 1);
+        assert_eq!(v["diagnostics_open_warnings"], 0);
+        assert_eq!(v["conflicts_open"], 1);
+        assert!(v["db_bytes"].as_i64().unwrap() > 0, "page_count × page_size");
+        assert!(v["uptime_s"].as_i64().is_some());
+        // The deployment half: the first question in any support call.
+        assert_eq!(v["auth_mode"], "trusted-header");
+        assert_eq!(v["config_path"], "C:/data/coord.toml");
+        assert!(v["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn leases_query_returns_held_leases_over_http() {
+        let state = AppState::new(db::test_pool().await);
+        let app = router(state.clone());
+        let acq = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/leases")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({
+                        "principal": "CONTOSO\\jsmith", "session_id": "sess-a",
+                        "purpose": "write", "paths": ["\\\\srv\\share\\a.md"]
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acq.status(), StatusCode::OK);
+
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/leases/query")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let rows = v.as_array().expect("an array of leases");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["principal"], "CONTOSO\\jsmith");
+        assert_eq!(rows[0]["session_id"], "sess-a");
+        assert_eq!(rows[0]["state"], "held");
+        assert_eq!(rows[0]["paths"][0], "\\\\srv\\share\\a.md");
+    }
+
+    #[tokio::test]
+    async fn audit_query_serves_both_the_per_path_and_the_fleet_wide_form() {
+        let state = AppState::new(db::test_pool().await);
+        for path in ["\\\\srv\\share\\a.md", "\\\\srv\\share\\b.md"] {
+            crate::audit::record(
+                &state,
+                &chapr_proto::Principal::new_unchecked("CONTOSO\\jsmith"),
+                &chapr_proto::SessionId::new_unchecked("sess-t"),
+                &CanonicalPath::new_unchecked(path),
+                chapr_proto::AuditKind::WriteCommit,
+                None,
+                None,
+                "wrote",
+            )
+            .await
+            .unwrap();
+        }
+        let app = router(state);
+
+        // Body with a path: the original governance read, unchanged.
+        let scoped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/audit/query")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({"path": "\\\\srv\\share\\a.md"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(scoped.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+
+        // Body without a path: the admin view's fleet-wide list.
+        let all = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/audit/query")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({"limit": 50})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(all.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

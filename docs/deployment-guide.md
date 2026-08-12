@@ -53,16 +53,28 @@ touches coord.
 - `chapr.history` shows the version log; the coord audit trail attributes each
   action to the acting user.
 
+## The admin page
+
+`GET /admin` on the coordinator — the same host and port the laptops use. Served
+by coord itself, so there is nothing extra to install and it works on a network
+with no route out.
+
+Five tabs: **Overview** (counts, plus what this coordinator is configured for),
+**Errors**, **Conflicts**, **Leases**, **Audit trail**. It is **read-only** —
+acknowledging a failure, releasing a lease and editing settings need the
+administrator role, which is not built yet.
+
 ## When something breaks
 
 Two places to look, and you need both — the second exists because a failure that
 happens *before* coord is reachable cannot report itself to coord.
 
-1. **Coord, for the whole fleet.** `POST /diagnostics/query` with `{}` returns
-   unexpected failures grouped by `(code, path)`, newest first, each with a
-   `remedy` field saying what to do, `facts` carrying the OS-level detail, and the
-   users and hosts that hit it — which is how you tell one misconfigured laptop
-   from a fault hitting everybody.
+1. **Coord, for the whole fleet.** The admin page's Errors tab, or
+   `POST /diagnostics/query` with `{}` for the same data as JSON: unexpected
+   failures grouped by `(code, path)`, newest first, each with a `remedy` field
+   saying what to do, `facts` carrying the OS-level detail, and the users and
+   hosts that hit it — which is how you tell one misconfigured laptop from a fault
+   hitting everybody.
 2. **The laptop, for that laptop.** The endpoint appends the same records as JSON
    lines to `%LOCALAPPDATA%\Chaperone\diagnostics.jsonl` (override with
    `CHAPR_DIAG_LOG`). Check here for a wrong coordinator URL, a TLS mismatch or a
@@ -84,6 +96,7 @@ that is the intended steady state.
 - [ ] Backend type (SMB / POSIX) → coord `backend`
 - [ ] Coord host + address + persistent DB/blob volumes
 - [ ] Auth mode (MVP `trusted-header` vs enforced)
+- [ ] Admin page URL passed to whoever supports this (`<coord>/admin`)
 - [ ] Client OS(es) → which MCPB bundle(s) to build
 - [ ] Coordinator URL baked into the bundle default / comms to users
 - [ ] **Coordinated root** (`CHAPR_ROOT` / the bundle's "Coordinated location"):
@@ -91,5 +104,6 @@ that is the intended steady state.
       announced to the model so it routes writes through Chaperone. Users on
       mapped drives are fine — a drive letter is resolved to its UNC form, so
       two laptops with different letters still key one file identically.
-- [ ] TLS? (set `[tls]`)
+- [ ] TLS? (`chapr-coord setup --tls-generate` makes a self-signed pair if there is no
+      internal CA — it still has to be trusted on the laptops)
 - [ ] Backup + monitoring wired

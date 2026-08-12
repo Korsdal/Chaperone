@@ -120,7 +120,8 @@ pub(crate) async fn run_server_ready(
     let state = AppState::new(pool)
         .with_blob_root(cfg.blob_root.as_str())
         .with_auth(auth::from_name(&cfg.auth))
-        .with_backends(cfg.backend, cfg.backend_routes.clone());
+        .with_backends(cfg.backend, cfg.backend_routes.clone())
+        .with_deployment(cfg.source.clone(), &cfg.auth);
     tracing::info!(auth = %cfg.auth, backend = %cfg.backend, "connection auth mode");
 
     // Proactive recovery scan (concept §15).

@@ -189,6 +189,28 @@ pub async fn query(
     Ok(DiagnosticsResponse { groups })
 }
 
+/// Count open groups by severity, for the admin overview's stat tiles.
+///
+/// A dedicated count rather than reusing [`query`]: that loads each group's
+/// occurrences with a query per group, which is the wrong cost for a number
+/// rendered on every page load.
+pub async fn count_open(pool: &SqlitePool) -> Result<(i64, i64), ChaprError> {
+    let row = sqlx::query(
+        "SELECT
+           SUM(CASE WHEN severity = 'error'   THEN 1 ELSE 0 END) AS errors,
+           SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) AS warnings
+         FROM diagnostics WHERE state = 'open'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(internal)?;
+    // SUM over no rows is NULL, not 0.
+    Ok((
+        row.get::<Option<i64>, _>("errors").unwrap_or(0),
+        row.get::<Option<i64>, _>("warnings").unwrap_or(0),
+    ))
+}
+
 /// Read one group plus its retained occurrences.
 async fn load_group(pool: &SqlitePool, id: &str) -> Result<DiagnosticGroup, ChaprError> {
     let row = sqlx::query(

@@ -90,7 +90,35 @@ impl ChaprServer {
         principal: Principal,
         session_id: SessionId,
     ) -> Self {
-        let lease_manager = Arc::new(LeaseManager::new(coord.clone()));
+        Self::with_diagnostics(
+            coord,
+            backend,
+            principal,
+            session_id,
+            Arc::new(crate::diag::Diagnostics::new(
+                crate::diag::Diagnostics::default_log_path(),
+            )),
+        )
+    }
+
+    /// As [`Self::new`], with the diagnostics sink supplied.
+    ///
+    /// A parameter rather than a `with_*` builder because two collaborators need
+    /// the same sink: the tool path, and the background lease renewer — whose
+    /// failures have no tool call to attach to and would otherwise be invisible.
+    /// A builder applied after construction would have silently updated only one
+    /// of them.
+    pub fn with_diagnostics(
+        coord: CoordClient,
+        backend: Arc<dyn Backend>,
+        principal: Principal,
+        session_id: SessionId,
+        diagnostics: Arc<crate::diag::Diagnostics>,
+    ) -> Self {
+        let lease_manager = Arc::new(
+            LeaseManager::new(coord.clone())
+                .with_diagnostics(diagnostics.clone(), principal.clone()),
+        );
         lease_manager.clone().spawn_renewer();
         Self {
             tool_router: Self::tool_router(),
@@ -101,21 +129,13 @@ impl ChaprServer {
             session_id,
             cfg: ReadConfig::default(),
             max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
-            diagnostics: Arc::new(crate::diag::Diagnostics::new(
-                crate::diag::Diagnostics::default_log_path(),
-            )),
+            diagnostics,
         }
     }
 
     /// Override the inline-content cap (bytes of rendered read body).
     pub fn with_max_inline_bytes(mut self, cap: usize) -> Self {
         self.max_inline_bytes = cap;
-        self
-    }
-
-    /// Override where unexpected failures are logged locally (E-026).
-    pub fn with_diagnostics(mut self, diagnostics: Arc<crate::diag::Diagnostics>) -> Self {
-        self.diagnostics = diagnostics;
         self
     }
 }
@@ -922,15 +942,15 @@ mod tests {
     /// platforms, which is the code a mock would have skipped.
     fn server_for(coord_uri: String) -> ChaprServer {
         let backend = crate::backend::make_backend(BackendKind::Posix).expect("posix backend");
-        ChaprServer::new(
+        ChaprServer::with_diagnostics(
             CoordClient::new(coord_uri),
             backend,
             Principal::new_unchecked("CONTOSO\\tester"),
             SessionId::new_unchecked("sess-test"),
+            // Local sink off: the default path is the real user profile, and a test
+            // suite must not append to the machine's own diagnostics log.
+            Arc::new(crate::diag::Diagnostics::new(None)),
         )
-        // Local sink off: the default path is the real user profile, and a test
-        // suite must not append to the machine's own diagnostics log.
-        .with_diagnostics(Arc::new(crate::diag::Diagnostics::new(None)))
     }
 
     fn tool_text(r: &CallToolResult) -> String {

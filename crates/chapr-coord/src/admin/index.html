@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chaperone — coordinator</title>
+<!--
+  The coordinator's admin view. One self-contained file, embedded in the binary by
+  `include_str!` and served from GET /admin.
+
+  Deliberately vanilla and dependency-free. This has to render on an on-prem
+  network with no route to the internet, so it loads nothing from anywhere: no
+  CDN, no font, no framework. It is also why there is no build step — the file
+  you are reading is the file that ships.
+
+  READ-ONLY. Every mutating action in the design (reap, release, archive a
+  sidecar, save settings) is deliberately absent: those need the admin role
+  (E-024a), and shipping them against an endpoint that authenticates nothing
+  would be handing anyone who can reach the port the ability to release other
+  people's leases.
+
+  SECURITY NOTE, load-bearing: every value shown here — paths, principals, detail
+  strings — originates on a shared drive that other people write to. It is
+  therefore untrusted input, exactly as concept §13.2 says. Nothing below ever
+  goes through innerHTML — `el()` is the only way data enters the page and it sets
+  textContent, so a file named `<img onerror=...>` renders as those characters
+  rather than executing in the administrator's browser.
+-->
+<style>
+  :root {
+    --ink: #194944;
+    --ink-soft: #24605a;
+    --accent: #268e7d;
+    --surface: #f5f8fb;
+    --line: #dde5ea;
+    --text: #16302e;
+    --muted: #5d7370;
+    --error: #b3261e;
+    --warn: #9a6700;
+    --radius: 10px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+    background: var(--surface);
+  }
+  header {
+    background: var(--ink);
+    color: #eaf3f1;
+    padding: 14px 22px;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: #9dc0ba; font-size: 12.5px; }
+  header .spacer { flex: 1; }
+  #live { font-size: 12.5px; color: #9dc0ba; }
+  #live b { color: #eaf3f1; font-weight: 600; }
+  button.link {
+    background: none; border: 1px solid #3c6f68; color: #eaf3f1;
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12.5px;
+  }
+  button.link:hover { background: #22574f; }
+  nav {
+    display: flex; gap: 2px; background: var(--ink-soft); padding: 0 14px;
+    overflow-x: auto;
+  }
+  nav button {
+    background: none; border: 0; color: #b9d6d1; font: inherit; font-size: 13.5px;
+    padding: 10px 16px; cursor: pointer; border-bottom: 3px solid transparent;
+    white-space: nowrap;
+  }
+  nav button[aria-selected="true"] { color: #fff; border-bottom-color: var(--accent); }
+  main { padding: 22px; max-width: 1400px; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
+  .tile {
+    background: #fff; border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 14px 18px; min-width: 158px;
+  }
+  .tile .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .tile .value { font-size: 26px; font-weight: 640; margin-top: 4px; }
+  .tile .value.err { color: var(--error); }
+  .tile .value.warn { color: var(--warn); }
+  .tile .note { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  section.card {
+    background: #fff; border: 1px solid var(--line); border-radius: var(--radius);
+    margin-bottom: 18px; overflow: hidden;
+  }
+  section.card > h2 {
+    font-size: 14px; font-weight: 640; padding: 12px 16px;
+    border-bottom: 1px solid var(--line); background: #fbfdfd;
+  }
+  section.card > p.hint { padding: 10px 16px; color: var(--muted); font-size: 13px; border-bottom: 1px solid var(--line); }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 16px; border-bottom: 1px solid #eef3f5; vertical-align: top; }
+  th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr.pick { cursor: pointer; }
+  tbody tr.pick:hover { background: #f4faf8; }
+  tbody tr[aria-selected="true"] { background: #eaf5f2; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
+  .path { word-break: break-all; }
+  .chip {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11.5px; font-weight: 600; border: 1px solid;
+  }
+  .chip.error { color: var(--error); border-color: #eebfbb; background: #fdf3f2; }
+  .chip.warning { color: var(--warn); border-color: #ecd9a8; background: #fdf9ef; }
+  .chip.held { color: var(--accent); border-color: #b7ded6; background: #f1faf7; }
+  .chip.expiring { color: var(--warn); border-color: #ecd9a8; background: #fdf9ef; }
+  .chip.stale { color: var(--error); border-color: #eebfbb; background: #fdf3f2; }
+  .muted { color: var(--muted); }
+  .split { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 18px; }
+  @media (max-width: 980px) { .split { grid-template-columns: 1fr; } }
+  dl.facts { padding: 4px 16px 14px; }
+  dl.facts div { display: flex; gap: 10px; padding: 5px 0; border-bottom: 1px solid #f2f6f7; }
+  dl.facts dt { color: var(--muted); min-width: 130px; font-size: 12.5px; }
+  dl.facts dd { flex: 1; word-break: break-all; }
+  .remedy { padding: 12px 16px; background: #f1faf7; border-top: 1px solid #dcefe9; border-bottom: 1px solid #dcefe9; }
+  .remedy h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--accent); margin-bottom: 5px; }
+  .empty { padding: 26px 16px; color: var(--muted); text-align: center; }
+  footer { padding: 0 22px 30px; color: var(--muted); font-size: 12.5px; max-width: 1400px; }
+  .err-banner { background: #fdf3f2; border: 1px solid #eebfbb; color: var(--error); padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Chaperone</h1>
+  <span class="sub" id="hdr-sub">coordinator</span>
+  <span class="spacer"></span>
+  <span id="live"></span>
+  <button class="link" id="refresh">Refresh</button>
+</header>
+
+<nav id="tabs" role="tablist"></nav>
+
+<main>
+  <div class="err-banner" id="banner" hidden></div>
+
+  <!-- Overview -->
+  <div data-panel="overview">
+    <div class="tiles" id="tiles"></div>
+    <section class="card">
+      <h2>Needs attention</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Problem</th><th>Code</th><th>File</th><th>Seen</th><th>Times</th></tr></thead>
+        <tbody id="attention"></tbody>
+      </table></div>
+    </section>
+    <section class="card">
+      <h2>What this coordinator is configured for</h2>
+      <dl class="facts" id="deployment"></dl>
+    </section>
+  </div>
+
+  <!-- Errors -->
+  <div data-panel="errors" hidden>
+    <div class="split">
+      <section class="card">
+        <h2>Unexpected failures</h2>
+        <p class="hint">Only faults appear here. A write that lost a compare-and-swap, a
+          document someone has open in Word, or a file another session is writing are
+          designed outcomes — look under Conflicts and Leases for those.</p>
+        <div class="scroll"><table>
+          <thead><tr><th>Problem</th><th>Severity</th><th>File</th><th>Last seen</th><th>Times</th></tr></thead>
+          <tbody id="errors"></tbody>
+        </table></div>
+      </section>
+      <section class="card" id="error-detail">
+        <h2>Detail</h2>
+        <div class="empty" id="error-empty">Select a failure to see what it was and what fixes it.</div>
+        <div id="error-body" hidden>
+          <dl class="facts" id="error-facts"></dl>
+          <div class="remedy"><h3>What fixes it</h3><div id="error-remedy"></div></div>
+          <h2 style="border-top:1px solid var(--line)">Occurrences</h2>
+          <div class="scroll"><table>
+            <thead><tr><th>When</th><th>Who</th><th>Machine</th></tr></thead>
+            <tbody id="error-occ"></tbody>
+          </table></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Conflicts -->
+  <div data-panel="conflicts" hidden>
+    <section class="card">
+      <h2>Open conflicts</h2>
+      <p class="hint">Both parties' bytes are kept. The loser's write is on the share as a
+        sidecar file; nothing was merged. Reconciling one is a decision for the two
+        people involved.</p>
+      <div class="scroll"><table>
+        <thead><tr><th>File on the share</th><th>Sidecar — needs a decision</th><th>Written by</th><th>Opened</th></tr></thead>
+        <tbody id="conflicts"></tbody>
+      </table></div>
+    </section>
+  </div>
+
+  <!-- Leases -->
+  <div data-panel="leases" hidden>
+    <section class="card">
+      <h2>Held leases</h2>
+      <p class="hint">A lease is an optimisation, never the thing that keeps data correct —
+        that is the exclusive open plus the version check. <b>Stale</b> means renewal has
+        stopped: the lease is still registered but nothing is heartbeating it.</p>
+      <div class="scroll"><table>
+        <thead><tr><th>Canonical path</th><th>State</th><th>Purpose</th><th>Holder</th><th>Agent session</th><th>Held for</th><th>Renews in</th></tr></thead>
+        <tbody id="leases"></tbody>
+      </table></div>
+    </section>
+  </div>
+
+  <!-- Audit -->
+  <div data-panel="audit" hidden>
+    <section class="card">
+      <h2>Audit trail</h2>
+      <p class="hint">Every lease, write, restore and recovery, stamped with the principal
+        that caused it. Newest first.</p>
+      <div class="scroll"><table>
+        <thead><tr><th>Time</th><th>Principal</th><th>Action</th><th>Path</th><th>Version</th><th>Detail</th></tr></thead>
+        <tbody id="audit"></tbody>
+      </table></div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  Read-only view. Acknowledging a failure, releasing a lease and editing settings
+  need the administrator role, which is not built yet — until then this page shows
+  state and changes nothing. It identifies itself to the coordinator as
+  <code>admin-ui</code>, which is attribution rather than proof of who you are.
+</footer>
+
+<script>
+"use strict";
+
+// Every request carries a principal header because the coordinator's read routes
+// are attributed. `admin-ui` is honest about what it is: we know the request came
+// from this page, not who was looking at it.
+const HEADERS = { "content-type": "application/json", "x-chapr-principal": "admin-ui" };
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: HEADERS, body: JSON.stringify(body || {}) });
+  if (!r.ok) throw new Error(path + " → HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+  return r.json();
+}
+async function get(path) {
+  const r = await fetch(path, { headers: HEADERS });
+  if (!r.ok) throw new Error(path + " → HTTP " + r.status);
+  return r.json();
+}
+
+// --- DOM helpers. `text` is the only way data enters the page: textContent,
+// never innerHTML, because every string below comes off a shared drive.
+function el(tag, cls, txt) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (txt !== undefined && txt !== null) n.textContent = String(txt);
+  return n;
+}
+function cell(txt, cls) { return el("td", cls, txt); }
+function chip(kind, label) {
+  const td = el("td");
+  td.appendChild(el("span", "chip " + kind, label));
+  return td;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function emptyRow(tbody, cols, msg) {
+  const tr = el("tr");
+  const td = el("td", "empty", msg);
+  td.colSpan = cols;
+  tr.appendChild(td);
+  tbody.appendChild(tr);
+}
+
+// --- formatting
+function ago(iso) {
+  if (!iso) return "—";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function dur(sec) {
+  if (sec === null || sec === undefined) return "—";
+  const s = Math.abs(sec), sign = sec < 0 ? "-" : "";
+  if (s < 60) return sign + s + "s";
+  if (s < 3600) return sign + Math.floor(s / 60) + "m " + (s % 60) + "s";
+  if (s < 86400) return sign + Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+  return sign + Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+}
+function bytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
+}
+function stamp(iso) { return iso ? new Date(iso).toLocaleString() : "—"; }
+function shortVersion(v) { return v ? v.slice(0, 12) : "—"; }
+
+// --- tabs
+const TABS = [
+  ["overview", "Overview"],
+  ["errors", "Errors"],
+  ["conflicts", "Conflicts"],
+  ["leases", "Leases"],
+  ["audit", "Audit trail"],
+];
+let current = "overview";
+
+function buildTabs() {
+  const nav = document.getElementById("tabs");
+  for (const [id, label] of TABS) {
+    const b = el("button", null, label);
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", String(id === current));
+    b.addEventListener("click", () => selectTab(id));
+    b.dataset.tab = id;
+    nav.appendChild(b);
+  }
+}
+function selectTab(id) {
+  current = id;
+  for (const b of document.querySelectorAll("nav button")) {
+    b.setAttribute("aria-selected", String(b.dataset.tab === id));
+  }
+  for (const p of document.querySelectorAll("[data-panel]")) {
+    p.hidden = p.dataset.panel !== id;
+  }
+}
+
+// --- renderers
+function renderOverview(o) {
+  document.getElementById("hdr-sub").textContent =
+    "coordinator · v" + o.version + " · up " + dur(o.uptime_s) + " · SQLite " + bytes(o.db_bytes);
+
+  const tiles = document.getElementById("tiles");
+  clear(tiles);
+  const spec = [
+    ["Failures", o.diagnostics_open_errors, o.diagnostics_open_errors ? "err" : "", "open, need action"],
+    ["Warnings", o.diagnostics_open_warnings, o.diagnostics_open_warnings ? "warn" : "", "degraded, not blocking"],
+    ["Conflicts", o.conflicts_open, "", "awaiting a decision"],
+    ["Leases held", o.leases_held, "", "renewing normally"],
+    ["Expiring", o.leases_expiring, "", "renewal due now"],
+    ["Stale", o.leases_stale, o.leases_stale ? "err" : "", "renewal has stopped"],
+  ];
+  for (const [label, value, cls, note] of spec) {
+    const t = el("div", "tile");
+    t.appendChild(el("div", "label", label));
+    t.appendChild(el("div", "value " + cls, value));
+    t.appendChild(el("div", "note", note));
+    tiles.appendChild(t);
+  }
+
+  const dep = document.getElementById("deployment");
+  clear(dep);
+  const rows = [
+    ["Configuration file", o.config_path || "(defaults and environment only)"],
+    ["Connection auth", o.auth_mode],
+    ["Fileserver backend", o.backend],
+    ["Blob store", o.blob_root],
+    ["Started", stamp(o.started_at)],
+  ];
+  for (const r of o.backend_routes) rows.push(["Route " + r.prefix, r.kind]);
+  for (const [k, v] of rows) {
+    const d = el("div");
+    d.appendChild(el("dt", null, k));
+    d.appendChild(el("dd", "mono", v));
+    dep.appendChild(d);
+  }
+}
+
+function renderAttention(groups) {
+  const tb = document.getElementById("attention");
+  clear(tb);
+  const open = groups.filter((g) => g.state === "open").slice(0, 6);
+  if (!open.length) { emptyRow(tb, 5, "Nothing needs attention."); return; }
+  for (const g of open) {
+    const tr = el("tr");
+    tr.appendChild(cell(g.title));
+    tr.appendChild(cell(g.code, "mono"));
+    tr.appendChild(cell(g.path || "—", "mono path"));
+    tr.appendChild(cell(ago(g.last_seen)));
+    tr.appendChild(cell(g.count));
+    tb.appendChild(tr);
+  }
+}
+
+let errorGroups = [];
+function renderErrors(groups) {
+  errorGroups = groups;
+  const tb = document.getElementById("errors");
+  clear(tb);
+  if (!groups.length) { emptyRow(tb, 5, "No unexpected failures recorded. This is the intended steady state."); return; }
+  groups.forEach((g, i) => {
+    const tr = el("tr", "pick");
+    tr.appendChild(cell(g.title));
+    tr.appendChild(chip(g.severity, g.severity));
+    tr.appendChild(cell(g.path || "—", "mono path"));
+    tr.appendChild(cell(ago(g.last_seen)));
+    tr.appendChild(cell(g.count));
+    tr.addEventListener("click", () => selectError(i));
+    tr.dataset.idx = String(i);
+    tb.appendChild(tr);
+  });
+}
+function selectError(i) {
+  const g = errorGroups[i];
+  if (!g) return;
+  for (const tr of document.querySelectorAll("#errors tr")) {
+    tr.setAttribute("aria-selected", String(tr.dataset.idx === String(i)));
+  }
+  document.getElementById("error-empty").hidden = true;
+  document.getElementById("error-body").hidden = false;
+
+  const facts = document.getElementById("error-facts");
+  clear(facts);
+  const rows = [
+    ["Problem", g.title],
+    ["Code", g.code],
+    ["Severity", g.severity],
+    ["File", g.path || "(not about one file)"],
+    ["First seen", stamp(g.first_seen)],
+    ["Last seen", stamp(g.last_seen)],
+    ["Times", g.count],
+    ["Detail", g.detail],
+  ];
+  for (const [k, v] of Object.entries(g.facts || {})) rows.push([k, v]);
+  for (const [k, v] of rows) {
+    const d = el("div");
+    d.appendChild(el("dt", null, k));
+    d.appendChild(el("dd", null, v));
+    facts.appendChild(d);
+  }
+  document.getElementById("error-remedy").textContent = g.remedy;
+
+  const occ = document.getElementById("error-occ");
+  clear(occ);
+  if (!(g.occurrences || []).length) { emptyRow(occ, 3, "—"); return; }
+  for (const o of g.occurrences) {
+    const tr = el("tr");
+    tr.appendChild(cell(stamp(o.at)));
+    tr.appendChild(cell(o.principal, "mono"));
+    tr.appendChild(cell(o.host || "—", "mono"));
+    occ.appendChild(tr);
+  }
+}
+
+function renderConflicts(list) {
+  const tb = document.getElementById("conflicts");
+  clear(tb);
+  if (!list.length) { emptyRow(tb, 4, "No open conflicts."); return; }
+  for (const c of list) {
+    const tr = el("tr");
+    tr.appendChild(cell(c.base_path, "mono path"));
+    tr.appendChild(cell(c.sidecar_path, "mono path"));
+    tr.appendChild(cell(c.losing_principal, "mono"));
+    tr.appendChild(cell(ago(c.created_at)));
+    tb.appendChild(tr);
+  }
+}
+
+function renderLeases(list) {
+  const tb = document.getElementById("leases");
+  clear(tb);
+  if (!list.length) { emptyRow(tb, 7, "No leases held. Reads take none — only a write does."); return; }
+  for (const l of list) {
+    const tr = el("tr");
+    const paths = el("td", "mono path");
+    l.paths.forEach((p, i) => {
+      if (i) paths.appendChild(el("div"));
+      paths.appendChild(el("div", null, p));
+    });
+    tr.appendChild(paths);
+    tr.appendChild(chip(l.state, l.state));
+    tr.appendChild(cell(l.purpose));
+    tr.appendChild(cell(l.principal, "mono"));
+    tr.appendChild(cell(l.session_id, "mono"));
+    tr.appendChild(cell(dur(l.held_for_s)));
+    tr.appendChild(cell(dur(l.renews_in_s)));
+    tb.appendChild(tr);
+  }
+}
+
+function renderAudit(list) {
+  const tb = document.getElementById("audit");
+  clear(tb);
+  if (!list.length) { emptyRow(tb, 6, "Nothing recorded yet."); return; }
+  for (const a of list) {
+    const tr = el("tr");
+    tr.appendChild(cell(stamp(a.timestamp)));
+    tr.appendChild(cell(a.principal, "mono"));
+    tr.appendChild(cell(a.kind));
+    tr.appendChild(cell(a.canonical_path, "mono path"));
+    tr.appendChild(cell(shortVersion(a.to_version), "mono"));
+    tr.appendChild(cell(a.detail));
+    tb.appendChild(tr);
+  }
+}
+
+// --- load
+let inFlight = false;
+async function refresh() {
+  if (inFlight) return;
+  inFlight = true;
+  const banner = document.getElementById("banner");
+  try {
+    const [overview, diags, conflicts, leases, audit] = await Promise.all([
+      get("/admin/overview"),
+      post("/diagnostics/query", {}),
+      // `scope` is a path prefix, and the empty prefix is every open conflict.
+      post("/conflicts/query", { scope: "" }),
+      post("/leases/query", {}),
+      post("/audit/query", { limit: 200 }),
+    ]);
+    renderOverview(overview);
+    renderAttention(diags.groups || []);
+    renderErrors(diags.groups || []);
+    renderConflicts(conflicts.conflicts || []);
+    renderLeases(leases || []);
+    renderAudit(audit || []);
+    banner.hidden = true;
+    const live = document.getElementById("live");
+    clear(live);
+    live.appendChild(el("span", null, "updated " + new Date().toLocaleTimeString()));
+  } catch (e) {
+    banner.hidden = false;
+    banner.textContent = "Could not load from the coordinator: " + e.message;
+  } finally {
+    inFlight = false;
+  }
+}
+
+buildTabs();
+selectTab("overview");
+document.getElementById("refresh").addEventListener("click", refresh);
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

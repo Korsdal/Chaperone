@@ -47,6 +47,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(4);
 
 struct Held {
     lost: bool,
+    /// Consecutive failed renewals (I-008). Reset by every success.
+    ///
+    /// One failed renewal is not a lost lease — the whole reason the renewal
+    /// interval is TTL ÷ 3 is that a dropped heartbeat should be survivable.
+    /// Declaring the lease lost on the first failure, and then never renewing it
+    /// again, made a momentary network blip permanent.
+    failures: u32,
+    /// The heartbeat TTL coord granted, in seconds. Taken from the grant rather
+    /// than hardcoded, so the tolerance below stays correct if coord's TTL changes.
+    ttl_s: u32,
     /// The in-process path locks this lease was granted under (E-027). Held for
     /// exactly the lease's lifetime, so they are dropped by `release` — which is
     /// what lets the next waiter through in the right order.
@@ -61,6 +71,10 @@ pub struct LeaseManager {
     /// Local per-path queueing, applied *before* coord is asked (E-027).
     locks: PathLocks,
     budget: Duration,
+    /// Where to report a lease we have given up on (E-026). Optional because a
+    /// renewal failure is background work with no tool call to attach to, so this
+    /// is the only path by which it becomes visible to anyone.
+    diagnostics: Option<(Arc<crate::diag::Diagnostics>, chapr_proto::Principal)>,
 }
 
 impl LeaseManager {
@@ -71,7 +85,18 @@ impl LeaseManager {
             interval: RENEWAL_INTERVAL,
             locks: PathLocks::new(),
             budget: DEFAULT_ACQUIRE_BUDGET,
+            diagnostics: None,
         }
+    }
+
+    /// Report a given-up lease to the diagnostics channel (E-026).
+    pub fn with_diagnostics(
+        mut self,
+        diagnostics: Arc<crate::diag::Diagnostics>,
+        principal: chapr_proto::Principal,
+    ) -> Self {
+        self.diagnostics = Some((diagnostics, principal));
+        self
     }
 
     /// Override the renewal interval (tests use a tiny one).
@@ -159,6 +184,8 @@ impl LeaseManager {
             resp.lease_id.clone(),
             Held {
                 lost: false,
+                failures: 0,
+                ttl_s: resp.ttl_s,
                 _guards: guards,
             },
         );
@@ -214,13 +241,83 @@ impl LeaseManager {
         };
 
         for id in ids {
-            if let Err(e) = self.coord.lease_renew(&id).await {
-                // Expired / reaped / coord unreachable → mark lost, stop renewing.
-                if let Some(h) = self.held.lock().await.get_mut(&id) {
-                    h.lost = true;
+            match self.coord.lease_renew(&id).await {
+                Ok(_) => {
+                    // A success clears the history: what matters is *consecutive*
+                    // failures, not failures ever.
+                    if let Some(h) = self.held.lock().await.get_mut(&id) {
+                        h.failures = 0;
+                    }
                 }
-                tracing::warn!(lease = %id, error = %e, "lease renewal failed; lease marked lost");
+                Err(e) => self.on_renew_failure(&id, e).await,
             }
+        }
+    }
+
+    /// Decide what a failed renewal means (I-008).
+    ///
+    /// The defect this replaces marked a lease lost after **one** failure and
+    /// never renewed it again, so a momentary blip permanently ended renewal and
+    /// coord reaped the lease mid-write. Two kinds of failure need telling apart:
+    ///
+    /// - **Definitive** — coord says this lease is gone (reaped, expired, past its
+    ///   hard ceiling, unknown id). Retrying cannot bring it back, and continuing
+    ///   to believe we hold it is the wrong belief. Lost immediately.
+    /// - **Transient** — coord could not be reached, or answered with an internal
+    ///   error. The lease is probably still there. Keep it and try on the next
+    ///   tick; the renewal interval is TTL ÷ 3 precisely so a dropped heartbeat is
+    ///   survivable.
+    ///
+    /// The tolerance is derived rather than picked: after `ttl_s / interval`
+    /// consecutive failures we have spent a full TTL without a heartbeat, so the
+    /// lease has certainly lapsed on coord's side and holding the belief any
+    /// longer would be false. Correctness never depended on any of this — the
+    /// exclusive open plus CAS is the core (invariant 3) — but availability and an
+    /// honest Leases view both do.
+    async fn on_renew_failure(&self, id: &LeaseId, e: ChaprError) {
+        let definitive = matches!(
+            e,
+            ChaprError::LeaseNotFound { .. }
+                | ChaprError::LeaseExpired { .. }
+                | ChaprError::MaxLeaseLifetimeExceeded { .. }
+        );
+
+        let (now_lost, failures) = {
+            let mut held = self.held.lock().await;
+            let Some(h) = held.get_mut(id) else {
+                return; // released while we were on the network
+            };
+            h.failures += 1;
+            let tolerance = (h.ttl_s / self.interval.as_secs().max(1) as u32).max(1);
+            h.lost = definitive || h.failures >= tolerance;
+            (h.lost, h.failures)
+        };
+
+        if now_lost {
+            tracing::warn!(
+                lease = %id, error = %e, failures,
+                definitive,
+                "lease given up as lost; renewal stopped"
+            );
+            // Surface it where an administrator will actually look. Without this
+            // the symptom lives only in the endpoint's stderr, which goes nowhere
+            // as a stdio child of Claude Desktop.
+            if let Some((diagnostics, principal)) = &self.diagnostics {
+                diagnostics
+                    .report(
+                        &self.coord,
+                        principal,
+                        &ChaprError::LeaseLost {
+                            lease_id: id.clone(),
+                        },
+                    )
+                    .await;
+            }
+        } else {
+            tracing::info!(
+                lease = %id, error = %e, failures,
+                "lease renewal failed; keeping the lease and retrying on the next tick"
+            );
         }
     }
 
@@ -445,28 +542,124 @@ mod tests {
         assert!(!mgr.is_held(&lease.lease_id).await);
     }
 
+    /// A manager whose renewals go to a closed port, tracking one lease.
+    ///
+    /// `ttl_s` 90 against the default 30 s interval gives a tolerance of three
+    /// consecutive failures — a full TTL without a heartbeat.
+    async fn manager_with_unreachable_coord(id: &str) -> (LeaseManager, LeaseId) {
+        let mgr = LeaseManager::new(CoordClient::new("http://127.0.0.1:1"));
+        let lease_id = LeaseId::new_unchecked(id);
+        mgr.held.lock().await.insert(
+            lease_id.clone(),
+            Held {
+                lost: false,
+                failures: 0,
+                ttl_s: 90,
+                _guards: Vec::new(),
+            },
+        );
+        (mgr, lease_id)
+    }
+
     #[tokio::test]
-    async fn coord_unreachable_renewal_marks_lost() {
-        // Acquire against a live mock, then point renewals at a dead port.
+    async fn a_single_transient_renewal_failure_keeps_the_lease() {
+        // I-008. One unreachable-coord blip used to end renewal for that lease
+        // permanently, so coord reaped it mid-write. The renewal interval is
+        // TTL ÷ 3 precisely so a dropped heartbeat is survivable — the manager has
+        // to actually survive it.
+        let (mgr, id) = manager_with_unreachable_coord("lease-blip").await;
+        mgr.renew_all_once().await;
+        assert!(
+            mgr.is_held(&id).await,
+            "one transient failure must not give up the lease"
+        );
+        assert_eq!(mgr.held.lock().await.get(&id).unwrap().failures, 1);
+    }
+
+    #[tokio::test]
+    async fn a_success_clears_the_failure_history() {
+        // What matters is *consecutive* failures. Two blips an hour apart are not
+        // a lost lease.
         let server = MockServer::start().await;
-        mount_acquire(&server, "lease-x").await;
+        mount_acquire(&server, "lease-mix").await;
+        Mock::given(method("POST"))
+            .and(path("/leases/lease-mix/renew"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "renewed_until": "2026-07-21T09:30:00Z"
+            })))
+            .mount(&server)
+            .await;
         let mgr = LeaseManager::new(CoordClient::new(server.uri()));
         let lease = mgr.acquire(&acquire_req()).await.unwrap();
 
-        // Swap in an unreachable coord by building a fresh manager that shares
-        // nothing — instead, simulate by renewing against a closed port.
-        let dead = LeaseManager::new(CoordClient::new("http://127.0.0.1:1"));
-        dead.held
-            .lock()
-            .await
-            .insert(
-                lease.lease_id.clone(),
-                Held {
-                    lost: false,
-                    _guards: Vec::new(),
-                },
-            );
-        dead.renew_all_once().await;
-        assert!(!dead.is_held(&lease.lease_id).await);
+        // Pretend two failures already happened, then let a real renewal land.
+        mgr.held.lock().await.get_mut(&lease.lease_id).unwrap().failures = 2;
+        mgr.renew_all_once().await;
+        assert!(mgr.is_held(&lease.lease_id).await);
+        assert_eq!(
+            mgr.held.lock().await.get(&lease.lease_id).unwrap().failures,
+            0,
+            "a success must reset the counter, not leave the lease one blip from death"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failures_give_up_once_a_whole_ttl_has_passed() {
+        // The other side of the fix: we must not believe we hold a lease coord has
+        // certainly reaped. Three failures at a 30 s interval is 90 s — the TTL.
+        let (mgr, id) = manager_with_unreachable_coord("lease-gone-quietly").await;
+        mgr.renew_all_once().await;
+        mgr.renew_all_once().await;
+        assert!(mgr.is_held(&id).await, "still inside the TTL");
+        mgr.renew_all_once().await;
+        assert!(
+            !mgr.is_held(&id).await,
+            "past a full TTL without a heartbeat the lease is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definitive_failure_gives_up_immediately() {
+        // Coord saying the lease does not exist is not a blip. Retrying cannot
+        // bring it back, and continuing to believe we hold it is the wrong belief.
+        let server = MockServer::start().await;
+        mount_acquire(&server, "lease-reaped").await;
+        Mock::given(method("POST"))
+            .and(path("/leases/lease-reaped/renew"))
+            .respond_with(ResponseTemplate::new(410).set_body_json(serde_json::json!({
+                "code": "LEASE_EXPIRED", "lease_id": "lease-reaped"
+            })))
+            .mount(&server)
+            .await;
+        let mgr = LeaseManager::new(CoordClient::new(server.uri()));
+        let lease = mgr.acquire(&acquire_req()).await.unwrap();
+
+        mgr.renew_all_once().await;
+        assert!(
+            !mgr.is_held(&lease.lease_id).await,
+            "an expired lease must be given up on the first answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn giving_up_a_lease_is_reported_as_a_diagnostic() {
+        // A renewal failure is background work with no tool call to attach to, so
+        // this is the only path by which it becomes visible to an administrator.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("diagnostics.jsonl");
+        let (mut mgr, id) = manager_with_unreachable_coord("lease-report").await;
+        mgr = mgr.with_diagnostics(
+            Arc::new(crate::diag::Diagnostics::new(Some(log.clone()))),
+            Principal::new_unchecked("CONTOSO\\jsmith"),
+        );
+
+        for _ in 0..3 {
+            mgr.renew_all_once().await;
+        }
+        assert!(!mgr.is_held(&id).await);
+        let text = std::fs::read_to_string(&log).expect("a given-up lease must be recorded");
+        assert!(text.contains("LEASE_LOST"));
+        // A warning, not an error: availability suffered, correctness did not.
+        assert!(text.contains("\"warning\""));
     }
 }

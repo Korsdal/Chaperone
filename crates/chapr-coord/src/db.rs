@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail         TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_path ON audit_log(canonical_path, id);
+-- Covers the admin view's principal filter. The plain fleet-wide listing needs no
+-- index of its own: it orders by id, which is the primary key.
+CREATE INDEX IF NOT EXISTS idx_audit_principal ON audit_log(principal, id);
 
 CREATE TABLE IF NOT EXISTS conflicts (
     conflict_id      TEXT    PRIMARY KEY,
