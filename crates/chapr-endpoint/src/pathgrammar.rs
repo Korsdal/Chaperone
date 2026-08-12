@@ -10,9 +10,21 @@
 //! Everything here is pure string logic with no OS dependency, so it compiles and
 //! unit-tests on any platform (the cross-platform-buildable choice, D-C).
 
+use crate::mount::MountTable;
 use chapr_proto::{BackendKind, CanonicalPath, Principal};
 use chrono::Utc;
 use unicode_normalization::UnicodeNormalization;
+
+/// `X:\…` — a drive letter with a rooted remainder. `X:foo` (drive-relative) and
+/// `foo\bar` are not absolute: neither names one file independently of who is
+/// asking, which is the property invariant 5 needs.
+fn is_absolute_local(p: &str) -> bool {
+    let mut it = p.chars();
+    matches!(
+        (it.next(), it.next(), it.next()),
+        (Some(c), Some(':'), Some('\\')) if c.is_ascii_alphabetic()
+    )
+}
 
 /// The path grammar for one backend kind. `normalize` is the §5.1
 /// canonicalisation body (backend-specific); the derived-name builders are
@@ -26,6 +38,24 @@ pub trait PathGrammar: Send + Sync {
     /// [`crate::canon::canonicalize`], which adds the empty-input guard and wraps
     /// the result in a [`CanonicalPath`].
     fn normalize(&self, raw: &str) -> Result<String, String>;
+
+    /// Bring `raw` into this backend's own rooted form *before* normalisation,
+    /// consulting the live mount table where the backend has one (E-022).
+    ///
+    /// Split out from [`Self::normalize`] because it is the one part of
+    /// canonicalisation that cannot be pure: resolving a mapped drive needs the
+    /// OS to answer what the letter currently points at. Keeping it separate
+    /// leaves `normalize` string-only and unit-testable on any platform.
+    ///
+    /// The default is identity — a backend whose paths have exactly one spelling
+    /// (POSIX) has nothing to resolve.
+    fn to_rooted(
+        &self,
+        raw: &str,
+        _mounts: &dyn crate::mount::MountTable,
+    ) -> Result<String, String> {
+        Ok(raw.to_string())
+    }
 
     /// Every "humans always win" lock sibling to pre-flight before a write (SMB's
     /// Office owner files). Empty for backends with no such convention (POSIX),
@@ -112,6 +142,44 @@ pub struct WinGrammar;
 impl PathGrammar for WinGrammar {
     fn sep(&self) -> char {
         '\\'
+    }
+
+    fn to_rooted(&self, raw: &str, mounts: &dyn MountTable) -> Result<String, String> {
+        let unified: String = raw.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
+
+        // Already UNC — nothing to resolve, and this is the overwhelmingly common
+        // case: `chapr.list` re-canonicalises every entry it returns, and those are
+        // joined onto an already-canonical parent. Short-circuiting here keeps the
+        // syscall to at most one per user-supplied path.
+        if unified.starts_with("\\\\") {
+            return Ok(unified);
+        }
+
+        // A relative or drive-relative path cannot be keyed at all: `bid.docx`
+        // means something different per working directory, so two agents naming
+        // one file would key it differently — invariant 5 broken with no way to
+        // notice. Refuse instead of guessing.
+        if !is_absolute_local(&unified) {
+            return Err(format!(
+                "{raw:?} is not an absolute path — give a UNC path (\\\\server\\share\\…) \
+                 or a full path on a mapped drive (Z:\\…)"
+            ));
+        }
+
+        match mounts.universal_name(&unified) {
+            // A mapped network drive: key it by the share so every laptop agrees
+            // regardless of which letter it happens to have mapped (E-022, D-030).
+            Ok(Some(unc)) => Ok(unc),
+            // Genuinely local, left as it is. A local path cannot be shared
+            // between laptops, so it carries no aliasing risk, and the dev and
+            // live-smoke harnesses work on local temp trees. Confining a
+            // deployment to the share is E-025's configured root, not this.
+            Ok(None) => Ok(unified),
+            Err(e) => Err(format!(
+                "cannot resolve {raw:?} to a share: {e} — coordination state is keyed by \
+                 the share path, so an unresolvable drive mapping is not safe to use"
+            )),
+        }
     }
 
     fn normalize(&self, raw: &str) -> Result<String, String> {

@@ -62,6 +62,9 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_IO",
+    # E-022: WNetGetUniversalNameW, to resolve a mapped drive letter to the UNC
+    # name of the share it points at (invariant 5 — see `mount.rs`).
+    "Win32_NetworkManagement_WNet",
 ] }
 
 [profile.release]

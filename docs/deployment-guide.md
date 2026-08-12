@@ -15,7 +15,11 @@ Two artifacts, N-to-1:
   I/O as the logged-in user; owns the write path, CAS, read state machine.
 
 File **bytes** go endpoint → fileserver directly; **metadata** goes endpoint ↔
-coord over HTTP. They never cross.
+coord over HTTP. The one deliberate exception is the **pre-image snapshot**: a
+write sends the bytes it is about to replace to coord's blob store, because that
+snapshot is what history and crash recovery are made of (D-026). It caps the
+largest writable file at 256 MiB. The 200 MB PDF a model *reads* still never
+touches coord.
 
 ## Prerequisites
 - A shared fileserver: **SMB** (Windows) or **POSIX** (Linux/NFS).
@@ -62,5 +66,10 @@ coord over HTTP. They never cross.
 - [ ] Auth mode (MVP `trusted-header` vs enforced)
 - [ ] Client OS(es) → which MCPB bundle(s) to build
 - [ ] Coordinator URL baked into the bundle default / comms to users
+- [ ] **Coordinated root** (`CHAPR_ROOT` / the bundle's "Coordinated location"):
+      the share path, as UNC. Bounds what the endpoint will touch, and is
+      announced to the model so it routes writes through Chaperone. Users on
+      mapped drives are fine — a drive letter is resolved to its UNC form, so
+      two laptops with different letters still key one file identically.
 - [ ] TLS? (set `[tls]`)
 - [ ] Backup + monitoring wired
