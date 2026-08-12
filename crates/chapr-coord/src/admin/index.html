@@ -168,7 +168,11 @@
   .save-note.ok { color: var(--accent); }
   .save-note.bad { color: var(--error); }
   .cutover { padding: 12px 16px; }
-  .cutover table { width: auto; min-width: 300px; }
+  .cutover table { width: auto; min-width: 320px; }
+  /* Without a rule the mode counts and the summary facts read as one confused
+     list, which is the wrong impression for the one panel a cutover is judged on. */
+  .cutover dl.facts { padding: 0; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .cutover dl.facts dt { min-width: 170px; }
   .gate { margin-top: 10px; font-size: 13px; }
   .gate.open { color: var(--accent); }
   .gate.shut { color: var(--warn); }
@@ -338,10 +342,11 @@
 </main>
 
 <footer>
-  Read-only view. Acknowledging a failure, releasing a lease and editing settings
-  need the administrator role, which is not built yet — until then this page shows
-  state and changes nothing. It identifies itself to the coordinator as
-  <code>admin-ui</code>, which is attribution rather than proof of who you are.
+  Signed in with the coordinator's admin token, which is checked rather than
+  asserted — and which does not depend on the connection auth mode, so a wrong
+  setting here can always be undone from this page. The Settings tab writes the
+  configuration file; the other tabs only read. Acknowledging a failure, releasing
+  a lease and reconciling a conflict are not built yet.
 </footer>
 
 <script>
