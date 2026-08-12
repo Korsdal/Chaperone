@@ -218,8 +218,21 @@ async fn put_blob(
 }
 
 /// `GET /blobs/{version}` — the raw bytes, as `application/octet-stream`.
+///
+/// Gated by [`crate::auth::Caller`] (D-029). Since D-026 this route serves file
+/// **content** — every write snapshots its pre-image here — and it applies no ACL
+/// check of its own, so reachability of the control plane implies read access to
+/// the history of every file coord knows about.
+///
+/// Under `trusted-header` the extractor authenticates nothing, and that is
+/// understood: it buys **attribution**, and it puts the route on the enforcement
+/// path *before* E-015 switches enforcement on. I-002's own note is that the
+/// ungated routes stay reachable while the gated ones begin rejecting — a gap
+/// that converts into a real bypass at exactly the moment auth starts working.
+/// The two content-bearing routes are the ones that must not be in that set.
 async fn get_blob(
     State(st): State<AppState>,
+    caller: crate::auth::Caller,
     Path(version): Path<String>,
 ) -> Result<Vec<u8>, ApiError> {
     let version = VersionToken::from_hex(version.clone()).ok_or_else(|| {
@@ -229,7 +242,25 @@ async fn get_blob(
         })
     })?;
     let bytes = history::get_blob(&st.blob_root, &version).await?;
+    tracing::info!(
+        principal = %caller_label(&caller),
+        %version,
+        size = bytes.len(),
+        "blob fetch"
+    );
     Ok(bytes)
+}
+
+/// How to name the caller in a log line. `AuditEvent` cannot carry these two
+/// routes: it is keyed by `(canonical_path, session_id)`, and a blob fetch has
+/// neither — the version hash is content-addressed and deduplicated, so it may
+/// name bytes shared by several paths, and no session travels on the request.
+/// Bending the audit record to fit would mean inventing a path, which is the
+/// opposite of what an audit trail is for. Durable attribution for these reads
+/// belongs in the diagnostics/access store (E-026), whose record shape fits;
+/// until then the structured log is the trail.
+fn caller_label(caller: &crate::auth::Caller) -> &str {
+    caller.0.as_ref().map_or("(unauthenticated)", |p| p.as_str())
 }
 
 async fn append_version_log(
@@ -251,11 +282,24 @@ async fn append_version_log(
     Ok(Json(entry))
 }
 
+/// `POST /history` — a file's version chain, newest first.
+///
+/// Gated for the same reason as [`get_blob`]: the chain is what turns a blob
+/// store into a readable history, since it hands out the very version hashes
+/// `GET /blobs/{version}` takes. Gating the bytes and leaving their index open
+/// would be half a gate.
 async fn get_history(
     State(st): State<AppState>,
+    caller: crate::auth::Caller,
     Json(req): Json<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
     let resp = history::history(&st.pool, &req.path).await?;
+    tracing::info!(
+        principal = %caller_label(&caller),
+        path = %req.path,
+        entries = resp.entries.len(),
+        "history query"
+    );
     Ok(Json(resp))
 }
 
@@ -795,6 +839,101 @@ mod tests {
         let clean: ResolveResponse =
             serde_json::from_slice(&to_bytes(clean.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(clean.journal_state, chapr_proto::JournalState::Clean);
+    }
+
+    #[tokio::test]
+    async fn content_routes_require_an_identity_under_enforced_auth() {
+        // D-029: `GET /blobs/{version}` serves file *content* (every write
+        // snapshots its pre-image there) and `POST /history` hands out the very
+        // version hashes it takes. Both were ungated, so control-plane
+        // reachability implied read access to every file's history while
+        // `/leases` already rejected — precisely the split I-002 warns turns into
+        // a real bypass the day E-015 switches enforcement on.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(db::test_pool().await)
+            .with_blob_root(tmp.path().to_path_buf())
+            .with_auth(std::sync::Arc::new(crate::auth::TrustedHeaderAuth));
+
+        let version = VersionToken::hash(b"a pre-image nobody should be able to fetch");
+        let blob = Request::builder()
+            .uri(format!("/blobs/{version}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state.clone()).oneshot(blob).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "blob fetch must not be reachable without an identity"
+        );
+
+        let hist = Request::builder()
+            .method("POST")
+            .uri("/history")
+            .header("content-type", "application/json")
+            .body(body_json(&serde_json::json!({"path": "\\\\srv\\share\\a.md"})))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(hist).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "gating the bytes but not their index would be half a gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_routes_serve_once_an_identity_is_present() {
+        // The gate is attribution, not a new obstacle: the endpoint sends
+        // `x-chapr-principal` on every request, so a real client is unaffected.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(
+            AppState::new(db::test_pool().await)
+                .with_blob_root(tmp.path().to_path_buf())
+                .with_auth(std::sync::Arc::new(crate::auth::TrustedHeaderAuth)),
+        );
+        let content = b"pre-image body".to_vec();
+        let version = VersionToken::hash(&content);
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blobs")
+                    .header("content-type", "application/octet-stream")
+                    .header("x-chapr-principal", "CONTOSO\\jsmith")
+                    .body(Body::from(content.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/blobs/{version}"))
+                    .header("x-chapr-principal", "CONTOSO\\jsmith")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let got = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(got.as_ref(), content.as_slice(), "gate must not alter the bytes");
+
+        let hist = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/history")
+                    .header("content-type", "application/json")
+                    .header("x-chapr-principal", "CONTOSO\\jsmith")
+                    .body(body_json(&serde_json::json!({"path": "\\\\srv\\share\\a.md"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hist.status(), StatusCode::OK);
     }
 
     #[tokio::test]

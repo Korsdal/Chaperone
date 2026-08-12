@@ -98,6 +98,12 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&args.config_out, cfg.to_toml())?;
     println!("Wrote config → {}", args.config_out.display());
 
+    // Before the service starts, so SQLite's WAL and the first blobs are created
+    // inside an already-restricted directory rather than being tightened after
+    // the fact (D-029).
+    println!("\nRestricting the data directories…");
+    let hardening_warnings = harden_data_dirs(&cfg);
+
     if args.no_service {
         print_manual_start(&args.config_out);
     } else {
@@ -114,6 +120,20 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     print_endpoint_snippet(&cfg);
+
+    // Last, so it is the final thing on screen rather than scrolled away by the
+    // endpoint snippet. Coord's blob store holds file content, so an unrestricted
+    // data directory is a real exposure the installer must not report silently.
+    if !hardening_warnings.is_empty() {
+        eprintln!("\n!! Data-directory permissions need attention:");
+        for w in &hardening_warnings {
+            eprintln!("   - {w}");
+        }
+        eprintln!(
+            "   Coord's blob store holds file content (every write snapshots the pre-image),\n   \
+             so anyone who can read these directories can read that history."
+        );
+    }
     Ok(())
 }
 
@@ -218,6 +238,164 @@ fn ensure_writable_dir(dir: &str) -> Result<(), String> {
     std::fs::write(&probe, b"ok").map_err(|e| format!("{dir} is not writable: {e}"))?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
+}
+
+// ---- data-directory hardening (D-029) ------------------------------------
+
+/// The on-disk SQLite file a `db_url` names, if it names one.
+///
+/// `sqlite:C:/data/coord.db?mode=rwc` → the path; `sqlite::memory:` → `None`.
+fn db_file_path(db_url: &str) -> Option<std::path::PathBuf> {
+    let rest = db_url.strip_prefix("sqlite:")?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let rest = rest.split('?').next()?;
+    // A leading ':' is a SQLite pseudo-target (`:memory:`), not a path.
+    if rest.is_empty() || rest.starts_with(':') {
+        return None;
+    }
+    Some(std::path::PathBuf::from(rest))
+}
+
+/// Directories we refuse to touch: hardening one of these locks down the machine
+/// rather than the coordinator.
+///
+/// Two independent guards, because either alone is too weak. The depth rule
+/// (at least two named components) rejects a bare volume or `/var`; the name list
+/// rejects a shared system directory that happens to be deep enough. `C:\
+/// ProgramData` is refused, `C:\ProgramData\Chaperone` is allowed.
+fn is_unsafe_to_harden(p: &Path) -> bool {
+    use std::path::Component;
+    let named: Vec<String> = p
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    if named.len() < 2 {
+        return true;
+    }
+    // Shared locations nobody should hand exclusively to one service.
+    const SHARED: &[&[&str]] = &[
+        &["windows"],
+        &["users"],
+        &["program files"],
+        &["program files (x86)"],
+        &["programdata"],
+        &["etc"],
+        &["usr"],
+        &["var"],
+        &["var", "lib"],
+        &["var", "log"],
+        &["home"],
+        &["opt"],
+        &["srv"],
+        &["tmp"],
+    ];
+    SHARED.iter().any(|s| named == *s)
+}
+
+/// Restrict the coordinator's data directories to administrators + the service
+/// account, and report what could not be done.
+///
+/// Since D-026 the blob store holds real file **content** — every write snapshots
+/// the pre-image it replaces — and on this deployment shape coord runs *on the
+/// fileserver*, so without this the share's own users can read and delete the
+/// history of every file straight from Explorer. `GET /blobs/{version}` has its
+/// own gate; this is the filesystem half, and the two are genuinely different
+/// exposures (D-029).
+///
+/// Applied by the installer, not at every start: it is a one-time deployment
+/// fact, and re-asserting ACLs on each boot would silently revert a deliberate
+/// change by an administrator.
+///
+/// Windows goes through `icacls` with **well-known SIDs** rather than account
+/// names — `S-1-5-32-544` (Administrators), `S-1-5-18` (LocalSystem) — because
+/// the display names are localized and a Danish server has "Administratorer".
+/// Shelling out keeps coord's core free of the Win32 security APIs, in keeping
+/// with it having no Windows primitives outside the cfg-gated watcher and SCM
+/// integration.
+fn harden_data_dirs(cfg: &Config) -> Vec<String> {
+    let mut targets: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&cfg.blob_root)];
+    if let Some(db) = db_file_path(&cfg.db_url) {
+        if let Some(parent) = db.parent() {
+            // The WAL and SHM siblings are created fresh by SQLite and inherit
+            // from the directory, not from the .db file — so the directory is
+            // the only thing worth restricting.
+            if !parent.as_os_str().is_empty() {
+                targets.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    let mut done: Vec<std::path::PathBuf> = Vec::new();
+    for dir in targets {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if done.contains(&canonical) {
+            continue;
+        }
+        done.push(canonical.clone());
+
+        if is_unsafe_to_harden(&canonical) {
+            warnings.push(format!(
+                "did NOT restrict {} — it is a shared or top-level directory. \
+                 Put coord's database and blob store in their own directory \
+                 (e.g. {}) and re-run setup, or restrict it by hand.",
+                canonical.display(),
+                if cfg!(windows) { "C:\\ProgramData\\Chaperone" } else { "/var/lib/chapr" }
+            ));
+            continue;
+        }
+        if let Err(e) = restrict_dir(&canonical) {
+            warnings.push(format!("could not restrict {}: {e}", canonical.display()));
+        } else {
+            println!("  restricted {} to administrators + the service account", canonical.display());
+        }
+    }
+    warnings
+}
+
+#[cfg(windows)]
+fn restrict_dir(dir: &Path) -> Result<(), String> {
+    // /inheritance:r drops inherited ACEs (otherwise Users keeps whatever
+    // ProgramData grants); /grant:r replaces rather than adds. (OI)(CI)F =
+    // object+container inherit, full control, so new blobs and the WAL inherit.
+    let out = std::process::Command::new("icacls")
+        .arg(dir)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+        ])
+        .output()
+        .map_err(|e| format!("running icacls: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "icacls exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn restrict_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    // 0750: owner (root, which setup runs as to write the unit file) full,
+    // group read+traverse, world nothing. The Linux counterpart of the Windows
+    // ACL above — same intent, native mechanism.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
+        .map_err(|e| format!("setting mode 0750: {e}"))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn restrict_dir(_dir: &Path) -> Result<(), String> {
+    Err("no directory-restriction mechanism is implemented for this platform".into())
 }
 
 /// Generate a systemd unit that runs `serve` against the written config.
@@ -410,5 +588,90 @@ mod tests {
             ..Config::default()
         };
         assert!(probe(&cfg).is_err());
+    }
+
+    #[test]
+    fn db_file_path_finds_the_sqlite_file_and_ignores_pseudo_targets() {
+        assert_eq!(
+            db_file_path("sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc"),
+            Some(std::path::PathBuf::from("C:/ProgramData/Chaperone/coord.db"))
+        );
+        assert_eq!(
+            db_file_path("sqlite:///var/lib/chapr/coord.db"),
+            Some(std::path::PathBuf::from("/var/lib/chapr/coord.db"))
+        );
+        // `:memory:` names no directory to restrict — must not be mistaken for one.
+        assert_eq!(db_file_path("sqlite::memory:"), None);
+        assert_eq!(db_file_path("postgres://host/db"), None);
+    }
+
+    #[test]
+    fn hardening_refuses_shared_and_top_level_directories() {
+        // The whole point of the guard: locking one of these down would take out
+        // the machine rather than protect the coordinator.
+        for bad in [
+            "C:\\",
+            "C:\\ProgramData",
+            "C:\\Windows",
+            "C:\\Program Files",
+            "/",
+            "/var",
+            "/var/lib",
+            "/etc",
+            "/home",
+        ] {
+            assert!(
+                is_unsafe_to_harden(Path::new(bad)),
+                "{bad} must be refused"
+            );
+        }
+        // A directory that is genuinely the coordinator's own is allowed.
+        for good in [
+            "C:\\ProgramData\\Chaperone",
+            "C:\\ProgramData\\Chaperone\\blobs",
+            "/var/lib/chapr",
+            "/srv/chapr/blobs",
+        ] {
+            assert!(
+                !is_unsafe_to_harden(Path::new(good)),
+                "{good} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn harden_data_dirs_reports_a_refusal_instead_of_acting() {
+        // A config pointing the blob store at a shared directory must come back
+        // as a warning, not a silent no-op — an unrestricted blob store is a real
+        // exposure now that it holds file content (D-026).
+        let cfg = Config {
+            blob_root: if cfg!(windows) { "C:\\ProgramData".into() } else { "/var/lib".into() },
+            db_url: "sqlite::memory:".into(),
+            ..Config::default()
+        };
+        let warnings = harden_data_dirs(&cfg);
+        assert_eq!(warnings.len(), 1, "one refusal expected, got {warnings:?}");
+        assert!(warnings[0].contains("did NOT restrict"));
+    }
+
+    #[test]
+    fn harden_data_dirs_covers_both_the_blob_store_and_the_database_directory() {
+        // Both are exposures and both must be considered: the blob store holds
+        // pre-image content, and the database directory holds the WAL, which
+        // carries recent transaction data. Asserted through the refusal path so
+        // no real ACL is touched — the platform mechanism itself is verified by
+        // hand against a live directory, since running it here would strip the
+        // test process's own access and leave an undeletable temp directory.
+        let cfg = Config {
+            blob_root: "/var/lib".into(),
+            db_url: "sqlite:/etc/coord.db".into(),
+            ..Config::default()
+        };
+        let warnings = harden_data_dirs(&cfg);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected a refusal for the blob root and one for the db directory, got {warnings:?}"
+        );
     }
 }

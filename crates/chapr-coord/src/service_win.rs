@@ -42,6 +42,52 @@ fn service_main(_args: Vec<OsString>) {
     }
 }
 
+/// How long the SCM is asked to wait for bring-up, and how long we wait for the
+/// listener before declaring the start failed.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Set one SCM status. A free fn rather than a closure so the start-failure path
+/// can report too without nesting closures over the same handle.
+fn report(
+    handle: &service_control_handler::ServiceStatusHandle,
+    state: ServiceState,
+    accept: ServiceControlAccept,
+    exit_code: ServiceExitCode,
+    checkpoint: u32,
+    wait_hint: Duration,
+) -> Result<(), windows_service::Error> {
+    handle.set_service_status(ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: state,
+        controls_accepted: accept,
+        exit_code,
+        checkpoint,
+        wait_hint,
+        process_id: None,
+    })
+}
+
+/// Report a failed start to the SCM and turn the reason into an error.
+///
+/// Load-bearing: without an explicit Stopped the SCM sits on a dead process
+/// until its own timeout expires, which is the same silent-dead-service symptom
+/// I-006 is about — just moved one step later.
+fn report_start_failure(
+    handle: &service_control_handler::ServiceStatusHandle,
+    reason: String,
+) -> Box<dyn std::error::Error> {
+    tracing::error!(%reason, "chapr-coord failed to start; reporting Stopped to the SCM");
+    let _ = report(
+        handle,
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::ServiceSpecific(1),
+        0,
+        Duration::default(),
+    );
+    reason.into()
+}
+
 fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let handler = move |control| -> ServiceControlHandlerResult {
@@ -56,36 +102,81 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     };
     let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
 
-    let set_status = |state: ServiceState, accept: ServiceControlAccept| {
-        status_handle.set_service_status(ServiceStatus {
-            service_type: SERVICE_TYPE,
-            current_state: state,
-            controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        })
-    };
-
-    set_status(
-        ServiceState::Running,
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+    // I-006: StartPending, **not** Running. Everything below can still fail —
+    // opening the database, loading a TLS certificate, binding the port — and
+    // reporting Running here is what let a failed bring-up masquerade as a
+    // healthy service with nothing listening.
+    report(
+        &status_handle,
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        1,
+        START_TIMEOUT,
     )?;
 
     // Bring up the server on a runtime; SCM Stop drops the runtime (aborts it).
-    let cfg = crate::config::Config::load(
+    let cfg = match crate::config::Config::load(
         std::env::var(CONFIG_ENV).ok().map(PathBuf::from).as_deref(),
-    )?;
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    ) {
+        Ok(cfg) => cfg,
+        Err(e) => return Err(report_start_failure(&status_handle, format!("loading config: {e}"))),
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            return Err(report_start_failure(
+                &status_handle,
+                format!("building the tokio runtime: {e}"),
+            ))
+        }
+    };
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
     rt.spawn(async move {
-        if let Err(e) = crate::run_server(cfg).await {
+        if let Err(e) = crate::run_server_ready(cfg, Some(ready_tx)).await {
             tracing::error!(error = %e, "run_server exited");
         }
     });
 
+    // Block until the listener is bound. A disconnected channel means the sender
+    // was dropped without a signal — bring-up failed — which is exactly the case
+    // that used to be reported as Running.
+    match ready_rx.recv_timeout(START_TIMEOUT) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(report_start_failure(
+                &status_handle,
+                "coord exited during bring-up before it began listening".into(),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(report_start_failure(
+                &status_handle,
+                format!("coord did not begin listening within {START_TIMEOUT:?}"),
+            ))
+        }
+    }
+
+    report(
+        &status_handle,
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ServiceExitCode::Win32(0),
+        0,
+        Duration::default(),
+    )?;
+    tracing::info!("chapr-coord reported RUNNING to the SCM (listener is up)");
+
     let _ = stop_rx.recv(); // block until SCM asks us to stop
-    set_status(ServiceState::Stopped, ServiceControlAccept::empty())?;
+    report(
+        &status_handle,
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        0,
+        Duration::default(),
+    )?;
     Ok(())
 }
 
