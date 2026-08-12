@@ -21,6 +21,13 @@
 //!   window — not a round-trip limit. What a model can write back is the separate
 //!   [`chapr_endpoint::server::WRITEBACK_BUDGET_BYTES`], reported per read as
 //!   `writable_inline` in the envelope header rather than refusing the read.
+//! - `CHAPR_DIAG_LOG`  — where unexpected failures are appended locally, as JSON
+//!   lines (E-026). Defaults to `%LOCALAPPDATA%\Chaperone\diagnostics.jsonl` on
+//!   Windows, `$XDG_STATE_HOME/Chaperone/diagnostics.jsonl` otherwise. This sink
+//!   exists because a failure *before* coord is reachable — wrong URL, TLS
+//!   mismatch, blocked port — cannot phone home, and the endpoint's stderr goes
+//!   nowhere as a stdio child of Claude Desktop. Set it to an empty value to
+//!   disable the local file entirely.
 //! - `RUST_LOG`        — tracing filter. Default `info`.
 
 use chapr_endpoint::backend::{default_backend_kind, make_backend};
@@ -68,7 +75,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Present our identity to coord (dev auth boundary; real deployments use
     // Negotiate/Kerberos on the transport instead of this header — I-001/I-002).
     let coord = CoordClient::new(&coord_url).with_principal(principal.as_str());
-    let mut server = ChaprServer::new(coord, backend, principal, session_id);
+
+    // Where unexpected failures land locally (E-026). Logged at start-up because a
+    // support path nobody can find is not a support path.
+    let diag_log = match std::env::var("CHAPR_DIAG_LOG") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(std::path::PathBuf::from(v)),
+        Err(_) => chapr_endpoint::diag::Diagnostics::default_log_path(),
+    };
+    match &diag_log {
+        Some(p) => tracing::info!(diagnostics_log = %p.display(), "local diagnostics log"),
+        None => tracing::warn!("local diagnostics log disabled; failures before coord is reachable will not be recorded anywhere"),
+    }
+
+    let mut server = ChaprServer::new(coord, backend, principal, session_id).with_diagnostics(
+        std::sync::Arc::new(chapr_endpoint::diag::Diagnostics::new(diag_log)),
+    );
     if let Some(cap) = std::env::var("CHAPR_MAX_INLINE_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

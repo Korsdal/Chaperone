@@ -19,7 +19,8 @@
 
 use chapr_proto::{
     AcquireLeaseRequest, AppendVersionLogRequest, AuditEvent, ChaprError, ClearJournalRequest,
-    ConflictEntry, ConflictsQuery, ConflictsResponse, HistoryQuery, HistoryResponse,
+    ConflictEntry, ConflictsQuery, ConflictsResponse, DiagnosticGroup, DiagnosticReport,
+    HistoryQuery, HistoryResponse,
     LeaseAcquireResponse, LeaseId, LeaseRenewResponse, OpenJournalRequest, PutBlobResponse,
     MovePathsRequest, ReadReceipt, RecordAuditRequest, RecoverJournalRequest, RecoveredFrom,
     RefreshIndexRequest, RegisterConflictRequest, ResolveConflictControl, ResolveRequest,
@@ -183,6 +184,19 @@ impl CoordClient {
     /// Record an endpoint-driven audit event (e.g. `write_commit`).
     pub async fn record_audit(&self, req: &RecordAuditRequest) -> Result<AuditEvent, ChaprError> {
         self.recv_json(self.http.post(self.url("/audit")).json(req)).await
+    }
+
+    /// Report one unexpected failure to coord's diagnostics store (E-026).
+    ///
+    /// Separate from `record_audit` on purpose: audit records what a principal did
+    /// and is a primary deliverable, this records why something broke. Different
+    /// reader, different retention.
+    pub async fn report_diagnostic(
+        &self,
+        req: &DiagnosticReport,
+    ) -> Result<DiagnosticGroup, ChaprError> {
+        self.recv_json(self.http.post(self.url("/diagnostics")).json(req))
+            .await
     }
 
     /// Migrate coord state after an SMB rename (concept §6.3).

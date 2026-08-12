@@ -15,6 +15,7 @@ mod auth;
 mod config;
 mod conflict;
 mod db;
+mod diagnostics;
 mod gc;
 mod history;
 mod http;

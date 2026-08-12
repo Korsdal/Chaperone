@@ -22,6 +22,7 @@ use axum::{
 };
 use chapr_proto::{
     AcquireLeaseRequest, AppendVersionLogRequest, AuditEvent, CanonicalPath, ChaprError,
+    DiagnosticGroup, DiagnosticReport, DiagnosticsQuery, DiagnosticsResponse,
     ClearJournalRequest, ConflictEntry, ConflictsQuery, ConflictsResponse, HistoryQuery,
     HistoryResponse, LeaseAcquireResponse, LeaseId, LeaseReleaseResponse, LeaseRenewResponse,
     MovePathsRequest, OpenJournalRequest, PutBlobResponse, ReadReceipt, RecordAuditRequest,
@@ -110,6 +111,8 @@ pub fn router(state: AppState) -> Router {
         .route("/reads", post(record_read))
         .route("/reads/assert", post(assert_read))
         .route("/watch/event", post(watch_event))
+        .route("/diagnostics", post(report_diagnostic))
+        .route("/diagnostics/query", post(query_diagnostics))
         .with_state(state)
 }
 
@@ -249,6 +252,52 @@ async fn get_blob(
         "blob fetch"
     );
     Ok(bytes)
+}
+
+/// `POST /diagnostics` — an endpoint reports one unexpected failure (E-026).
+///
+/// Attributed to the **authenticated** caller over the body's principal, like
+/// every other principal-bearing route (D-016): a diagnostic is read to tell one
+/// misconfigured laptop from a fault hitting everybody, so the identity has to be
+/// the connection's rather than one the body asserts.
+async fn report_diagnostic(
+    State(st): State<AppState>,
+    caller: crate::auth::Caller,
+    Json(req): Json<DiagnosticReport>,
+) -> Result<Json<DiagnosticGroup>, ApiError> {
+    let report = DiagnosticReport {
+        principal: caller.0.unwrap_or(req.principal),
+        ..req
+    };
+    let group = crate::diagnostics::record(&st, &report).await?;
+    tracing::warn!(
+        code = %group.code,
+        path = group.path.as_ref().map(|p| p.as_str()).unwrap_or("-"),
+        count = group.count,
+        principal = %report.principal,
+        "endpoint reported a diagnostic"
+    );
+    Ok(Json(group))
+}
+
+/// `POST /diagnostics/query` — read the grouped failures.
+///
+/// Ungated beyond `Caller` for now. The **admin role** that should own this is
+/// E-024a, deliberately deferred with the dashboard (D-030): this slice exists so
+/// that when something breaks at the customer we can find out *what*, and gating
+/// it behind a role nobody can hold yet would defeat that.
+async fn query_diagnostics(
+    State(st): State<AppState>,
+    caller: crate::auth::Caller,
+    Json(req): Json<DiagnosticsQuery>,
+) -> Result<Json<DiagnosticsResponse>, ApiError> {
+    let resp = crate::diagnostics::query(&st.pool, &req).await?;
+    tracing::info!(
+        principal = %caller_label(&caller),
+        groups = resp.groups.len(),
+        "diagnostics query"
+    );
+    Ok(Json(resp))
 }
 
 /// How to name the caller in a log line. `AuditEvent` cannot carry these two
@@ -839,6 +888,93 @@ mod tests {
         let clean: ResolveResponse =
             serde_json::from_slice(&to_bytes(clean.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(clean.journal_state, chapr_proto::JournalState::Clean);
+    }
+
+    #[tokio::test]
+    async fn a_reported_diagnostic_comes_back_from_the_query() {
+        let app = router(AppState::new(db::test_pool().await));
+        let body = serde_json::json!({
+            "code": "SHARING_VIOLATION",
+            "title": "A file could not be opened exclusively",
+            "severity": "error",
+            "path": "\\\\srv\\share\\a.md",
+            "principal": "CONTOSO\\jsmith",
+            "host": "LAPTOP-04",
+            "detail": "sharing violation opening \\\\srv\\share\\a.md exclusively",
+            "remedy": "Exclude the share from antivirus real-time scanning.",
+            "facts": { "os_error": "32" }
+        });
+        let posted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diagnostics")
+                    .header("content-type", "application/json")
+                    .body(body_json(&body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(posted.status(), StatusCode::OK);
+
+        let queried = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diagnostics/query")
+                    .header("content-type", "application/json")
+                    .body(body_json(&serde_json::json!({})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queried.status(), StatusCode::OK);
+        let resp: chapr_proto::DiagnosticsResponse =
+            serde_json::from_slice(&to_bytes(queried.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(resp.groups.len(), 1);
+        let g = &resp.groups[0];
+        assert_eq!(g.code, "SHARING_VIOLATION");
+        assert_eq!(g.count, 1);
+        // The two fields that make a diagnostic usable rather than merely present.
+        assert!(g.remedy.contains("antivirus"));
+        assert_eq!(g.facts.get("os_error").map(String::as_str), Some("32"));
+        assert_eq!(g.occurrences[0].host.as_deref(), Some("LAPTOP-04"));
+    }
+
+    #[tokio::test]
+    async fn a_diagnostic_is_attributed_to_the_authenticated_caller() {
+        // Same rule as every other principal-bearing route (D-016). It matters here
+        // because a diagnostic is read to tell one bad laptop from a fleet-wide
+        // fault, so the identity must be the connection's rather than asserted.
+        let state = AppState::new(db::test_pool().await)
+            .with_auth(std::sync::Arc::new(crate::auth::TrustedHeaderAuth));
+        let app = router(state);
+        let body = serde_json::json!({
+            "code": "IO", "title": "t", "severity": "error",
+            "principal": "CONTOSO\\spoofed", "detail": "d", "remedy": "r"
+        });
+        let posted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diagnostics")
+                    .header("content-type", "application/json")
+                    .header("x-chapr-principal", "CONTOSO\\authed")
+                    .body(body_json(&body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(posted.status(), StatusCode::OK);
+        let g: chapr_proto::DiagnosticGroup =
+            serde_json::from_slice(&to_bytes(posted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let who: Vec<&str> = g.occurrences.iter().map(|o| o.principal.as_str()).collect();
+        assert_eq!(who, vec!["CONTOSO\\authed"]);
+        assert!(!who.contains(&"CONTOSO\\spoofed"));
     }
 
     #[tokio::test]
