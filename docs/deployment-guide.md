@@ -53,6 +53,26 @@ touches coord.
 - `chapr.history` shows the version log; the coord audit trail attributes each
   action to the acting user.
 
+## When something breaks
+
+Two places to look, and you need both — the second exists because a failure that
+happens *before* coord is reachable cannot report itself to coord.
+
+1. **Coord, for the whole fleet.** `POST /diagnostics/query` with `{}` returns
+   unexpected failures grouped by `(code, path)`, newest first, each with a
+   `remedy` field saying what to do, `facts` carrying the OS-level detail, and the
+   users and hosts that hit it — which is how you tell one misconfigured laptop
+   from a fault hitting everybody.
+2. **The laptop, for that laptop.** The endpoint appends the same records as JSON
+   lines to `%LOCALAPPDATA%\Chaperone\diagnostics.jsonl` (override with
+   `CHAPR_DIAG_LOG`). Check here for a wrong coordinator URL, a TLS mismatch or a
+   blocked port — none of which can be reported over the network they break.
+
+**Only unexpected failures land there.** A CAS conflict, a document a human has
+open in Word, a busy file — those are designed outcomes, not faults, and they
+surface as conflict and lease state instead. If the diagnostics list is empty,
+that is the intended steady state.
+
 ## Operations
 - **Availability:** coord availability == write availability. Run it as a service,
   monitor `/healthz`.

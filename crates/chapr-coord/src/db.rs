@@ -108,6 +108,46 @@ CREATE TABLE IF NOT EXISTS session_reads (
     seen_at_ms INTEGER NOT NULL,
     PRIMARY KEY (session_id, path, version)
 );
+
+-- Operational diagnostics (E-026). Deliberately NOT the audit log: audit records
+-- what a principal did and is a primary deliverable, this records why something
+-- failed. Different reader, different retention; merging them makes audit
+-- unreadable. Only unexpected failures land here -- a CAS conflict or an Office
+-- lock is a designed outcome and surfaces as conflict/lease status instead.
+--
+-- Grouped by (code, path): the failure that matters is usually the one repeating,
+-- and one looping agent would otherwise bury everything else under identical rows.
+CREATE TABLE IF NOT EXISTS diagnostics (
+    id            TEXT    PRIMARY KEY,
+    code          TEXT    NOT NULL,   -- stable machine code, from the ChaprError variant
+    path          TEXT,               -- canonical; NULL for endpoint-wide problems
+    title         TEXT    NOT NULL,
+    severity      TEXT    NOT NULL,   -- Severity: error | warning
+    detail        TEXT    NOT NULL,
+    remedy        TEXT    NOT NULL,   -- what fixes it; required, not decoration
+    facts_json    TEXT    NOT NULL,   -- free key/value context, so a new fact needs no migration
+    state         TEXT    NOT NULL,   -- DiagnosticState: open | acknowledged | resolved
+    first_seen_ms INTEGER NOT NULL,
+    last_seen_ms  INTEGER NOT NULL,
+    count         INTEGER NOT NULL
+);
+-- The grouping key. A unique index cannot span a NULL path in SQLite, so the key
+-- folds a missing path to the empty string; the module maps it back to NULL.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_diagnostics_group
+    ON diagnostics(code, IFNULL(path, ''));
+CREATE INDEX IF NOT EXISTS idx_diagnostics_recent ON diagnostics(state, last_seen_ms);
+
+-- Individual sightings within a group. Bounded per group -- the group count is the
+-- real history. principal/host are what separate one misconfigured laptop from a
+-- fault hitting everybody.
+CREATE TABLE IF NOT EXISTS diagnostic_occurrences (
+    group_id  TEXT    NOT NULL REFERENCES diagnostics(id) ON DELETE CASCADE,
+    at_ms     INTEGER NOT NULL,
+    principal TEXT    NOT NULL,
+    host      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_diag_occ_group
+    ON diagnostic_occurrences(group_id, at_ms);
 ";
 
 /// Open (creating if absent) a SQLite pool at `url`, e.g.

@@ -45,6 +45,7 @@
 //!   internal `coord.resolve` control-channel call (concept §8.1).
 
 pub mod backend;
+pub mod diagnostics;
 pub mod enums;
 pub mod error;
 pub mod ids;
@@ -55,6 +56,10 @@ pub mod version;
 // Flat re-export of the whole contract. Downstream crates write
 // `use chapr_proto::*` (or name a single type) without tracking module paths.
 pub use backend::{BackendDescriptor, BackendKind};
+pub use diagnostics::{
+    DiagnosticGroup, DiagnosticOccurrence, DiagnosticReport, DiagnosticState, DiagnosticsQuery,
+    DiagnosticsResponse, Severity,
+};
 pub use enums::{
     AuditKind, ConflictResolution, ConflictState, Integrity, JournalState, LeasePurpose,
     RestoreMode, VersionEvent, WriteMode,
