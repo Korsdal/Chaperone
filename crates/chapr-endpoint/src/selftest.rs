@@ -189,21 +189,37 @@ pub async fn run() -> u8 {
         }
     }
 
+    // Confinement (E-025) is **opt-in**: with no roots configured, `is_within_roots`
+    // returns true for everything. So the roots have to be loaded before the check
+    // below means anything — without this the check passed trivially and reported a
+    // green line for work it had not done.
+    let roots_configured = load_coordinated_roots(&mut r, kind);
+
     // From here on we touch the share.
+    let what_confined = "test folder is inside the coordinated share";
     let canon_dir = match canonicalize(&dir, g) {
         Ok(c) => c,
         Err(e) => {
-            r.fail(
-                "test folder is inside the coordinated share",
-                format!("{dir}: {e}"),
-            );
+            r.fail(what_confined, format!("{dir}: {e}"));
             return r.finish().min(255) as u8;
         }
     };
-    r.pass(
-        "test folder is inside the coordinated share",
-        format!("canonical form {}", canon_dir.as_str()),
-    );
+    if roots_configured {
+        r.pass(
+            what_confined,
+            format!("canonical form {}", canon_dir.as_str()),
+        );
+    } else {
+        r.skip(
+            what_confined,
+            format!(
+                "CHAPR_ROOT is not set, so confinement is off and every path passes — \
+                 nothing was actually checked. The path canonicalises to {}. Set CHAPR_ROOT \
+                 to the coordinated share to test this for real.",
+                canon_dir.as_str()
+            ),
+        );
+    }
     if let Err(e) = std::fs::create_dir_all(canon_dir.as_str()) {
         r.fail("test folder is writable", format!("{}: {e}", canon_dir.as_str()));
         return r.finish().min(255) as u8;
@@ -289,6 +305,40 @@ pub async fn run() -> u8 {
     }
 
     r.finish().min(255) as u8
+}
+
+/// Install the coordinated roots from `CHAPR_ROOT`, as `main` does at start-up.
+///
+/// Returns whether any root is in force. The self-test runs in a process that never
+/// went through `main`'s start-up path, so without this the confinement check has
+/// nothing to check against and silently passes.
+fn load_coordinated_roots(r: &mut Report, kind: BackendKind) -> bool {
+    let raw = match std::env::var("CHAPR_ROOT") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return false,
+    };
+    let grammar = grammar_for(kind);
+    let mounts = crate::mount::default_mounts();
+    let mut roots = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        // Canonicalised against an empty root set — there is nothing to confine a
+        // root itself to. Mirrors `main`'s own loading so the boundary the self-test
+        // enforces is the boundary the running endpoint enforces.
+        match crate::canon::canonicalize_in(part, grammar, mounts, &[]) {
+            Ok(p) => roots.push(p),
+            Err(e) => r.fail(
+                "CHAPR_ROOT is usable",
+                format!("{part:?} could not be canonicalised: {e}"),
+            ),
+        }
+    }
+    if roots.is_empty() {
+        return false;
+    }
+    // Ignored deliberately: only an already-set root set can fail here, and in this
+    // process nothing else sets one.
+    let _ = crate::canon::set_coordinated_roots(roots);
+    true
 }
 
 async fn contention_check(
