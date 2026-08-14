@@ -37,6 +37,7 @@ pub mod pathgrammar;
 pub mod pathlock;
 pub mod posixfs;
 pub mod read;
+pub mod selftest;
 pub mod server;
 #[cfg(windows)]
 pub mod winfs;

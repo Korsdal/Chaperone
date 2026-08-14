@@ -1,0 +1,19 @@
+# Workspace-wide build settings.
+#
+# Static CRT on Windows (D-032). Rust's MSVC target links the C runtime
+# dynamically by default, so both shipped binaries depended on `vcruntime140.dll`
+# from the Visual C++ redistributable. That is invisible on a developer machine —
+# every dev box has it — and it stopped a customer's coordinator from starting on
+# a clean Windows Server 2022 until the redistributable was downloaded by hand.
+#
+# The endpoint has the same dependency inside its `.mcpb`, so this is set for the
+# whole workspace rather than for coord alone: a laptop without the redistributable
+# would fail the same way, and that is a latent fault we have not ruled out rather
+# than one we have not met.
+#
+# The trade, which INSTALL.md states rather than hides: CRT security fixes no
+# longer arrive via Windows Update, because the runtime is inside our binary. For
+# two self-contained programs delivered as single files, being able to run at all
+# on an untouched server wins.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

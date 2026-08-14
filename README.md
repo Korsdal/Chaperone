@@ -144,12 +144,23 @@ Building on Linux alongside a Windows checkout: set an isolated target dir
 (`CARGO_TARGET_DIR=$HOME/chapr-target`) so the two toolchains don't clobber each other. The endpoint
 compiles on Linux because the `windows` dependency and the SMB backend are `cfg(windows)`-gated.
 
+The Windows builds link the CRT statically (`.cargo/config.toml`), so the shipped
+binaries need no Visual C++ redistributable — the dynamic default stopped a
+coordinator from starting on a clean Windows Server 2022.
+
 Coord setup and service install:
 
 ```sh
-chapr-coord setup                      # interactive; or --unattended
+chapr-coord                            # no arguments = the setup wizard
+chapr-coord setup --non-interactive …  # unattended, for fleet rollout
 chapr-coord serve --config coord.toml
 ```
+
+The coordinator's own executable is the installer: there is no script to run, and a
+bare invocation runs the wizard unless a `coord.toml` is present or there is no
+console to prompt on. Note that `addr` (where the socket binds) and `public_url`
+(what a laptop connects to) are two different settings — conflating them is how an
+administrator once came to be told to configure `http://127.0.0.1:8787` fleet-wide.
 
 See `packaging/coord/` for the config template and service install steps, and `packaging/mcpb/` for
 building the endpoint bundle. Note that `build-mcpb.ps1` writes to `./build` by default, which is

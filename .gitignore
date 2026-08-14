@@ -32,8 +32,13 @@ desktop.ini
 # --- Internal development tooling — kept LOCAL, never published. -------------
 # The code is the product; these are private working docs / agent tooling.
 # (gitignore does not delete them — they remain on disk for local use.)
-CLAUDE.md
-LOGBOOK.md
+#
+# `LOGBOOK.md` and `CLAUDE.md` used to be here. They are committed as of
+# 2026-08-14: the logbook is ~110 KB of irreplaceable project memory — decisions,
+# their reasoning, and every issue's history — and keeping it out of git left it on
+# one laptop with no backup. The repo is private, so there was never a disclosure
+# argument against it, only "the code is the product". The reasoning behind the
+# code turns out to be part of the product.
 .claude/
 docs/init spec/
 docs/status.html

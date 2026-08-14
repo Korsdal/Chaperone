@@ -43,6 +43,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // corrupts the protocol stream.
     init_tracing();
 
+    // One explicit argument check, deliberately not a clap parser: Claude Desktop
+    // launches this binary with no arguments and expects an MCP server on stdio.
+    // Anything that could reinterpret the no-argument case would break every
+    // installed extension, so the no-argument path below is left untouched.
+    if std::env::args().nth(1).as_deref() == Some("self-test") {
+        std::process::exit(chapr_endpoint::selftest::run().await as i32);
+    }
+
     let coord_url =
         std::env::var("CHAPR_COORD_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
     // Ambient OS identity — the logged-in user, reused directly (E-023, D-024).

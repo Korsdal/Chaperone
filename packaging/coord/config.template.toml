@@ -7,9 +7,16 @@
 # Put it on a persistent, backed-up volume.
 db_url = "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc"
 
-# Listen address. Bind to the interface endpoints reach; 127.0.0.1 for loopback,
-# 0.0.0.0 for a LAN-reachable service.
+# Listen address — where the SOCKET BINDS. 0.0.0.0 for a LAN-reachable service,
+# 127.0.0.1 for loopback only. This is not a URL and must never be given to a user.
 addr = "0.0.0.0:8787"
+
+# The URL the laptops connect to. THIS is the value that goes in every endpoint's
+# configuration, and it is deliberately separate from `addr` above: `0.0.0.0` and
+# `127.0.0.1` are correct bind addresses and useless URLs. Leave it out and coord
+# derives it from this machine's hostname plus `addr`'s port, which is usually right.
+# Coord refuses to start with a loopback URL while `addr` listens for other machines.
+public_url = "http://FILESERVER:8787"
 
 # Content-addressed history/blob store. A SEPARATE mount from the DB is
 # recommended (it grows with write volume). Back both up together.
@@ -30,9 +37,16 @@ backend = "smb"
 reap_secs = 30      # lease reaper
 gc_secs   = 86400   # blob GC (daily)
 
+# The share this coordinator fronts, as UNC. Set by the wizard, which offers the
+# machine's own shares. It is what the handover tells the administrator to give
+# users, and the canonical prefix coordination state is keyed by (invariant 5) —
+# so a hidden share keeps its `$`, and a drive letter is refused here.
+share_unc = "\\\\FILESERVER\\Share"
+
 # --- Optional: change-watcher (invalidates the cache on out-of-band edits) ---
-# watch_dir  = "\\\\fileserver\\share"     # local/UNC path to watch
-# share_unc  = "\\\\fileserver\\share"     # canonical UNC prefix for mapping
+# A local path an OS thread reads; usually the same as `share_unc`, but a distinct
+# setting because they are distinct things.
+# watch_dir  = "\\\\fileserver\\share"
 
 # --- Optional: TLS (serve HTTPS on the control channel) ---
 # [tls]

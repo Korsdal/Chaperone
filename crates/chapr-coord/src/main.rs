@@ -19,6 +19,7 @@ mod db;
 mod diagnostics;
 mod gc;
 mod history;
+mod host;
 mod http;
 mod index;
 mod journal;
@@ -27,6 +28,7 @@ mod mv;
 mod reads;
 mod reaper;
 mod setup;
+mod shares;
 mod state;
 // The change-watcher *effect core* (`watch`) is platform-agnostic (E-017): it
 // backs both the Windows ReadDirectoryChangesW source and the push endpoint
@@ -73,10 +75,45 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// The conventional config filename — the default `setup --config-out` writes and
+/// the one a bare invocation looks for beside the executable's working directory.
+const DEFAULT_CONFIG: &str = "coord.toml";
+
+/// Returns `ExitCode` rather than `Result` so errors are reported with `Display`.
+///
+/// Rust's default `main` error handler formats with `Debug`, which turned a
+/// perfectly good message about a Windows share path into
+/// `"\\\\FILESRV01\\\\mappe$"` — every backslash doubled and the whole thing
+/// re-quoted. The audience for these messages is an administrator mid-install, so
+/// the escaping mattered more than the one line it costs to avoid.
+fn main() -> std::process::ExitCode {
     init_tracing();
     let cli = Cli::parse();
-    match cli.cmd.unwrap_or(Cmd::Serve { config: None }) {
+    let interactive = cli.cmd.is_none();
+    let cmd = cli.cmd.unwrap_or_else(default_command);
+
+    let result = dispatch(cmd);
+    if let Err(e) = &result {
+        eprintln!("\n!! {e}");
+    }
+
+    // A bare invocation is a double-click until proven otherwise, and the thing a
+    // double-click does worst is fail: the window closes with the reason in it.
+    // Only reached for the no-subcommand path, so scripts and the SCM are
+    // untouched.
+    if interactive {
+        host::pause_if_own_console();
+    }
+
+    if result.is_err() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+fn dispatch(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
         Cmd::Serve { config } => {
             let cfg = Config::load(config.as_deref())?;
             runtime()?.block_on(run_server(cfg))
@@ -85,6 +122,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(windows)]
         Cmd::RunService { config } => service_win::run(config),
     }
+}
+
+/// What a bare `chapr-coord` (no subcommand) should do.
+///
+/// It used to be `serve`, which is the wrong guess for the way this binary is
+/// actually delivered: copied to a server and double-clicked. There is no config
+/// yet at that point, so `serve` bound loopback with built-in defaults and looked
+/// like a working coordinator that no laptop could reach — and left an
+/// administrator needing a script just to reach the wizard.
+///
+/// `serve` still wins whenever there is a config to serve or nobody to prompt, so
+/// no scripted or service invocation changes behaviour.
+fn default_command() -> Cmd {
+    use std::io::IsTerminal;
+    let config = std::path::Path::new(DEFAULT_CONFIG);
+    if config.exists() {
+        return Cmd::Serve {
+            config: Some(config.to_path_buf()),
+        };
+    }
+    if std::io::stdin().is_terminal() {
+        return Cmd::Setup(setup::SetupArgs::default_for_wizard());
+    }
+    Cmd::Serve { config: None }
 }
 
 /// Bring up all subsystems from a resolved config and serve until shutdown.
