@@ -492,6 +492,8 @@ function renderOverview(o) {
   clear(dep);
   const rows = [
     ["Configuration file", o.config_path || "(defaults and environment only)"],
+    ["Coordinator URL (give this to users)", o.advertised_url],
+    ["Listening on (not a URL)", o.bind_addr],
     ["Connection auth", o.auth_mode],
     ["Fileserver backend", o.backend],
     ["Blob store", o.blob_root],
@@ -646,7 +648,10 @@ const FIELDS = [
    "Tried when the primary rejects. Set this while changing the primary; remove it when the panel above says it is safe."],
   ["admin_principals", "Administrators", "list", null,
    "One principal per line. Enforced once the auth mode actually authenticates; recorded but not enforced under trusted-header."],
-  ["addr", "Listen address", "text", null, "host:port the laptops connect to."],
+  ["public_url", "Coordinator URL", "text", null,
+   "What the laptops connect to: scheme, then this coordinator's hostname and port (for example FILESRV01:8787 behind http). Blank = derived from this machine's hostname. This is NOT the listen address below — a bind address is not a URL, and handing one out leaves every laptop unable to connect."],
+  ["addr", "Listen address", "text", null,
+   "Where the socket binds, e.g. 0.0.0.0:8787. Never give this to a user."],
   ["db_url", "Database", "text", null, "SQLite URL. Also decides where the admin token lives."],
   ["blob_root", "Blob store", "text", null, "Holds file history. Moving it is a data migration, not a setting."],
   ["backend", "Fileserver backend", "select", ["smb", "posix"],

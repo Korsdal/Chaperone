@@ -38,6 +38,18 @@ pub struct BackendRoute {
 pub struct Config {
     pub db_url: String,
     pub addr: String,
+    /// The base URL laptops actually connect to — a hostname, not a bind address.
+    ///
+    /// `addr` binds a socket; this is what a client types. `0.0.0.0` and
+    /// `127.0.0.1` are correct for the former and useless as the latter, and
+    /// conflating the two handed a real customer `http://127.0.0.1:8787` as the
+    /// value to configure on every laptop. They are two different facts about a
+    /// deployment and they now have two fields.
+    ///
+    /// `None` means "derive it": this machine's hostname plus `addr`'s port. Read
+    /// it through [`Config::advertised_url`], never by reaching for `addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     pub blob_root: String,
     /// Connection auth mode: `disabled` | `trusted-header` | `negotiate`.
     pub auth: String,
@@ -92,6 +104,7 @@ impl Default for Config {
         Config {
             db_url: "sqlite:chapr-coord.db".into(),
             addr: "127.0.0.1:8787".into(),
+            public_url: None,
             blob_root: "chapr-blobs".into(),
             auth: "disabled".into(),
             reap_secs: 30,
@@ -141,6 +154,10 @@ impl Config {
         if let Some(v) = get("CHAPR_COORD_ADDR") {
             self.addr = v;
             captive.push("addr");
+        }
+        if let Some(v) = get("CHAPR_COORD_PUBLIC_URL") {
+            self.public_url = Some(v);
+            captive.push("public_url");
         }
         if let Some(v) = get("CHAPR_COORD_BLOBS") {
             self.blob_root = v;
@@ -196,6 +213,30 @@ impl Config {
             .filter(|d| !d.as_os_str().is_empty())
     }
 
+    /// The URL to hand a laptop — the **only** place a client-facing URL is built.
+    ///
+    /// Everything that tells a human or a laptop where the coordinator is goes
+    /// through here. The handover used to format `cfg.addr` directly, which is how
+    /// `http://127.0.0.1:8787` ended up being the value an administrator was told
+    /// to configure on every machine: a bind address is not a URL, and the two
+    /// were the same string.
+    pub fn advertised_url(&self) -> String {
+        if let Some(u) = self
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            return u.trim_end_matches('/').to_string();
+        }
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        // `addr` is a validated SocketAddr, so the last `:` segment is the port
+        // for both `1.2.3.4:8787` and `[::]:8787`.
+        let port = self.addr.rsplit(':').next().unwrap_or("8787");
+        let host = machine_hostname().unwrap_or_else(|| "localhost".to_string());
+        format!("{scheme}://{host}:{port}")
+    }
+
     /// Which fields differ between `self` and `other`, by config field name.
     ///
     /// Used to tell an operator what a save actually changed, split into what took
@@ -209,6 +250,7 @@ impl Config {
         };
         note(self.db_url != other.db_url, "db_url");
         note(self.addr != other.addr, "addr");
+        note(self.public_url != other.public_url, "public_url");
         note(self.blob_root != other.blob_root, "blob_root");
         note(self.auth != other.auth, "auth");
         note(self.auth_fallback != other.auth_fallback, "auth_fallback");
@@ -269,14 +311,82 @@ impl Config {
                 )));
             }
         }
-        if self.addr.parse::<std::net::SocketAddr>().is_err() {
-            return Err(ConfigError(format!(
-                "addr {:?} is not a host:port address",
-                self.addr
-            )));
+        let bind: std::net::SocketAddr = self.addr.parse().map_err(|_| {
+            ConfigError(format!("addr {:?} is not a host:port address", self.addr))
+        })?;
+
+        // The mistake this catches is not a typo, it is a category error: handing
+        // out the bind address as the URL. It is rejected rather than warned about
+        // because the resulting config *looks* finished — the service starts, the
+        // admin page works on the box, and the failure surfaces only as every
+        // laptop being unable to connect.
+        if let Some(raw) = self
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            if !raw.starts_with("http://") && !raw.starts_with("https://") {
+                return Err(ConfigError(format!(
+                    "public_url {raw:?} needs a scheme — e.g. http://{raw}"
+                )));
+            }
+            const UNREACHABLE: &[&str] = &["0.0.0.0", "127.0.0.1", "::", "::1", "localhost"];
+            let host = url_host(raw);
+            // A deliberate loopback-only deployment is legitimate (a developer box,
+            // a single-machine demo), and there `addr` says so too. It is only a
+            // contradiction when the listener is reachable and the URL is not.
+            if UNREACHABLE.iter().any(|h| h.eq_ignore_ascii_case(host)) && !bind.ip().is_loopback()
+            {
+                return Err(ConfigError(format!(
+                    "public_url {raw:?} names {host:?}, which no other machine can reach, but \
+                     addr {:?} is listening for them. Use the coordinator's hostname — the name \
+                     the laptops resolve — not its bind address.",
+                    self.addr
+                )));
+            }
         }
         Ok(())
     }
+}
+
+/// The host part of an `http(s)://host[:port][/path]` URL, for validation only.
+///
+/// Deliberately not a URL parser: coord has no need of one, and the single fact
+/// wanted here is "which name did the administrator write down".
+fn url_host(url: &str) -> &str {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // IPv6 literals are bracketed, so the brackets — not a colon — delimit the
+    // host: `[::1]:8787` must yield `::1`, never `[`.
+    if let Some(inner) = authority
+        .strip_prefix('[')
+        .and_then(|a| a.split_once(']'))
+        .map(|(inner, _)| inner)
+    {
+        return inner;
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
+/// This machine's name — what the laptops will actually be connecting to.
+///
+/// Lives here rather than in the wizard because [`Config::advertised_url`] needs
+/// it at every read, not only at install time.
+pub fn machine_hostname() -> Option<String> {
+    let key = if cfg!(windows) { "COMPUTERNAME" } else { "HOSTNAME" };
+    std::env::var(key)
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
 }
 
 /// Fields a running coordinator can adopt without a restart.
@@ -289,7 +399,11 @@ impl Config {
 /// `auth` is here **because** the admin token is independent of the auth mode. You
 /// cannot lock yourself out, which is what makes changing it live safe, and what
 /// makes an auth cutover something you can attempt rather than commit to blind.
-pub const RELOADABLE_FIELDS: &[&str] = &["auth", "auth_fallback"];
+/// `public_url` is here for a different reason from the auth fields: nothing in
+/// the running service reads it. It is display data — the handover, the admin
+/// overview, the value an operator copies to a laptop — so correcting a wrong one
+/// should not cost a restart of the coordinator every laptop depends on.
+pub const RELOADABLE_FIELDS: &[&str] = &["auth", "auth_fallback", "public_url"];
 
 /// The on-disk SQLite file a `db_url` names, if it names one.
 ///
@@ -338,6 +452,118 @@ mod tests {
             !cfg.overridden_by_env.contains(&"blob_root"),
             "only keys actually taken from the environment are captive"
         );
+    }
+
+    #[test]
+    fn public_url_is_captive_when_the_environment_sets_it() {
+        let mut cfg = Config::default();
+        cfg.apply_overrides(overrides(&[(
+            "CHAPR_COORD_PUBLIC_URL",
+            "http://FILESRV01:8787",
+        )]));
+        assert_eq!(cfg.public_url.as_deref(), Some("http://FILESRV01:8787"));
+        assert!(cfg.overridden_by_env.contains(&"public_url"));
+    }
+
+    #[test]
+    fn advertised_url_uses_an_explicit_value_verbatim() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("http://FILESRV01:8787/".into()),
+            ..Default::default()
+        };
+        // Trailing slash trimmed, because callers append `/admin` and `/healthz`.
+        assert_eq!(cfg.advertised_url(), "http://FILESRV01:8787");
+        assert_eq!(cfg.advertised_url(), format!("{}", cfg.advertised_url()));
+    }
+
+    #[test]
+    fn advertised_url_derives_host_and_port_when_unset() {
+        let cfg = Config {
+            addr: "0.0.0.0:9191".into(),
+            public_url: None,
+            ..Default::default()
+        };
+        let url = cfg.advertised_url();
+        // The port comes from `addr`; the host does not — that is the whole point.
+        assert!(url.ends_with(":9191"), "{url}");
+        assert!(url.starts_with("http://"), "{url}");
+        assert!(!url.contains("0.0.0.0"), "derived the bind address as a host: {url}");
+
+        // TLS decides the scheme, so the handover is not http on an https service.
+        let secure = Config {
+            tls: Some(TlsConfig {
+                cert_path: "c.pem".into(),
+                key_path: "k.pem".into(),
+            }),
+            ..cfg
+        };
+        assert!(secure.advertised_url().starts_with("https://"));
+    }
+
+    #[test]
+    fn validate_refuses_a_loopback_url_on_a_reachable_listener() {
+        for host in ["0.0.0.0", "127.0.0.1", "localhost", "[::1]"] {
+            let cfg = Config {
+                addr: "0.0.0.0:8787".into(),
+                public_url: Some(format!("http://{host}:8787")),
+                ..Default::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("{host} is not reachable from another machine");
+            assert!(err.to_string().contains("laptops resolve"), "{err}");
+        }
+    }
+
+    /// A single-machine deployment is legitimate, and there the loopback URL is
+    /// the truth. The rule is about the *contradiction*, not about loopback.
+    #[test]
+    fn validate_accepts_a_deliberate_loopback_deployment() {
+        let cfg = Config {
+            addr: "127.0.0.1:8787".into(),
+            public_url: Some("http://127.0.0.1:8787".into()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_a_public_url_without_a_scheme() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("FILESRV01:8787".into()),
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("a bare host:port is not a URL");
+        assert!(err.to_string().contains("needs a scheme"), "{err}");
+    }
+
+    #[test]
+    fn url_host_extracts_the_name_an_admin_wrote_down() {
+        assert_eq!(url_host("http://FILESRV01:8787"), "FILESRV01");
+        assert_eq!(url_host("https://coord.example.dk/admin"), "coord.example.dk");
+        assert_eq!(url_host("http://[::1]:8787"), "::1");
+        assert_eq!(url_host("http://[fe80::1]"), "fe80::1");
+        assert_eq!(url_host("FILESRV01"), "FILESRV01");
+    }
+
+    #[test]
+    fn public_url_is_reloadable_but_addr_is_not() {
+        // `public_url` is display data — nothing in the running service reads it,
+        // so a wrong one should not cost a restart. `addr` binds the listener.
+        assert!(RELOADABLE_FIELDS.contains(&"public_url"));
+        assert!(!RELOADABLE_FIELDS.contains(&"addr"));
+    }
+
+    #[test]
+    fn changed_fields_notices_a_new_public_url() {
+        let a = Config::default();
+        let b = Config {
+            public_url: Some("http://FILESRV01:8787".into()),
+            ..Config::default()
+        };
+        assert!(a.changed_fields(&b).contains(&"public_url"));
     }
 
     #[test]

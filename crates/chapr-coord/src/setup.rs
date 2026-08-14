@@ -9,7 +9,7 @@
 //! Pure pieces (`config_from_args`, `systemd_unit`, `probe`) are unit-tested;
 //! the interactive prompting is a thin layer on top.
 
-use crate::config::{Config, TlsConfig};
+use crate::config::{machine_hostname, Config, TlsConfig};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
@@ -29,6 +29,13 @@ pub struct SetupArgs {
     pub no_service: bool,
     #[arg(long)]
     pub addr: Option<String>,
+    /// The base URL laptops connect to (e.g. `http://FILESRV01:8787`).
+    ///
+    /// Separate from `--addr` on purpose: that binds a socket, this is what a
+    /// client types. Omitted → derived from this machine's hostname and `--addr`'s
+    /// port, which is right far more often than the bind address ever was.
+    #[arg(long)]
+    pub public_url: Option<String>,
     #[arg(long)]
     pub db: Option<String>,
     #[arg(long)]
@@ -59,6 +66,36 @@ pub struct SetupArgs {
     pub backend: Option<String>,
 }
 
+impl SetupArgs {
+    /// Defaults for a wizard run nobody passed flags to — i.e. a double-click.
+    ///
+    /// The config and data go where the service will look for them rather than
+    /// into whatever directory the executable was launched from, which for a
+    /// hand-delivered binary is usually a Downloads folder. This is the last thing
+    /// the PowerShell wrapper contributed that the exe did not do itself.
+    pub fn default_for_wizard() -> Self {
+        let dir = default_data_dir();
+        // SQLite wants forward slashes in its URL even on Windows.
+        let url_dir = dir.display().to_string().replace('\\', "/");
+        SetupArgs {
+            config_out: dir.join("coord.toml"),
+            db: Some(format!("sqlite:{url_dir}/coord.db?mode=rwc")),
+            blobs: Some(dir.join("blobs").display().to_string()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Where a coordinator's persistent state belongs on this platform.
+fn default_data_dir() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        std::path::PathBuf::from(root).join("Chaperone")
+    } else {
+        std::path::PathBuf::from("/var/lib/chaperone")
+    }
+}
+
 /// Build a config from defaults + any provided flags (the unattended baseline).
 fn config_from_args(args: &SetupArgs) -> Config {
     // Wizard baseline: trusted-header is the MVP identity mode (D-024) — the
@@ -72,6 +109,7 @@ fn config_from_args(args: &SetupArgs) -> Config {
     if let Some(v) = &args.addr {
         cfg.addr = v.clone();
     }
+    cfg.public_url = args.public_url.clone();
     if let Some(v) = &args.db {
         cfg.db_url = v.clone();
     }
@@ -97,6 +135,18 @@ fn config_from_args(args: &SetupArgs) -> Config {
 
 pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("── Chaperone coordination service — setup ──\n");
+
+    // Said up front, not discovered at the service-registration step. Reaching
+    // that step means the administrator has already answered every question and
+    // committed to a config, which is the worst moment to learn the shell was
+    // wrong.
+    if !args.no_service && !crate::host::is_elevated() {
+        println!("  ! Not running as administrator, so registering the Windows service will fail.");
+        println!("    Close this, right-click the executable and choose \"Run as administrator\".");
+        println!("    (Or continue anyway — the config is still written, and the wizard will");
+        println!("     print how to start the service by hand.)\n");
+    }
+
     let mut cfg = config_from_args(&args);
     let mut generate_tls = args.tls_generate;
     if !args.non_interactive {
@@ -136,8 +186,26 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     probe(&cfg).map_err(|e| format!("environment check failed: {e}"))?;
     println!("  ok");
 
+    if let Some(parent) = args.config_out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(&args.config_out, cfg.to_toml())?;
     println!("Wrote config → {}", args.config_out.display());
+
+    // The admin token is created **before** hardening, for the same reason the
+    // self-signed certificate is (see `generate_self_signed`): hardening restricts
+    // the data directory to administrators and the service account, and a wizard
+    // run without elevation then cannot write into the directory it just locked.
+    // Creating it afterwards produced a coordinator whose admin page could never be
+    // signed into — fail-closed, so not dangerous, but a dead install. This is the
+    // second time this ordering has bitten; the rule is now "everything the wizard
+    // has to create, it creates before it locks the door".
+    let token = match cfg.data_dir() {
+        Some(dir) => crate::admin_token::load_or_create(&dir)
+            .map(|t| (t, crate::admin_token::path_in(&dir)))
+            .map_err(|e| format!("could not create the admin token: {e}")),
+        None => Err("no data directory (an in-memory database?), so no admin token".to_string()),
+    };
 
     // Before the service starts, so SQLite's WAL and the first blobs are created
     // inside an already-restricted directory rather than being tightened after
@@ -160,7 +228,13 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    print_endpoint_snippet(&cfg);
+    print!(
+        "{}",
+        endpoint_snippet(
+            &cfg,
+            token.as_ref().map(|(t, p)| (t.as_str(), p.as_path()))
+        )
+    );
 
     // Last, so it is the final thing on screen rather than scrolled away by the
     // endpoint snippet. Coord's blob store holds file content, so an unrestricted
@@ -181,10 +255,39 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>> {
     use dialoguer::{Confirm, Input, Select};
 
+    // The four questions that decide whether this install works come first, and
+    // the two that used to be wrong — the advertised URL and the share — are
+    // asked outright instead of being inferred or hidden behind another prompt.
+
+    // 1. Where the socket binds. A delivered service has to be reachable, so the
+    //    wizard's baseline is the wildcard rather than `Config::default()`'s
+    //    loopback (which stays the `serve`/test baseline, as with `auth`).
+    if cfg.addr == Config::default().addr {
+        cfg.addr = "0.0.0.0:8787".to_string();
+    }
     cfg.addr = Input::new()
-        .with_prompt("Listen address (host:port reachable by the laptops)")
+        .with_prompt("Listen address (where the socket binds)")
         .default(cfg.addr.clone())
         .interact_text()?;
+
+    // 2. What the laptops type. Echoed back immediately: a wrong hostname is
+    //    obvious when you see the resulting URL and invisible in a config file.
+    let host: String = Input::new()
+        .with_prompt("Hostname the laptops will connect to")
+        .default(machine_hostname().unwrap_or_else(|| "localhost".to_string()))
+        .interact_text()?;
+    let port = cfg.addr.rsplit(':').next().unwrap_or("8787").to_string();
+    cfg.public_url = Some(format!("http://{}:{port}", host.trim()));
+    println!("  → coordinator URL: {}", cfg.public_url.as_deref().unwrap_or(""));
+    println!("    This is what goes on every laptop. It is deliberately not the listen");
+    println!("    address above — that binds a socket and is not something a client can use.");
+
+    // 3. The coordinated share. Asked unconditionally, because it is the value
+    //    the handover has to be able to state, and it is keyed by invariant 5 —
+    //    an administrator recalling it from memory is how two spellings of one
+    //    share enter a rollout.
+    cfg.share_unc = Some(prompt_for_share(&host)?);
+
     cfg.db_url = Input::new()
         .with_prompt("SQLite URL")
         .default(cfg.db_url.clone())
@@ -221,21 +324,23 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
         .interact()?;
     cfg.backend = backend_opts[bsel].parse().unwrap_or_default();
 
+    // 4. The watcher. `share_unc` is already known, so this no longer asks for the
+    //    same path twice under two names. The two fields are genuinely different —
+    //    `share_unc` is the canonical prefix coordination state is keyed by,
+    //    `watch_dir` is a local path an OS thread reads — and they are usually
+    //    equal, which is why one should default to the other rather than be
+    //    conflated with it.
     if Confirm::new()
         .with_prompt("Enable the proactive change-watcher? (recommended if users edit files outside Chaperone)")
         .default(false)
         .interact()?
     {
-        let wd: String = Input::new()
-            .with_prompt("Watch directory (the share path)")
-            .interact_text()?;
-        cfg.share_unc = Some(
+        cfg.watch_dir = Some(
             Input::new()
-                .with_prompt("Canonical share UNC prefix")
-                .default(wd.clone())
+                .with_prompt("Watch directory (a local path, or the share)")
+                .default(cfg.share_unc.clone().unwrap_or_default())
                 .interact_text()?,
         );
-        cfg.watch_dir = Some(wd);
         if !cfg!(windows) {
             println!("  ! note: the built-in watcher is Windows-only; on Linux use a push sidecar (roadmap Option 4).");
         }
@@ -260,19 +365,123 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
     } else {
         println!("  ! warning: serving plaintext HTTP — not for production.");
     }
+
+    // The URL was echoed as `http://` before the TLS question was asked, so it has
+    // to be reconciled now. Handing out an `http://` URL for a service that only
+    // speaks TLS is the same class of mistake as handing out the bind address:
+    // a value that looks right and connects to nothing.
+    if cfg.tls.is_some() || generate_tls {
+        if let Some(url) = cfg.public_url.take() {
+            cfg.public_url = Some(url.replacen("http://", "https://", 1));
+            println!("  → coordinator URL is now {}", cfg.public_url.as_deref().unwrap_or(""));
+        }
+    }
     Ok(generate_tls)
+}
+
+/// Ask which share this coordinator fronts, offering what the machine serves.
+///
+/// Free text is kept as an option rather than replaced: a coordinator does not
+/// have to live on the fileserver, and when it does not, `NetShareEnum` on the
+/// local machine has nothing useful to say.
+fn prompt_for_share(host: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use dialoguer::{Input, Select};
+
+    let found = crate::shares::local_shares();
+    if !found.is_empty() {
+        let mut labels: Vec<String> = found
+            .iter()
+            .map(|s| {
+                let unc = s.unc(host);
+                if s.remark.is_empty() {
+                    unc
+                } else {
+                    format!("{unc}  ({})", s.remark)
+                }
+            })
+            .collect();
+        labels.push("Type a different path…".to_string());
+
+        let sel = Select::new()
+            .with_prompt("Which share should Chaperone coordinate?")
+            .items(&labels)
+            .default(0)
+            .interact()?;
+        if sel < found.len() {
+            return Ok(found[sel].unc(host));
+        }
+    } else {
+        println!("  (no local shares found — this host may not be the fileserver)");
+    }
+
+    loop {
+        let raw: String = Input::new()
+            .with_prompt("Share to coordinate, as a UNC path (\\\\server\\share)")
+            .interact_text()?;
+        match validate_share_path(raw.trim()) {
+            Ok(path) => return Ok(path),
+            Err(why) => println!("  ! {why}"),
+        }
+    }
+}
+
+/// Check a hand-typed share path before it becomes the key everything hangs off.
+///
+/// Existence is checked but a missing path is **not** fatal here — the coordinator
+/// legitimately may not be able to see the share itself (it does no file I/O; the
+/// endpoints do, as the logged-in user). Shape is fatal, because a non-UNC value
+/// cannot be the canonical prefix invariant 5 needs.
+fn validate_share_path(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("a share path is needed".into());
+    }
+    // Single-quoted, not `{:?}` — debug-formatting a Windows path doubles every
+    // backslash, so a message about a missing backslash arrives with four of them.
+    if !raw.starts_with(r"\\") {
+        return Err(format!(
+            "'{raw}' is not a UNC path. Coordination state is keyed by the UNC form, so \
+             a drive letter here would not match what the endpoints report — use \\\\server\\share."
+        ));
+    }
+    if raw.trim_start_matches('\\').split('\\').filter(|p| !p.is_empty()).count() < 2 {
+        return Err(format!("'{raw}' names a server but no share"));
+    }
+    if !Path::new(raw).exists() {
+        println!(
+            "  note: {raw} is not reachable from this machine. That can be correct — \
+             coord does no file I/O; the endpoints do, as each logged-in user."
+        );
+    }
+    Ok(raw.to_string())
 }
 
 /// Validate the host can actually run this config, before we commit to it.
 fn probe(cfg: &Config) -> Result<(), String> {
+    // The structural rules first, so the wizard refuses the same configurations
+    // the settings API refuses. They used to be enforced only on the API path,
+    // which meant the installer could write a config the admin page would not.
+    cfg.validate().map_err(|e| e.to_string())?;
     let addr: SocketAddr = cfg.addr.parse().map_err(|e| format!("invalid listen address {:?}: {e}", cfg.addr))?;
     // Bind-and-drop to confirm the port is free.
     std::net::TcpListener::bind(addr).map_err(|e| format!("cannot bind {}: {e}", cfg.addr))?;
     ensure_writable_dir(&cfg.blob_root)?;
+    // The database directory too, and for the same reason: it is created here so
+    // SQLite's first write lands somewhere already checked, rather than failing
+    // after the service has been registered and reported healthy.
+    if let Some(dir) = cfg.data_dir() {
+        ensure_writable_dir(&dir.display().to_string())?;
+    }
     if let Some(wd) = &cfg.watch_dir {
         if !Path::new(wd).exists() {
             return Err(format!("watch directory does not exist: {wd}"));
         }
+    }
+    // Shape-check the share here too, not only in the interactive prompt. The
+    // unattended path takes `--share-unc` straight from a flag, and a mangled value
+    // (a lost backslash from whichever shell invoked us) would otherwise be written
+    // to the config and become the canonical prefix everything is keyed by.
+    if let Some(share) = &cfg.share_unc {
+        validate_share_path(share)?;
     }
     if let Some(tls) = &cfg.tls {
         if !Path::new(&tls.cert_path).exists() {
@@ -302,17 +511,6 @@ fn ensure_writable_dir(dir: &str) -> Result<(), String> {
 /// The expiry is printed at generation so it is a known date rather than a
 /// surprise TLS failure years later.
 const CERT_VALID_DAYS: i64 = 5 * 365;
-
-/// This machine's name — what the laptops will actually be connecting to.
-fn machine_hostname() -> Option<String> {
-    let key = if cfg!(windows) { "COMPUTERNAME" } else { "HOSTNAME" };
-    std::env::var(key).ok().filter(|h| !h.is_empty()).or_else(|| {
-        std::fs::read_to_string("/etc/hostname")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|h| !h.is_empty())
-    })
-}
 
 /// Write a self-signed cert/key pair into `dir` and return the paths.
 ///
@@ -629,73 +827,111 @@ fn print_manual_start(config_path: &Path) {
 /// administrator with no idea that an admin page exists, what to give the users,
 /// or where to look when a laptop misbehaves. Each line below is something that
 /// was previously only discoverable by reading source or docs.
-fn print_endpoint_snippet(cfg: &Config) {
-    let scheme = if cfg.tls.is_some() { "https" } else { "http" };
-    let base = format!("{scheme}://{}", cfg.addr);
+/// The handover text, built rather than printed so it can be asserted on.
+///
+/// The token is passed in rather than loaded here: it has to be created before the
+/// data directory is locked down, which is a decision about *ordering* in
+/// [`run`] and not something this formatter should be able to get wrong.
+///
+/// It is a returned `String` for one reason: the defect that made this whole
+/// change necessary was a *wrong line in this text*, shipped and unnoticed
+/// because nothing could read it back. `handover_never_advertises_a_bind_address`
+/// is the test that could not exist while this function only called `println!`.
+fn endpoint_snippet(cfg: &Config, token: Result<(&str, &Path), &String>) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    // Never `cfg.addr` — that is a bind address, and formatting it as a URL is
+    // exactly the defect this handover once shipped.
+    let base = cfg.advertised_url();
 
-    println!("\n── Where to watch this ──");
-    println!("  Admin page:   {base}/admin");
-    println!("    Overview, failures with what fixes them, conflicts, leases, audit trail,");
-    println!("    and the settings — including how to change the connection auth mode safely.");
-    println!("  Health check: {base}/healthz");
+    let _ = write!(
+        s,
+        "\n── Where to watch this ──\n  \
+         Admin page:   {base}/admin\n    \
+         Overview, failures with what fixes them, conflicts, leases, audit trail,\n    \
+         and the settings — including how to change the connection auth mode safely.\n  \
+         Health check: {base}/healthz\n"
+    );
 
-    // The token, not just its path: the whole point of the handover is that the
-    // person running setup can hand over everything needed without going hunting.
-    match cfg.data_dir() {
-        Some(dir) => match crate::admin_token::load_or_create(&dir) {
-            Ok(token) => {
-                println!("\n── Sign in to the admin page with this ──");
-                println!("  {token}");
-                println!(
-                    "  Kept in {} — a directory restricted to administrators, so the file",
-                    crate::admin_token::path_in(&dir).display()
-                );
-                println!("  itself is the safe place for it. Read it again any time.");
-                println!("  It does not depend on the auth mode, which is deliberate: it is the");
-                println!("  way back in if a change to the auth setting turns out to be wrong.");
-            }
-            Err(e) => {
-                eprintln!("\n  ! could not create the admin token: {e}");
-                eprintln!("    The admin page will refuse to show anything until this is fixed.");
-            }
-        },
-        None => {
-            eprintln!("\n  ! no data directory (an in-memory database?), so no admin token —");
-            eprintln!("    the admin page will refuse to show anything.");
+    match token {
+        Ok((token, path)) => {
+            let _ = write!(
+                s,
+                "\n── Sign in to the admin page with this ──\n  \
+                 {token}\n  \
+                 Kept in {} — a directory restricted to administrators, so the file\n  \
+                 itself is the safe place for it. Read it again any time.\n  \
+                 It does not depend on the auth mode, which is deliberate: it is the\n  \
+                 way back in if a change to the auth setting turns out to be wrong.\n",
+                path.display()
+            );
+        }
+        Err(e) => {
+            let _ = write!(
+                s,
+                "\n  ! {e}\n    \
+                 The admin page will refuse to show anything until this is fixed.\n"
+            );
         }
     }
 
-    println!("\n── Give this to the users ──");
-    println!("  Coordinator URL:      {base}");
-    println!("  Coordinated location: the share path, as UNC (e.g. \\\\FILESRV\\AICollab)");
-    println!("    Both are fields in the endpoint bundle's own install dialog. A mapped");
-    println!("    drive letter is fine — it is resolved to its UNC form, so users with");
-    println!("    different letters still agree on which file is which.");
-    println!(
-        "  Identity is auto-derived from each user's OS logon (auth mode: {}). Nothing to type.",
-        cfg.auth
-    );
-    println!(
-        "  Backend is auto-selected per endpoint OS and confirmed against coord's announcement ({}).",
-        cfg.backend
-    );
-
-    println!("\n── When something breaks ──");
-    println!("  Whole fleet:  the admin page's Errors tab.");
-    println!("  One laptop:   %LOCALAPPDATA%\\Chaperone\\diagnostics.jsonl on that machine.");
-    println!("    That second one matters: a laptop that cannot reach the coordinator");
-    println!("    cannot report it to the coordinator.");
-    println!("  Only unexpected faults appear there. A write that lost a compare-and-swap,");
-    println!("  or a document someone has open in Word, is a designed outcome — look under");
-    println!("  Conflicts and Leases for those.");
-
-    println!("\n── Back up together ──");
-    println!("  Database:   {}", cfg.db_url);
-    println!("  Blob store: {}", cfg.blob_root);
-    println!("    History is only restorable if both are restored from the same moment.");
-    if cfg.tls.is_none() {
-        println!("\n  ! Serving plain HTTP. Restrict the port to the machines that need it.");
+    let _ = write!(s, "\n── Give this to the users ──\n  Coordinator URL:      {base}\n");
+    match cfg.share_unc.as_deref() {
+        // The actual configured value, not an example of one. A handover that
+        // prints `\\FILESRV\AICollab` leaves the administrator to work out what
+        // their own share is called, which is the moment a guess enters the
+        // rollout and two users end up naming the same file differently.
+        Some(share) => {
+            let _ = writeln!(s, "  Coordinated location: {share}");
+        }
+        None => {
+            let _ = write!(
+                s,
+                "  Coordinated location: (not configured here — the share path, as UNC)\n    \
+                 Setup did not record one, so this is the one value you have to\n    \
+                 supply from memory. Re-run setup to store it.\n"
+            );
+        }
     }
+    let _ = write!(
+        s,
+        "    Both are fields in the endpoint bundle's own install dialog. A mapped\n    \
+         drive letter is fine — it is resolved to its UNC form, so users with\n    \
+         different letters still agree on which file is which.\n  \
+         Listening on {} — that is where the socket binds, not what the\n    \
+         laptops type. The URL above is the one to hand out.\n  \
+         Identity is auto-derived from each user's OS logon (auth mode: {}). Nothing to type.\n  \
+         Backend is auto-selected per endpoint OS and confirmed against coord's announcement ({}).\n",
+        cfg.addr, cfg.auth, cfg.backend
+    );
+
+    let _ = write!(
+        s,
+        "\n── When something breaks ──\n  \
+         Whole fleet:  the admin page's Errors tab.\n  \
+         One laptop:   %LOCALAPPDATA%\\Chaperone\\diagnostics.jsonl on that machine.\n    \
+         That second one matters: a laptop that cannot reach the coordinator\n    \
+         cannot report it to the coordinator.\n  \
+         Only unexpected faults appear there. A write that lost a compare-and-swap,\n  \
+         or a document someone has open in Word, is a designed outcome — look under\n  \
+         Conflicts and Leases for those.\n"
+    );
+
+    let _ = write!(
+        s,
+        "\n── Back up together ──\n  \
+         Database:   {}\n  \
+         Blob store: {}\n    \
+         History is only restorable if both are restored from the same moment.\n",
+        cfg.db_url, cfg.blob_root
+    );
+    if cfg.tls.is_none() {
+        let _ = write!(
+            s,
+            "\n  ! Serving plain HTTP. Restrict the port to the machines that need it.\n"
+        );
+    }
+    s
 }
 
 #[cfg(test)]
@@ -716,6 +952,116 @@ mod tests {
         assert_eq!(cfg.auth, "trusted-header");
         assert_eq!(cfg.tls.as_ref().unwrap().cert_path, "c.pem");
         assert_eq!(cfg.db_url, "sqlite:chapr-coord.db"); // default kept
+    }
+
+    /// The regression the customer hit: the handover told an administrator to
+    /// configure `http://127.0.0.1:8787` on every laptop, because the text was
+    /// built from the bind address. Asserting on the *absence* of the bind address
+    /// rather than the presence of the right URL is deliberate — it fails for any
+    /// future line that reaches for `cfg.addr` to build a URL, not just this one.
+    #[test]
+    fn handover_never_advertises_a_bind_address() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("http://FILESRV01:8787".into()),
+            share_unc: Some(r"\\FILESRV01\mappe$".into()),
+            ..Config::default()
+        };
+        let path = std::path::Path::new("C:/ProgramData/Chaperone/admin-token");
+        let text = endpoint_snippet(&cfg, Ok(("tok-abc", path)));
+
+        let handout = text
+            .split("── Give this to the users ──")
+            .nth(1)
+            .expect("the handout section exists");
+        let url_line = handout
+            .lines()
+            .find(|l| l.contains("Coordinator URL:"))
+            .expect("the URL line exists");
+        assert!(
+            url_line.contains("http://FILESRV01:8787"),
+            "wrong URL handed out: {url_line}"
+        );
+        for unreachable in ["0.0.0.0:8787", "127.0.0.1"] {
+            assert!(
+                !url_line.contains(unreachable),
+                "handed out {unreachable} as the URL: {url_line}"
+            );
+        }
+        // The bind address still appears, but only labelled as what it is.
+        assert!(text.contains("Listening on 0.0.0.0:8787"));
+        // And the real share, not the generic example it used to print.
+        assert!(text.contains(r"\\FILESRV01\mappe$"), "{text}");
+        assert!(!text.contains("FILESRV\\AICollab"), "still printing the example share");
+    }
+
+    #[test]
+    fn handover_says_so_when_no_share_was_recorded() {
+        let cfg = Config::default();
+        let text = endpoint_snippet(&cfg, Err(&"no data directory".to_string()));
+        assert!(text.contains("not configured here"), "{text}");
+        assert!(text.contains("refuse to show anything"), "{text}");
+    }
+
+    /// The exact value a shell mangled during testing: `\\srv\share` arriving as
+    /// `\srv\share`. It has to fail, because it would otherwise become the
+    /// canonical prefix (invariant 5) and silently disagree with what every
+    /// endpoint reports for the same files.
+    #[test]
+    fn a_mangled_share_path_is_refused_rather_than_stored() {
+        let err = validate_share_path(r"\FILESRV01\mappe$").expect_err("one backslash is not UNC");
+        assert!(err.contains("not a UNC path"), "{err}");
+
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            share_unc: Some(r"\FILESRV01\mappe$".into()),
+            blob_root: std::env::temp_dir()
+                .join("chapr-probe-share")
+                .display()
+                .to_string(),
+            ..Config::default()
+        };
+        assert!(probe(&cfg).is_err(), "the unattended path must check this too");
+    }
+
+    #[test]
+    fn validate_share_path_accepts_a_hidden_share_and_rejects_a_drive_letter() {
+        // A trailing `$` is a hidden share, not an invalid one — the customer's
+        // real share is spelled this way.
+        assert_eq!(
+            validate_share_path(r"\\FILESRV01\mappe$").unwrap(),
+            r"\\FILESRV01\mappe$"
+        );
+        assert!(validate_share_path(r"D:\Shared").is_err(), "a drive letter is not canonical");
+        assert!(validate_share_path(r"\\FILESRV01").is_err(), "a server with no share");
+        assert!(validate_share_path("").is_err());
+    }
+
+    #[test]
+    fn public_url_flag_applies() {
+        let args = SetupArgs {
+            public_url: Some("http://FILESRV01:8787".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_from_args(&args).public_url.as_deref(),
+            Some("http://FILESRV01:8787")
+        );
+        // Absent → derived, never the bind address verbatim.
+        assert!(config_from_args(&SetupArgs::default()).public_url.is_none());
+    }
+
+    /// `probe` now runs the structural rules too, so the wizard cannot write a
+    /// config the admin page's settings API would reject.
+    #[test]
+    fn probe_refuses_what_validate_refuses() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("http://localhost:8787".into()),
+            ..Config::default()
+        };
+        let err = probe(&cfg).expect_err("a loopback URL on a reachable listener must not pass");
+        assert!(err.contains("laptops resolve"), "unhelpful message: {err}");
     }
 
     #[test]

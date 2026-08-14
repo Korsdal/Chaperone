@@ -88,6 +88,14 @@ pub struct AdminOverview {
     pub leases_stale: usize,
     // ---- deployment ----
     pub config_path: Option<String>,
+    /// What laptops connect to, and — beside it — where the socket binds.
+    ///
+    /// Shown as two rows on purpose. They were one value once, which is how an
+    /// administrator came to be told to configure `http://127.0.0.1:8787` on every
+    /// machine (D-032). Displaying both makes the distinction visible at the moment
+    /// someone is copying one of them.
+    pub advertised_url: String,
+    pub bind_addr: String,
     pub auth_mode: String,
     pub backend: String,
     pub blob_root: String,
@@ -640,6 +648,8 @@ async fn admin_overview(
         leases_expiring: count(lease::LeaseHealth::Expiring),
         leases_stale: count(lease::LeaseHealth::Stale),
         config_path: cfg.source.as_ref().map(|p| p.display().to_string()),
+        advertised_url: cfg.advertised_url(),
+        bind_addr: cfg.addr.clone(),
         auth_mode: cfg.auth.clone(),
         backend: st.backend_default.to_string(),
         blob_root: st.blob_root.display().to_string(),

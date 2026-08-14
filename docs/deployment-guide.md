@@ -29,13 +29,24 @@ touches coord.
 - To build: the Rust toolchain (`cargo`) and, to pack MCPBs, Node + `@anthropic-ai/mcpb`.
 
 ## Step 1 — Coordinator
-1. Build: `cargo build --release -p chapr-coord`.
-2. Configure + install as a service — see [`../packaging/coord/service-install.md`](../packaging/coord/service-install.md)
-   (`chapr-coord setup`). Start from [`../packaging/coord/config.template.toml`](../packaging/coord/config.template.toml).
-3. Choose the **backend** coord announces (`smb`/`posix`) and the **auth** mode
+1. Build: `cargo build --release -p chapr-coord`. The result is one self-contained
+   `.exe` — no Visual C++ redistributable, no Rust on the target host, no script.
+2. Copy it to the coordinator host and run it **elevated** with no arguments. That
+   *is* the installer: a bare invocation runs the setup wizard. See
+   [`../packaging/coord/service-install.md`](../packaging/coord/service-install.md);
+   [`../packaging/coord/config.template.toml`](../packaging/coord/config.template.toml)
+   documents every field if you would rather write the config by hand.
+3. Answer four questions: **listen address**, **hostname the laptops connect to**,
+   **share to coordinate**, and whether to run the change-watcher. The first two are
+   separate on purpose — a bind address is not a URL (D-032).
+4. Choose the **backend** coord announces (`smb`/`posix`) and the **auth** mode
    (`trusted-header` for the MVP — zero end-user setup; `negotiate`/`oidc` to
    harden later, E-015).
-4. Verify: `GET /healthz` → `ok`.
+5. Read the handover it prints. It is the whole set of things to pass on: the admin
+   token, the coordinator URL, the coordinated share, where both logs live, and what
+   to back up.
+6. Verify: `GET /healthz` → `ok`, **from a laptop** rather than from the coordinator
+   itself. Loopback working proves nothing about what a user will experience.
 
 ## Step 2 — Endpoints (MCPB)
 1. Build one bundle **per client OS** — see [`../packaging/mcpb/README.md`](../packaging/mcpb/README.md).
