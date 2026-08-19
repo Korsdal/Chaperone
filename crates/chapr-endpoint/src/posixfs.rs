@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! POSIX filesystem primitives for the shared §7 core (E-019).
 //!
 //! The POSIX counterpart to `winfs`: an exclusive-open via **advisory** `flock`

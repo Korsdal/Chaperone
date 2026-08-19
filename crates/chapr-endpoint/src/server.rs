@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The MCP server surface (rmcp) — exposes `chapr_read` over the tool protocol.
 //!
 //! Thin adapter: it wires the read state machine ([`crate::read`]) to rmcp and
@@ -696,7 +700,7 @@ pub fn instructions(roots: &[chapr_proto::CanonicalPath]) -> String {
 ///
 /// The distinction is not cosmetic, and it is the point of E-027. An internal
 /// error reads as a broken tool, and the two things an agent does with a broken
-/// tool are abandon the task or hammer it — the retry storm CLAUDE.md's failure
+/// tool are abandon the task or hammer it — the retry storm the README's failure
 /// directions call out. A tool result that says *what happened and what to do
 /// next* gets followed instead.
 ///

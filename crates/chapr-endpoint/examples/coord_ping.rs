@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! A tiny end-to-end exercise of [`chapr_endpoint::CoordClient`] against a
 //! running coord. Doubles as a dev smoke test that the shared proto types
 //! round-trip across the real HTTP boundary.

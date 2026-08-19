@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The change-watcher (concept §12, §14) — platform-agnostic core.
 //!
 //! Coord runs a single read-only, metadata-only watch on the share. Its job is

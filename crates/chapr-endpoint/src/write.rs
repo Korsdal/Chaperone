@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The contended write path (concept §7) — the crown jewel.
 //!
 //! Deliberately boring and linear (implementation notes §6): everything from

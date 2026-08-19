@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Ambient OS identity for the MVP control channel (E-023, decision D-024).
 //!
 //! The endpoint runs *as the logged-in user*, so their identity is already

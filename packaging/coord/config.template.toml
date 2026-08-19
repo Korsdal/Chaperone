@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SerenIT ApS
+# Copyright 2026 Prompted EV
+
 # Chaperone coordinator — configuration TEMPLATE.
 # Precedence: built-in defaults < this file < environment (CHAPR_COORD_*).
 # Generate interactively with `chapr-coord setup`, or copy + edit this file and

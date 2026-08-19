@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The axum HTTP surface for the lease endpoints (E-002 slice of concept §6.4).
 //!
 //! In production this channel is authenticated with Negotiate/Kerberos (concept

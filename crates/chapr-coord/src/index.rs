@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The version index — coord's BLAKE3 hash cache (concept §4.2) and the
 //! `coord.resolve` read used by the endpoint's read state machine (§8.1).
 //!

@@ -17,6 +17,11 @@ chapr-blobs/
 build/
 *.mcpb
 
+# Release staging. The release workflow assembles named artifacts here before
+# uploading them to a GitHub Release; the artifacts themselves never live in git.
+# (A customer DEPLOYABLE repo does commit its binaries — this one does not.)
+dist/
+
 # Scratch working dir.
 scratchpad/
 
@@ -33,12 +38,27 @@ desktop.ini
 # The code is the product; these are private working docs / agent tooling.
 # (gitignore does not delete them — they remain on disk for local use.)
 #
-# `LOGBOOK.md` and `CLAUDE.md` used to be here. They are committed as of
-# 2026-08-14: the logbook is ~110 KB of irreplaceable project memory — decisions,
-# their reasoning, and every issue's history — and keeping it out of git left it on
-# one laptop with no backup. The repo is private, so there was never a disclosure
-# argument against it, only "the code is the product". The reasoning behind the
-# code turns out to be part of the product.
+# `LOGBOOK.md` and `CLAUDE.md` were committed on 2026-08-14 on the explicit
+# grounds that "the repo is private, so there was never a disclosure argument."
+# That premise expired when the project went Apache-2.0 and public (D-033), so
+# the decision is reversed here and they are untracked again.
+#
+# What they are: ~200 KB of candid internal reasoning — every decision and its
+# rationale, issue histories, the customer deployable by name, a collaborator's
+# plugin internals, share paths. None of it is secret; all of it is written for
+# an internal audience and not for the world. What a public reader actually
+# needs from them belongs in README.md, restated deliberately.
+#
+# NOTE: they were also purged from git history (filter-branch, 2026-08-20), not
+# merely untracked, because a public clone would otherwise still yield them via
+# `git show`. Do not re-add them: the purge cost a force-push and cannot be
+# repeated cheaply.
+#
+# NOTE: the 2026-08-14 backup argument was real and is now live again — the
+# logbook is irreplaceable project memory sitting on one laptop. It needs a home
+# in a private repo.
 .claude/
 docs/init spec/
 docs/status.html
+CLAUDE.md
+LOGBOOK.md

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The audit log (concept §4.2, §5.2, §13.1) — an append-only, principal-stamped
 //! record of every coordination-significant action.
 //!

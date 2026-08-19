@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Content-addressed history: the blob store and the per-file version log
 //! (concept §12, §5.2, §6.5).
 //!

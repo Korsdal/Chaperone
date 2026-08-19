@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SerenIT ApS
+# Copyright 2026 Prompted EV
+
 # Chaperone — Cargo workspace root.
 #
 # Filesystem coordination for concurrent Claude Desktop agent sessions against a
-# single on-prem SMB fileserver. See CLAUDE.md and `init spec/` for the settled
-# architecture.
+# single on-prem SMB fileserver. See README.md for the settled architecture.
 #
 # Build order (implementation notes §3–4): chapr-proto -> chapr-coord -> chapr-endpoint.
 # Only chapr-proto exists today (backlog E-001). chapr-coord (E-002) and
@@ -19,13 +22,18 @@ members = [
 # Shared package metadata. Every crate inherits these with `x.workspace = true`
 # so version/edition/license are defined once and cannot drift between binaries.
 [workspace.package]
-version = "0.1.0"          # baseline set by jok 2026-07-21; human owns version bumps (CLAUDE.md)
+version = "0.1.0"          # baseline set by jok 2026-07-21; human owns version bumps (see README)
 edition = "2021"
 # 1.85, not 1.75: clap 4.6 and clap_builder declare rust-version 1.85 and
 # axum-server 0.7 declares 1.82, so a box provisioned for 1.75 cannot build this
 # tree. Verified against the locked versions in the registry cache.
 rust-version = "1.85"
-license = "UNLICENSED"
+# Apache-2.0 as of 2026-08-19 (D-033). Full text in LICENSE at the repo root;
+# per-company attribution is in NOTICE, which section 4(d) of the licence requires
+# a redistributor to carry along.
+license = "Apache-2.0"
+# Still not on crates.io: these are two deployables, not libraries. Open source
+# and published-to-a-registry are separate decisions.
 publish = false
 
 # Single source of truth for dependency versions across all three crates.

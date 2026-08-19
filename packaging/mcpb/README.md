@@ -26,27 +26,41 @@ same template produces macOS/Linux (POSIX) bundles.
 
 ## Build
 
-1. Copy `manifest.template.json` → `manifest.json` and fill the `{{PLACEHOLDERS}}`.
-2. Run the builder:
+The builder takes either an already-instantiated `manifest.json` (`-Manifest`) or the template
+plus the values to fill it with (`-Template`). CI uses the second form; a customer deployable that
+keeps a hand-tuned manifest with pre-filled defaults uses the first.
 
-   ```powershell
-   ./build-mcpb.ps1 -Manifest ./manifest.json -Pack
-   ```
+```powershell
+# From the template — what the release workflow runs:
+./build-mcpb.ps1 -Template ./manifest.template.json -Version 0.1.0 -Pack `
+                 -Output ./chaperone-endpoint.mcpb
 
-   It compiles the release binary, assembles `build/` (`manifest.json` +
-   `server/chapr-endpoint.exe`), then `validate`s + `pack`s it (omit `-Pack` to
-   stop after assembly and run `mcpb pack` yourself).
-3. Distribute the resulting `.mcpb`. Users double-click it in Claude Desktop and
-   enter the coordinator URL and coordinated location when prompted.
+# From an instantiated manifest — what a customer deployable does:
+./build-mcpb.ps1 -Manifest ./manifest.json -Pack
+```
 
-`-Output <path>` writes the packed bundle straight to a customer deployable's
-committed location, which is how a customer deployable's committed bundle is produced.
+It compiles the release binary, assembles `build/` (`manifest.json` + `server/chapr-endpoint[.exe]`
++ `LICENSE` + `NOTICE`), then `validate`s and `pack`s it. Omit `-Pack` to stop after assembly.
+`-Output <path>` writes the packed bundle straight to a chosen location.
 
-**Upgrading an installed bundle.** Claude Desktop identifies a bundle by `name` and
-`version`. While the version is held at `0.1.0` (a human decision, per the project's
-versioning rule) a rebuild is indistinguishable from the old one, so users must
-remove the existing extension before installing a new build. Say so in the customer
-guide rather than letting them discover a stale binary.
+**It does not cross-compile.** `-Platform` (`win32` | `linux` | `darwin`) defaults to the host and
+must match it: the script packages the binary cargo just built for *this* machine, and a bundle
+labelled `linux` while carrying a `.exe` installs cleanly and then fails to start. The release
+workflow therefore builds each OS's bundle on that OS's runner. On PowerShell 7 (Linux/macOS) the
+staged binary is `chmod +x`'d, because `Copy-Item` does not carry the mode across.
+
+Placeholders are filled from the parameters, and a leftover `{{PLACEHOLDER}}` is a hard error —
+`mcpb validate` is perfectly happy to accept the literal string `{{VERSION}}` as a version.
+
+Released bundles are built by `.github/workflows/release.yml` on a `v*` tag and attached to a draft
+GitHub Release. Building one by hand is for local testing and for customer deployables.
+
+**Upgrading an installed bundle.** Claude Desktop identifies a bundle by `name` and `version`, so
+two builds carrying the same version are indistinguishable to it and a user can end up running a
+stale binary. Released bundles are safe here — the release workflow refuses a tag that does not
+match the workspace version, so every published `.mcpb` has a distinct one. **Hand-built bundles
+between releases are not**: tell users to remove the existing extension before installing one,
+rather than letting them discover the stale binary.
 
 ## Signing & provenance
 Claude Desktop reports **signature** (code-signed & trusted?) and **provenance**

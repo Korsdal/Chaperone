@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! In-process serialisation per canonical path (E-027, D-030).
 //!
 //! ## Why this exists
@@ -11,7 +15,7 @@
 //!
 //! That is not a data-integrity problem: nothing was written twice, and
 //! invariant 3 never depended on the lease. It is an *agent-behaviour* problem,
-//! and the sharp end of it is what CLAUDE.md's failure directions warn about —
+//! and the sharp end of it is what the README's failure directions warn about —
 //! an error is exactly what makes an LLM either abandon the task or retry
 //! forever.
 //!

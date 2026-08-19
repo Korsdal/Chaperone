@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! chapr-coord — the coordination service.
 //!
 //! One instance on-prem beside the fileserver; owns all coordination metadata

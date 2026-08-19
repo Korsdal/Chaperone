@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The lease reaper — the proactive half of expiry (concept §9).
 //!
 //! `lease_acquire` already sweeps expired leases lazily, so the reaper is not

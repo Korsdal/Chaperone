@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Windows `ReadDirectoryChangesW` source for the change-watcher (concept §14).
 //!
 //! Runs a blocking watch loop on a dedicated OS thread (the API blocks until

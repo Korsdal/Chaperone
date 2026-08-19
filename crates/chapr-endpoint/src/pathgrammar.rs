@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Per-backend path grammar (E-019, decision D-E).
 //!
 //! Invariant 5 keys all coordination state by canonical path, but the *shape* of

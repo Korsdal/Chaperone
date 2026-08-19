@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The live per-session mount table — mapped drive letter → UNC (E-022).
 //!
 //! Invariant 5 keys every piece of coordination state by canonical path, so two

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The lease table: all-or-none acquire, release, and lazy expiry.
 //!
 //! Leases are an **optimisation**, not the correctness core (invariant 3) — the

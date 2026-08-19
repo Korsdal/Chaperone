@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Shared application state.
 //!
 //! Coarse locking, exactly as the implementation notes prescribe for this stage

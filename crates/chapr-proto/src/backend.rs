@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Backend identity carried on the control channel (§14).
 //!
 //! Coord *announces* which kind of fileserver backend owns a resource; the

@@ -1,5 +1,8 @@
 # Chaperone
 
+[![CI](https://github.com/Korsdal/Chaperone/actions/workflows/ci.yml/badge.svg)](https://github.com/Korsdal/Chaperone/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Filesystem coordination for concurrent Claude Desktop agent sessions working against a single
 on-prem fileserver.
 
@@ -129,6 +132,28 @@ The long-term direction is that coord *announces* what the environment is and en
 against their own local capabilities, selecting a matching backend. Local knowledge is
 authoritative.
 
+## Install
+
+Every release attaches built binaries, so trying Chaperone does not require a Rust toolchain on a
+fileserver:
+
+**[Releases →](https://github.com/Korsdal/Chaperone/releases)**
+
+| Artifact | What it is |
+| --- | --- |
+| `chapr-coord-<ver>-windows-x86_64.exe` / `-linux-x86_64` | The coordinator. Run it with **no arguments** — the executable *is* the installer, and a bare invocation runs the setup wizard. |
+| `chaperone-endpoint-<ver>-windows-x86_64.mcpb` | The endpoint, as a one-click Claude Desktop bundle (Settings → Extensions). |
+| `chaperone-endpoint-<ver>-linux-x86_64.mcpb` + raw binary | Same for Linux. The raw binary is published too, because Claude Desktop's Linux story is thin and a bare binary wires into any MCP client. |
+| `SHA256SUMS` | `sha256sum -c SHA256SUMS`, or `Get-FileHash` on Windows. |
+
+Releases are built by GitHub Actions from a tag, not from someone's laptop, and are
+provenance-attested. The `.mcpb` bundles are **unsigned** — signing is broken upstream in the mcpb
+CLI, so Claude Desktop reports every bundle as unsigned regardless; accountability rests on the
+audit trail.
+
+Building it yourself is three words of `cargo` (below) — the binaries exist because asking a DBA to
+install a Rust toolchain on a production fileserver to evaluate a tool is a rude way to say hello.
+
 ## Build
 
 Requires Rust 1.85+ (`clap` and `clap_builder` declare 1.85, `axum-server` 1.82 — the tree does
@@ -165,6 +190,62 @@ administrator once came to be told to configure `http://127.0.0.1:8787` fleet-wi
 See `packaging/coord/` for the config template and service install steps, and `packaging/mcpb/` for
 building the endpoint bundle. Note that `build-mcpb.ps1` writes to `./build` by default, which is
 git-ignored.
+
+### Releasing
+
+CI (`.github/workflows/ci.yml`) runs those three commands on Windows and Linux for every push and
+PR, plus a build against the declared MSRV so the 1.85 claim above cannot drift again.
+
+A release is a tag:
+
+```sh
+# 1. bump [workspace.package] version in Cargo.toml — a human decision, see Contributing
+# 2. commit it
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` then tests, builds, and packs on both OSes, generates `SHA256SUMS`,
+attests provenance, and opens a **draft** release for a human to publish. It refuses to run if the
+tag does not match the workspace version — the version bump is the decision, and the tag only
+records it. `workflow_dispatch` runs the same pipeline without creating a release, for proving a
+change to the packaging before spending a tag.
+
+## Contributing
+
+Issues and PRs are welcome. Contributions are inbound=outbound — anything you send in is licensed
+under the same Apache-2.0 terms (section 5 of the licence). There is no CLA.
+
+Before changing anything, three things about this codebase are worth knowing, because they are not
+guessable from the code:
+
+**The invariants above are assertions, not preferences.** They are listed under "Load-bearing
+invariants" for a reason: getting one backwards loses somebody's file. In particular, leases are an
+*optimization* — exclusive-open plus CAS is the correctness core. Code is correct with lock+CAS and
+no leases, and *not* correct with leases and no CAS. If a change appears to let you skip the CAS
+re-hash, the change is wrong.
+
+**The write path is deliberately boring.** Everything from version-check to write-close happens
+under one held exclusive handle, in straight-line blocking I/O inside `spawn_blocking`. It reads as
+unfashionably synchronous and repetitive, and that is the design: correctness *ordering* matters
+more than I/O concurrency on a single file. Be clever elsewhere. A PR that makes the write path
+more elegant is the one most likely to be declined.
+
+**Versioning is a human decision.** Nothing automated bumps `[workspace.package] version` — not a
+tool, not CI, not an agent. The release workflow refuses a tag that does not match the version in
+the tree, precisely so that the bump has to be a deliberate act by a person. Propose a version in
+a PR; don't set one.
+
+### A note on `D-nnn` / `E-nnn` / `I-nnn`
+
+Comments throughout the source cite identifiers like `D-032`, `E-016`, or `I-005`. These index an
+internal engineering logbook — decisions, work items, and issues — which is **not published**: it
+is written for an internal audience and names customers, collaborators' internal tooling, and
+specific share layouts.
+
+You are not missing context you need. Each reference is provenance, not a pointer you have to
+follow: the comment carrying it states the reasoning in full, which is the convention those
+comments are written to. If you hit one that does not stand on its own, that is a documentation
+bug worth reporting — the comment should be self-contained.
 
 ## Status
 
@@ -224,11 +305,27 @@ Two things to know explicitly:
 
 ## License
 
-Proprietary — `UNLICENSED`, not published to crates.io.
+[Apache License 2.0](LICENSE). Copyright 2026 SerenIT ApS and Prompted EV — Chaperone is jointly
+owned by the two companies, and was open-sourced by agreement of both. See [NOTICE](NOTICE).
+
+The reasoning for going open, in the owners' words: *don't give larger companies a reason to go
+build the same tool*, and *if it works, everyone should be able to grab it*.
+
+Apache-2.0 rather than MIT because this ships as binaries into other companies' networks, where it
+holds exclusive handles on their files: it carries an explicit patent grant, and its NOTICE
+requirement keeps two-company attribution attached to a redistributed build rather than leaving it
+in a repo the recipient never sees. `.mcpb` bundles are therefore built with LICENSE and NOTICE
+inside them.
+
+Still `publish = false` — Chaperone is two deployables, not a library dependency. Open source and
+published-to-crates.io are separate decisions.
+
+Contributions are inbound=outbound, with no CLA — see [Contributing](#contributing).
 
 ---
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
 Chaperone is built with AI assistance under human review. Architecture decisions are human-owned and
-recorded in the project logbook; every commit is human-reviewed before it lands.
+recorded in an engineering logbook kept outside this repo; every commit is human-reviewed before it
+lands.

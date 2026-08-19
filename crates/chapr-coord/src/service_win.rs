@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Native Windows Service (SCM) integration (E-016).
 //!
 //! `chapr-coord run-service` (the binPath the installed service uses) hands the

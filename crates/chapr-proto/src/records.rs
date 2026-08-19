@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The persisted / cached record shapes (concept §5.2).
 //!
 //! These are the rows coord owns: the lease table, intent journal, per-file

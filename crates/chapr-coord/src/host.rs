@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Facts about the machine the installer is running on.
 //!
 //! Two questions the wizard has to answer, both previously answered by the

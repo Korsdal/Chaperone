@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The `Backend` seam: the abstraction that lets one per-OS MCP bundle drive
 //! several fileserver backends, chosen at runtime.
 //!

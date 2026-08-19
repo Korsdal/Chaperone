@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! # chapr-proto — the Chaperone wire contract
 //!
 //! This crate is the single, shared definition of everything that crosses the
@@ -84,7 +88,7 @@ pub use tools::{
 };
 pub use version::VersionToken;
 
-/// The `chapr.*` tool namespace prefix. Naming is settled (CLAUDE.md); the
+/// The `chapr.*` tool namespace prefix. Naming is settled (see the README); the
 /// spec's historical `fs.*` / `FMCP` names must never appear in new code,
 /// audit event names, or identifiers.
 pub const TOOL_NAMESPACE: &str = "chapr";

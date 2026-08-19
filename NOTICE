@@ -1,0 +1,17 @@
+Chaperone
+
+Copyright 2026 SerenIT ApS
+Copyright 2026 Prompted EV
+
+Contributors:
+
+  Johannes Korsdal
+  Kristian Schou
+
+Chaperone is jointly owned by the two companies named above and is released
+under the Apache License, Version 2.0. See LICENSE for the full text; section
+4(d) requires this file to travel with any redistribution of the work or of a
+derivative of it.
+
+Chaperone is built with AI assistance under human review. Architecture decisions
+are human-owned; every commit is human-reviewed before it lands.

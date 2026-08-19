@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! `chapr-endpoint self-test` — verification that runs on a customer's laptop.
 //!
 //! The live smoke suites in `examples/` already cover more than this does, and

@@ -26,10 +26,15 @@ touches coord.
 - A host for the coordinator that can reach the share's network and that laptops
   can reach over HTTP(S).
 - Claude Desktop on each laptop.
-- To build: the Rust toolchain (`cargo`) and, to pack MCPBs, Node + `@anthropic-ai/mcpb`.
+- To build from source: the Rust toolchain (`cargo`) and, to pack MCPBs, Node +
+  `@anthropic-ai/mcpb`. Not needed if you take the published
+  [Releases](https://github.com/Korsdal/Chaperone/releases) — the binaries there are built by CI
+  from a tag, with `SHA256SUMS` alongside them.
 
 ## Step 1 — Coordinator
-1. Build: `cargo build --release -p chapr-coord`. The result is one self-contained
+1. Get the binary: download `chapr-coord-<version>-<os>` from the project's
+   [Releases](https://github.com/Korsdal/Chaperone/releases) page (checksums in `SHA256SUMS`), or
+   build it with `cargo build --release -p chapr-coord`. The result is one self-contained
    `.exe` — no Visual C++ redistributable, no Rust on the target host, no script.
 2. Copy it to the coordinator host and run it **elevated** with no arguments. That
    *is* the installer: a bare invocation runs the setup wizard. See
@@ -49,9 +54,12 @@ touches coord.
    itself. Loopback working proves nothing about what a user will experience.
 
 ## Step 2 — Endpoints (MCPB)
-1. Build one bundle **per client OS** — see [`../packaging/mcpb/README.md`](../packaging/mcpb/README.md).
-   Identity is auto-derived from the OS logon, so the only user-config field is the
-   coordinator URL.
+1. Get one bundle **per client OS**: download `chaperone-endpoint-<version>-<os>.mcpb` from
+   [Releases](https://github.com/Korsdal/Chaperone/releases), or build it — see
+   [`../packaging/mcpb/README.md`](../packaging/mcpb/README.md). A packager who builds it can
+   pre-fill the coordinator URL and coordinated location as defaults, so users type nothing;
+   released bundles ship without those defaults, so users enter them once. Identity is
+   auto-derived from the OS logon either way.
 2. Distribute the `.mcpb`. Users install it in Claude Desktop
    (Settings → Extensions) and enter the coordinator URL once.
 3. On first connect the endpoint reads coord's backend announcement, confirms it

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The version token — Chaperone's single change-detection primitive.
 
 use serde::{Deserialize, Serialize};

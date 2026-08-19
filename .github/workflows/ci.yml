@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SerenIT ApS
+# Copyright 2026 Prompted EV
+
+# The three commands the README documents, run on both OSes the project claims to
+# support. Nothing here is Chaperone-specific cleverness on purpose: if the README
+# says these three pass on Windows and Linux, CI is what keeps that sentence true.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT setting RUSTFLAGS here, tempting as `-D warnings` is: the
+  # RUSTFLAGS environment variable REPLACES `target.*.rustflags` from
+  # .cargo/config.toml rather than adding to it, which would silently drop
+  # `+crt-static` on Windows (D-032) and make CI build something other than what
+  # we ship. The clippy step below already fails on warnings.
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Both platforms report. A Windows failure must not hide a Linux one —
+      # the SMB and POSIX backends fail in genuinely different places.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    # The README and Cargo.toml both claim 1.85. That claim was wrong once
+    # already (it said 1.75 while the dependency tree needed 1.85, so a box
+    # provisioned from the README could not build the tree) — this job is what
+    # stops it drifting again.
+    name: MSRV 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build with the declared minimum toolchain
+        run: cargo build --workspace --all-targets

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Closed enumerations shared across records ([`crate::records`]) and the tool
 //! surface ([`crate::tools`]).
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Atomic coord-state migration for a rename (concept §6.3).
 //!
 //! The endpoint has already performed the SMB rename (the file is ground truth,

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! [`ChaprError`] — the exhaustive failure enum.
 //!
 //! This is the reason the project is in Rust (implementation notes §1): the

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The `chapr.*` tool surface (concept §6) and the internal `coord.resolve`
 //! control-channel call (concept §8.1), as request/response types.
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The admin token — the credential that gates the administrative surface.
 //!
 //! ## Why a token and not a role

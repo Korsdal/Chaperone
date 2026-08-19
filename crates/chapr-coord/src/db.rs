@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! SQLite persistence for coord.
 //!
 //! SQLite is the confirmed engine (concept §18 open item, resolved — logbook

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Full-surface live smoke test: drives every mutation/read verb through the
 //! **real** selected backend (SMB `winfs` on Windows, or POSIX `posixfs`
 //! advisory-`flock` on Linux) against a running coord and real files on disk.

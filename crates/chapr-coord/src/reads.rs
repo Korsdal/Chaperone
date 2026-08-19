@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Session read-tracking — the basis for structural read-before-write
 //! (concept §6.2).
 //!

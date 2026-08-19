@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The diagnostics store (E-026) — grouped operational failures.
 //!
 //! The rationale for keeping this separate from the audit log lives on the proto

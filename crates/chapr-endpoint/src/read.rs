@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The read state machine (concept §8) — `chapr.read`'s core logic, independent
 //! of both MCP transport and Win32.
 //!

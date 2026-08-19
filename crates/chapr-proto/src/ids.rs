@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Typed identifier newtypes.
 //!
 //! Every coordination record is keyed by one of these. They are thin wrappers

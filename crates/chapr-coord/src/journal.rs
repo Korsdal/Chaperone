@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The intent journal — the record of in-flight writes that drives crash
 //! recovery (concept §5.2, §7, §8.1, §15).
 //!

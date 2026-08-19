@@ -12,6 +12,12 @@
 *.toml text eol=lf
 *.md   text eol=lf
 *.json text eol=lf
+*.yml  text eol=lf
+# LICENSE stays byte-identical to the canonical Apache-2.0 text (md5
+# 3b83ef96387f14655fc854ddc3c6bd57) — a CRLF checkout would change that hash and
+# make the file no longer match what apache.org serves.
+LICENSE text eol=lf
+NOTICE  text eol=lf
 
 # Binary — never touch, never diff.
 *.mcpb binary

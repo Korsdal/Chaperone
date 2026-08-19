@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The Win32 exclusive-open primitive — the correctness core of the write path
 //! (concept §7, invariant 3–4).
 //!

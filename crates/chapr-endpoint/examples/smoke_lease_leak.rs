@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Fault-injection regression probe for the commit-tail lease leak (now fixed).
 //!
 //! `write()` releases the lease at the very bottom. The post-close tail above it

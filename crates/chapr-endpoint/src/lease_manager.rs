@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Lease lifecycle + background renewal (concept §9, §15).
 //!
 //! A lease's heartbeat TTL (90 s) is decoupled from how long an operation takes:
@@ -35,7 +39,7 @@ pub const RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
 /// How long to keep waiting for a lease another *process* holds before handing
 /// the caller a "still busy" answer (E-027).
 ///
-/// Bounded on purpose (CLAUDE.md failure directions: "bounded retries, exp
+/// Bounded on purpose (the README's failure directions: "bounded retries, exp
 /// backoff + jitter, per-file budget, terminal ask-the-human state" — an LLM will
 /// otherwise retry forever). Generous on purpose too: data integrity over speed,
 /// and a salesperson running a workflow already expects it to take time.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Operational diagnostics — the "why did it break" channel (E-026, D-030).
 //!
 //! ## Diagnostics are not the audit trail

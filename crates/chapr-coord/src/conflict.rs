@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The conflict registry (concept §11) — the source of truth for open conflict
 //! sidecars.
 //!

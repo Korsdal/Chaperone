@@ -1,0 +1,235 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SerenIT ApS
+# Copyright 2026 Prompted EV
+
+# Cut a release: push a `v*` tag, get built binaries and packed .mcpb bundles
+# attached to a DRAFT GitHub Release for a human to review and publish.
+#
+# Anyone who clones this repo can build it themselves — `cargo build --release`
+# is three words. Publishing binaries is not about capability, it is about not
+# making a DBA install a Rust toolchain on a fileserver to try the thing.
+#
+# Deliberately absent: RUSTFLAGS. The env var REPLACES `target.*.rustflags` from
+# .cargo/config.toml, which would drop `+crt-static` (D-032) and ship binaries
+# that need the Visual C++ redistributable — the exact failure that cost hours at
+# the first customer install.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: builds and packs everything, uploads it as workflow artifacts, and
+  # creates no release. Use it to prove the pipeline before spending a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-gate:
+    name: Tag matches workspace version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [ -z "$workspace" ]; then echo "::error::could not read version from Cargo.toml"; exit 1; fi
+          echo "version=$workspace" >> "$GITHUB_OUTPUT"
+
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "Dry run — building $workspace, no release will be created."
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$workspace" ]; then
+            echo "::error::tag v$tag does not match workspace version $workspace."
+            echo "::error::Bump [workspace.package] version in Cargo.toml first, commit it, then tag."
+            echo "::error::Versioning is a human responsibility in this project — CI will not paper over the mismatch."
+            exit 1
+          fi
+          echo "Tag v$tag matches workspace version $workspace."
+
+  build:
+    name: ${{ matrix.slug }}
+    needs: version-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32
+            slug: windows-x86_64
+            exe: ".exe"
+          - os: ubuntu-latest
+            platform: linux
+            slug: linux-x86_64
+            exe: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # For `npx @anthropic-ai/mcpb` in the packing step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # A release build that has not passed its own tests is not a release. This
+      # duplicates CI on purpose: a tag can be pushed at a commit CI never saw.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Prepare dist
+        shell: bash
+        run: mkdir -p dist
+
+      # One bundle per client OS, built ON that OS — build-mcpb.ps1 refuses to
+      # label a binary as a platform it was not compiled for.
+      - name: Pack the endpoint MCPB
+        shell: pwsh
+        run: |
+          ./packaging/mcpb/build-mcpb.ps1 `
+            -Template ./packaging/mcpb/manifest.template.json `
+            -Version ${{ needs.version-gate.outputs.version }} `
+            -Platform ${{ matrix.platform }} `
+            -OutDir ./build/bundle `
+            -Output ./dist/chaperone-endpoint-${{ needs.version-gate.outputs.version }}-${{ matrix.slug }}.mcpb `
+            -Pack
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.version-gate.outputs.version }}"
+          cp "target/release/chapr-coord${{ matrix.exe }}" \
+             "dist/chapr-coord-$v-${{ matrix.slug }}${{ matrix.exe }}"
+          # The endpoint ships as an .mcpb on Windows, where Claude Desktop
+          # installs it in one click. The raw Linux binary is published as well
+          # because Claude Desktop's Linux story is thin, and a bare binary you
+          # can wire into any MCP client is more useful there than a bundle
+          # format that host may not accept.
+          if [ "${{ matrix.platform }}" != "win32" ]; then
+            cp "target/release/chapr-endpoint" "dist/chapr-endpoint-$v-${{ matrix.slug }}"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    # Dry runs stop after build. Only a tag produces a release.
+    if: github.ref_type == 'tag'
+    needs: [version-gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For provenance attestation.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      # Attest BEFORE the checksum file exists, so the subjects are exactly the
+      # things a user runs. Attestations are free on public repos and require
+      # Enterprise on private ones, so this is conditional rather than a hard
+      # dependency of every release.
+      - name: Provenance attestation
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: staged/*
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.version-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Chaperone $VERSION — filesystem coordination for concurrent Claude agent sessions
+          against a shared fileserver.
+
+          ## Install
+
+          **Coordinator** — one per site, on-prem beside the fileserver.
+
+          Download \`chapr-coord-$VERSION-windows-x86_64.exe\` (or the Linux build) and run it
+          with no arguments. The executable *is* the installer: a bare invocation runs the setup
+          wizard, and \`serve\` takes over once a \`coord.toml\` exists. Note that \`addr\` (where
+          the socket binds) and \`public_url\` (what a laptop connects to) are different settings.
+
+          **Endpoint** — one per user laptop.
+
+          Download \`chaperone-endpoint-$VERSION-windows-x86_64.mcpb\` and double-click it in
+          Claude Desktop (Settings → Extensions). It asks for the coordinator URL and the
+          coordinated location; identity comes from the OS logon, so there is nothing else to set.
+
+          ## Verify
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS      # or: Get-FileHash on Windows
+          \`\`\`
+
+          ## Worth knowing
+
+          - **The .mcpb bundles are unsigned.** Signing is broken upstream in the mcpb CLI
+            (\`node-forge\`: "PKCS#7 signature verification not yet implemented"), so Claude Desktop
+            reports every bundle as unsigned regardless. Accountability rests on the audit trail;
+            managed fleets can pre-approve the bundle via Intune/GPO.
+          - **Windows binaries link the CRT statically**, so no Visual C++ redistributable is
+            needed — the trade is that CRT security fixes arrive with a Chaperone rebuild rather
+            than via Windows Update.
+          - **The Linux endpoint bundle is the least exercised artifact here.** The POSIX backend
+            is tested, but the bundle format on a Linux host is not something we run in anger.
+          - Every artifact carries LICENSE and NOTICE; the .mcpb bundles carry them inside.
+
+          Built by GitHub Actions from the \`$GITHUB_REF_NAME\` tag.
+          EOF
+          cat notes.md
+
+      - name: Draft the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --verify-tag \
+            --title "Chaperone $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            staged/*
+          echo "Draft release created — review and publish it from the Releases page."

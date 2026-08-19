@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! The mutation verbs beyond `chapr.write`: `create`, `delete` (soft),
 //! `restore` (concept §6.2, §6.5), and `move` (§6.3).
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Blob garbage collection + retention (concept §12).
 //!
 //! Reference-counted mark-and-sweep over the content-addressed blob store, with

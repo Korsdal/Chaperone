@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Coord configuration (E-016).
 //!
 //! Resolution precedence, lowest to highest: **built-in defaults → TOML config

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Pilot-shaped live smoke: the two things `smoke_parts` structurally cannot
 //! cover, both of which the 4-user pilot consists of.
 //!

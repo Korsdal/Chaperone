@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! Authentication boundary (concept §13.1) — pluggable, so the deployment can
 //! swap the dev stand-in for real Negotiate/Kerberos.
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 SerenIT ApS
+// Copyright 2026 Prompted EV
+
 //! chapr-endpoint binary — the stdio MCP server (one per sales laptop, a child
 //! of Claude Desktop).
 //!
