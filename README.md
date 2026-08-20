@@ -146,6 +146,10 @@ fileserver:
 | `chaperone-endpoint-<ver>-linux-x86_64.mcpb` + raw binary | Same for Linux. The raw binary is published too, because Claude Desktop's Linux story is thin and a bare binary wires into any MCP client. |
 | `SHA256SUMS` | `sha256sum -c SHA256SUMS`, or `Get-FileHash` on Windows. |
 
+The coordinator's OS and the endpoints' OS are independent: an Ubuntu fileserver running coord with
+Windows laptops, or a Windows/SMB coord with Linux endpoints, are both ordinary. Take the coordinator
+build for the host that runs it and the bundle for each endpoint OS.
+
 Releases are built by GitHub Actions from a tag, not from someone's laptop, and are
 provenance-attested. The `.mcpb` bundles are **unsigned** — signing is broken upstream in the mcpb
 CLI, so Claude Desktop reports every bundle as unsigned regardless; accountability rests on the
@@ -207,11 +211,19 @@ A release is a tag:
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-`.github/workflows/release.yml` then tests, builds, and packs on both OSes, generates `SHA256SUMS`,
-attests provenance, and opens a **draft** release for a human to publish. It refuses to run if the
-tag does not match the workspace version — the version bump is the decision, and the tag only
-records it. `workflow_dispatch` runs the same pipeline without creating a release, for proving a
-change to the packaging before spending a tag.
+`.github/workflows/release.yml` then tests, builds, and packs on both OSes, checks every artifact is
+present and non-empty, generates `SHA256SUMS`, attests provenance, and opens a **draft** release for
+a human to publish. It refuses to run if the tag does not match the workspace version — the version
+bump is the decision, and the tag only records it.
+
+Each release carries five binaries, so a site can mix platforms freely — an Ubuntu coordinator with
+Windows endpoints, or a Windows/SMB coordinator with Linux ones. Download the coordinator for the
+host that runs it and the bundle for each endpoint OS.
+
+`workflow_dispatch` runs the **whole** pipeline and publishes nothing: it stages the artifacts,
+renders the release notes, and writes the checksums, attaching both as a `dry-run-release-material`
+artifact, then stops before `gh release create`. So a tag executes exactly one command that has
+never run before, rather than four. Use it after any change to packaging.
 
 ## Contributing
 

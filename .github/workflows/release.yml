@@ -46,7 +46,7 @@ jobs:
           echo "version=$workspace" >> "$GITHUB_OUTPUT"
 
           if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
-            echo "Dry run — building $workspace, no release will be created."
+            echo "Dry run for $workspace — every stage runs except the publish itself."
             exit 0
           fi
 
@@ -136,9 +136,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Draft release
-    # Dry runs stop after build. Only a tag produces a release.
-    if: github.ref_type == 'tag'
+    name: Publish (draft, on a tag)
+    # Runs in BOTH modes on purpose. It used to be gated on `ref_type == 'tag'`,
+    # which meant a dispatch run proved the build half of the pipeline and none of
+    # the publish half — so the first real tag was also the first execution of
+    # checksums, notes rendering, and `gh release create` at once. Now a dry run
+    # does everything up to the irreversible step and uploads the result for
+    # inspection, leaving exactly one never-yet-run command behind a tag.
     needs: [version-gate, build]
     runs-on: ubuntu-latest
     permissions:
@@ -154,12 +158,33 @@ jobs:
           path: staged
           merge-multiple: true
 
+      # Every artifact a user could download must be present and non-empty before
+      # anything downstream treats the set as a release. A zero-byte binary
+      # uploads cleanly, checksums cleanly, and fails only on the machine that
+      # runs it — `if-no-files-found: error` catches an empty directory, not an
+      # empty file.
+      - name: Sanity-check the staged set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged
+          ls -l
+          n=0
+          for f in *; do
+            [ -s "$f" ] || { echo "::error::$f is empty"; exit 1; }
+            n=$((n+1))
+          done
+          echo "$n artifacts staged"
+          # 2 coord binaries + 2 .mcpb bundles + the bare Linux endpoint.
+          [ "$n" -eq 5 ] || { echo "::error::expected 5 artifacts, staged $n"; exit 1; }
+
       # Attest BEFORE the checksum file exists, so the subjects are exactly the
-      # things a user runs. Attestations are free on public repos and require
-      # Enterprise on private ones, so this is conditional rather than a hard
-      # dependency of every release.
+      # things a user runs. Tag-only: attesting a dry run would mint provenance
+      # for artifacts nobody can download. Attestations are free on public repos
+      # and need Enterprise on private ones, hence the visibility check too — on a
+      # private repo this skips, and releases go out unattested.
       - name: Provenance attestation
-        if: github.event.repository.visibility == 'public'
+        if: github.ref_type == 'tag' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: staged/*
@@ -178,6 +203,13 @@ jobs:
           VERSION: ${{ needs.version-gate.outputs.version }}
         run: |
           set -euo pipefail
+          # On a dispatch, GITHUB_REF_NAME is a branch, so "from the main tag"
+          # would be a lie in a file whose whole job is to be accurate.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            source_line="Built by GitHub Actions from the \`$GITHUB_REF_NAME\` tag."
+          else
+            source_line="Built by GitHub Actions from \`$GITHUB_REF_NAME\` as a dry run — this text was rendered, not published."
+          fi
           cat > notes.md <<EOF
           Chaperone $VERSION — filesystem coordination for concurrent Claude agent sessions
           against a shared fileserver.
@@ -216,11 +248,13 @@ jobs:
             is tested, but the bundle format on a Linux host is not something we run in anger.
           - Every artifact carries LICENSE and NOTICE; the .mcpb bundles carry them inside.
 
-          Built by GitHub Actions from the \`$GITHUB_REF_NAME\` tag.
+          $source_line
           EOF
           cat notes.md
 
+      # The one irreversible step, and so the only one still behind a tag.
       - name: Draft the release
+        if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -233,3 +267,36 @@ jobs:
             --notes-file notes.md \
             staged/*
           echo "Draft release created — review and publish it from the Releases page."
+
+      # A dry run's whole value is being inspectable, so hand back the two files
+      # a tag would have published rather than only logging them.
+      - name: Upload the dry-run release material
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-release-material
+          path: |
+            notes.md
+            staged/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Summary
+        shell: bash
+        env:
+          VERSION: ${{ needs.version-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+              echo "### Draft release $GITHUB_REF_NAME created"
+              echo "Review and publish it from the Releases page."
+            else
+              echo "### Dry run for $VERSION — nothing published"
+              echo "Checksums and release notes were produced and attached as"
+              echo "\`dry-run-release-material\`. Everything a tag would do ran except"
+              echo "\`gh release create\` and provenance attestation."
+              echo ""
+              echo "To release: bump \`[workspace.package] version\` in \`Cargo.toml\`,"
+              echo "commit it, then \`git tag v<version> && git push origin v<version>\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
