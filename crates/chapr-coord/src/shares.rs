@@ -20,6 +20,21 @@
 //! string/integer logic that unit-tests on any platform; only the enumeration
 //! itself is Windows-gated (the cross-platform-buildable choice, D-C).
 
+// The consequence of that split: off Windows the only caller of the filter is
+// its own tests, because `local_shares()` there returns an empty list without
+// consulting it. So in a non-test Linux build the filter and its constants are
+// genuinely unreachable — `dead_code` is right, and this workspace builds with
+// warnings as errors, which is how ubuntu-latest failed clippy while every test
+// passed.
+//
+// Allowed rather than restructured. The alternative is moving the filter behind
+// `cfg(windows)` with its tests, which would delete real coverage of the one
+// piece of logic here that has a subtle bug in it (a trailing `$` is not what
+// makes a share administrative) on the platform where CI actually runs it. The
+// scope is deliberately this module: everything in it exists to serve Windows
+// share enumeration, so "unreachable off Windows" describes the whole file.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 /// A share worth offering as the coordinated location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalShare {

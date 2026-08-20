@@ -1055,108 +1055,136 @@ mod tests {
         assert_eq!(select_backend(None), BackendKind::default());
     }
 
-    /// A [`FsPrimitives`] that never mutates anything. `open_existing` fails with
-    /// a distinctive I/O error rather than panicking: reaching the open is the
-    /// *correct* outcome when no human holds the file, and it has to be
-    /// distinguishable from the pre-flight refusal.
-    struct StubFs;
+    /// The `~$F` human-lock pre-flight on the restore path.
+    ///
+    /// Windows-only **as a group**, and not because the guard is platform-
+    /// specific. `StubFs` forces `BackendKind::Smb` so the `~$F` grammar is
+    /// exercised whatever the host, but these tests use a **real temp file**, and
+    /// a native temp path is backslash-shaped only here. On Linux
+    /// `human_lock_paths` finds no `\` to split on, emits the nonexistent
+    /// candidate `~$/tmp/…/q3.xlsx`, and the pre-flight cannot fire — so the
+    /// refusal test failed on ubuntu-latest while the code was correct. Feeding a
+    /// backslash grammar a POSIX path is the test's mistake, not the guard's.
+    ///
+    /// Gating the module rather than the two tests keeps `StubFs` and
+    /// `restore_against_stub` out of the Linux build with them; left behind they
+    /// are dead code, and this workspace treats warnings as errors.
+    ///
+    /// Candidate generation is covered platform-independently in `pathgrammar`
+    /// (that SMB emits the Excel and Word forms, and that POSIX emits none). What
+    /// these two add is that the *restore path* calls the pre-flight at all, and
+    /// one platform is enough to prove that.
+    #[cfg(windows)]
+    mod human_lock_preflight {
+        use super::*;
 
-    struct NeverOpened;
-    impl LockedFile for NeverOpened {
-        fn read_all(&self) -> io::Result<Vec<u8>> {
-            unreachable!("no handle is ever produced")
+        /// A [`FsPrimitives`] that never mutates anything. `open_existing` fails with
+        /// a distinctive I/O error rather than panicking: reaching the open is the
+        /// *correct* outcome when no human holds the file, and it has to be
+        /// distinguishable from the pre-flight refusal.
+        struct StubFs;
+
+        struct NeverOpened;
+        impl LockedFile for NeverOpened {
+            fn read_all(&self) -> io::Result<Vec<u8>> {
+                unreachable!("no handle is ever produced")
+            }
+            fn overwrite(&self, _bytes: &[u8]) -> io::Result<()> {
+                unreachable!("no handle is ever produced")
+            }
         }
-        fn overwrite(&self, _bytes: &[u8]) -> io::Result<()> {
-            unreachable!("no handle is ever produced")
+
+        impl FsPrimitives for StubFs {
+            type File = NeverOpened;
+            fn kind(&self) -> BackendKind {
+                BackendKind::Smb // the grammar with a `~$F` convention
+            }
+            fn open_existing(&self, _path: &str) -> io::Result<Self::File> {
+                Err(io::Error::other("reached the exclusive open"))
+            }
+            fn create_new(&self, _path: &str, _bytes: &[u8]) -> io::Result<()> {
+                unreachable!("a restore in place creates nothing")
+            }
+            fn rename(&self, _s: &str, _d: &str, _o: bool) -> io::Result<()> {
+                unreachable!("a restore in place renames nothing — never temp-rename")
+            }
         }
-    }
 
-    impl FsPrimitives for StubFs {
-        type File = NeverOpened;
-        fn kind(&self) -> BackendKind {
-            BackendKind::Smb // the grammar with a `~$F` convention
+        /// Drive `restore_in_place_core` against [`StubFs`] and return the error.
+        /// A success is impossible here (the stub never yields a handle), so an `Ok`
+        /// means the core committed something it should not have.
+        fn restore_against_stub(path: &CanonicalPath) -> ChaprError {
+            let coord = CoordClient::new("http://127.0.0.1:1"); // unroutable on purpose
+            let principal = Principal::new_unchecked("CONTOSO\\agent");
+            let session_id = SessionId::new_unchecked("sess-restore");
+            let rt = Handle::current();
+            let ctx = WriteCtx {
+                rt: &rt,
+                coord: &coord,
+                principal: &principal,
+                session_id: &session_id,
+            };
+            match restore_in_place_core(
+                &StubFs,
+                false,
+                &ctx,
+                &RestoreInPlaceArgs {
+                    path: path.clone(),
+                    lease_id: LeaseId::new_unchecked("lease-1"),
+                    bytes: b"an old version the agent wants back".to_vec(),
+                    version: VersionToken::hash(b"an old version the agent wants back"),
+                },
+            ) {
+                Ok(_) => panic!("restore reported a commit against a stub that writes nothing"),
+                Err(e) => e,
+            }
         }
-        fn open_existing(&self, _path: &str) -> io::Result<Self::File> {
-            Err(io::Error::other("reached the exclusive open"))
+
+        /// `chapr.restore mode=in_place` overwrote a document a human had open in
+        /// Word or Excel. It was the only mutating verb missing the `~$F` pre-flight,
+        /// and it deliberately performs no CAS ("a restore is a deliberate
+        /// overwrite"), so that check was the sole guard on the path — humans always
+        /// win (concept §7 step 3, §10).
+        #[tokio::test]
+        async fn restore_in_place_refuses_while_a_human_has_the_file_open() {
+            let dir = tempfile::tempdir().unwrap();
+            let doc = dir.path().join("q3.xlsx");
+            std::fs::write(&doc, b"the human's work").unwrap();
+            // Excel's owner file — what "a human has this open" looks like on SMB.
+            std::fs::write(dir.path().join("~$q3.xlsx"), b"lock").unwrap();
+
+            let path = CanonicalPath::new_unchecked(doc.to_string_lossy().to_string());
+            let err = restore_against_stub(&path);
+
+            assert!(
+                matches!(err, ChaprError::OfficeLockPresent { .. }),
+                "expected OfficeLockPresent, got {err:?}"
+            );
+            // And the human's bytes are still theirs.
+            assert_eq!(std::fs::read(&doc).unwrap(), b"the human's work");
         }
-        fn create_new(&self, _path: &str, _bytes: &[u8]) -> io::Result<()> {
-            unreachable!("a restore in place creates nothing")
+
+        /// The mirror of the above: with no lock file the pre-flight lets the core
+        /// through to the exclusive open, so the refusal really is the lock's doing
+        /// rather than a test that passes for any input.
+        ///
+        /// It would pass on Linux, but only vacuously: there the pre-flight can
+        /// never refuse anything, so the claim it exists to check is not being
+        /// checked. Hence it lives in the gated module with its partner.
+        #[tokio::test]
+        async fn restore_in_place_proceeds_past_the_preflight_without_a_lock() {
+            let dir = tempfile::tempdir().unwrap();
+            let doc = dir.path().join("q3.xlsx");
+            std::fs::write(&doc, b"the human's work").unwrap();
+            // No `~$q3.xlsx` this time.
+
+            let path = CanonicalPath::new_unchecked(doc.to_string_lossy().to_string());
+            let err = restore_against_stub(&path);
+
+            assert!(
+                !matches!(err, ChaprError::OfficeLockPresent { .. }),
+                "pre-flight refused with no lock file present: {err:?}"
+            );
         }
-        fn rename(&self, _s: &str, _d: &str, _o: bool) -> io::Result<()> {
-            unreachable!("a restore in place renames nothing — never temp-rename")
-        }
-    }
-
-    /// Drive `restore_in_place_core` against [`StubFs`] and return the error.
-    /// A success is impossible here (the stub never yields a handle), so an `Ok`
-    /// means the core committed something it should not have.
-    fn restore_against_stub(path: &CanonicalPath) -> ChaprError {
-        let coord = CoordClient::new("http://127.0.0.1:1"); // unroutable on purpose
-        let principal = Principal::new_unchecked("CONTOSO\\agent");
-        let session_id = SessionId::new_unchecked("sess-restore");
-        let rt = Handle::current();
-        let ctx = WriteCtx {
-            rt: &rt,
-            coord: &coord,
-            principal: &principal,
-            session_id: &session_id,
-        };
-        match restore_in_place_core(
-            &StubFs,
-            false,
-            &ctx,
-            &RestoreInPlaceArgs {
-                path: path.clone(),
-                lease_id: LeaseId::new_unchecked("lease-1"),
-                bytes: b"an old version the agent wants back".to_vec(),
-                version: VersionToken::hash(b"an old version the agent wants back"),
-            },
-        ) {
-            Ok(_) => panic!("restore reported a commit against a stub that writes nothing"),
-            Err(e) => e,
-        }
-    }
-
-    /// `chapr.restore mode=in_place` overwrote a document a human had open in
-    /// Word or Excel. It was the only mutating verb missing the `~$F` pre-flight,
-    /// and it deliberately performs no CAS ("a restore is a deliberate
-    /// overwrite"), so that check was the sole guard on the path — humans always
-    /// win (concept §7 step 3, §10).
-    #[tokio::test]
-    async fn restore_in_place_refuses_while_a_human_has_the_file_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let doc = dir.path().join("q3.xlsx");
-        std::fs::write(&doc, b"the human's work").unwrap();
-        // Excel's owner file — what "a human has this open" looks like on SMB.
-        std::fs::write(dir.path().join("~$q3.xlsx"), b"lock").unwrap();
-
-        let path = CanonicalPath::new_unchecked(doc.to_string_lossy().to_string());
-        let err = restore_against_stub(&path);
-
-        assert!(
-            matches!(err, ChaprError::OfficeLockPresent { .. }),
-            "expected OfficeLockPresent, got {err:?}"
-        );
-        // And the human's bytes are still theirs.
-        assert_eq!(std::fs::read(&doc).unwrap(), b"the human's work");
-    }
-
-    /// The mirror of the above: with no lock file the pre-flight lets the core
-    /// through to the exclusive open, so the refusal really is the lock's doing
-    /// rather than a test that passes for any input.
-    #[tokio::test]
-    async fn restore_in_place_proceeds_past_the_preflight_without_a_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let doc = dir.path().join("q3.xlsx");
-        std::fs::write(&doc, b"the human's work").unwrap();
-        // No `~$q3.xlsx` this time.
-
-        let path = CanonicalPath::new_unchecked(doc.to_string_lossy().to_string());
-        let err = restore_against_stub(&path);
-
-        assert!(
-            !matches!(err, ChaprError::OfficeLockPresent { .. }),
-            "pre-flight refused with no lock file present: {err:?}"
-        );
     }
 }

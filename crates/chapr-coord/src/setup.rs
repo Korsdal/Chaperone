@@ -1170,35 +1170,36 @@ mod tests {
 
     #[test]
     fn hardening_refuses_shared_and_top_level_directories() {
+        // POSIX-shaped cases run on BOTH platforms: `/` is a separator on Windows
+        // too, so `std::path` splits these identically either way.
+        //
+        // Windows-shaped cases are cfg-gated, and the reason is not tidiness. On
+        // Unix a backslash is an ordinary filename character, so
+        // `Path::new(r"C:\ProgramData\Chaperone")` is ONE component there, not
+        // three — it collapses into the depth guard and reads as unsafe. That is
+        // correct behaviour for a path Linux will never be handed, but asserting
+        // it cross-platform asserts a portability `std::path` does not offer.
+        // (This test claimed exactly that and failed on ubuntu-latest.)
+        //
+        // Fixing the function instead — normalising `\` to `/` before parsing —
+        // would be worse: it would misread a legitimately-named Unix directory,
+        // to buy portability the hardening path never needs, since it only ever
+        // sees local paths on the host it runs on.
+        let mut refuse: Vec<&str> = vec!["/", "/var", "/var/lib", "/etc", "/home"];
+        let mut allow: Vec<&str> = vec!["/var/lib/chapr", "/srv/chapr/blobs"];
+        if cfg!(windows) {
+            refuse.extend([r"C:\", r"C:\ProgramData", r"C:\Windows", r"C:\Program Files"]);
+            allow.extend([r"C:\ProgramData\Chaperone", r"C:\ProgramData\Chaperone\blobs"]);
+        }
+
         // The whole point of the guard: locking one of these down would take out
         // the machine rather than protect the coordinator.
-        for bad in [
-            "C:\\",
-            "C:\\ProgramData",
-            "C:\\Windows",
-            "C:\\Program Files",
-            "/",
-            "/var",
-            "/var/lib",
-            "/etc",
-            "/home",
-        ] {
-            assert!(
-                is_unsafe_to_harden(Path::new(bad)),
-                "{bad} must be refused"
-            );
+        for bad in refuse {
+            assert!(is_unsafe_to_harden(Path::new(bad)), "{bad} must be refused");
         }
         // A directory that is genuinely the coordinator's own is allowed.
-        for good in [
-            "C:\\ProgramData\\Chaperone",
-            "C:\\ProgramData\\Chaperone\\blobs",
-            "/var/lib/chapr",
-            "/srv/chapr/blobs",
-        ] {
-            assert!(
-                !is_unsafe_to_harden(Path::new(good)),
-                "{good} must be allowed"
-            );
+        for good in allow {
+            assert!(!is_unsafe_to_harden(Path::new(good)), "{good} must be allowed");
         }
     }
 
