@@ -22,7 +22,11 @@ members = [
 # Shared package metadata. Every crate inherits these with `x.workspace = true`
 # so version/edition/license are defined once and cannot drift between binaries.
 [workspace.package]
-version = "0.1.0"          # baseline set by jok 2026-07-21; human owns version bumps (see README)
+# 0.1.1 set by jok 2026-08-20, the first release after the project went
+# Apache-2.0 and open. Human owns version bumps (see README) — nothing automated
+# touches this line, and the release workflow refuses a tag that disagrees with
+# it, so the bump is the decision and the tag only records it.
+version = "0.1.1"
 edition = "2021"
 # 1.88.0 is the highest rust-version declared anywhere in the LOCKED dependency
 # graph: darling 0.23 and time 0.3.55 require it, with the icu_* 2.2 crates just

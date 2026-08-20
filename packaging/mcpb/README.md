@@ -23,8 +23,9 @@ users type nothing.
 
 The MCPB is per **client OS**, not per fileserver — each bundle carries the
 backend(s) that OS can drive; the coordinator announces which backend to use and
-the endpoint confirms it locally. For this project we ship **Windows** (SMB); the
-same template produces macOS/Linux (POSIX) bundles.
+the endpoint confirms it locally. Releases build all three from this one template:
+`win32` (SMB), `linux` and `darwin` (POSIX). macOS is compile-verified only — it
+has never been run.
 
 | Placeholder | Windows (SMB) | Linux/macOS (POSIX) |
 |---|---|---|
@@ -40,7 +41,7 @@ keeps a hand-tuned manifest with pre-filled defaults uses the first.
 
 ```powershell
 # From the template — what the release workflow runs:
-./build-mcpb.ps1 -Template ./manifest.template.json -Version 0.1.0 -Pack `
+./build-mcpb.ps1 -Template ./manifest.template.json -Version 0.1.1 -Pack `
                  -Output ./chaperone-endpoint.mcpb
 
 # From an instantiated manifest — what a customer deployable does:

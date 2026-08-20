@@ -306,21 +306,29 @@ bug worth reporting — the comment should be self-contained.
 
 ## Status
 
-Version **0.1.0**. The v1 tool surface is complete and live-verified end to end: read · write ·
+Version **0.1.1**. The v1 tool surface is complete and live-verified end to end: read · write ·
 create · list · stat · delete · move/rename · history · conflicts · resolve_conflict — 10 MCP tools
 against 11 coord routes.
 
-All three crates build and test green on **Windows and Linux**, clippy clean at `-D warnings` on
-both, with the live smoke suite passing on both the SMB and POSIX backends. The endpoint packs as an
-MCPB bundle and installs in Claude Desktop.
+**It has run on real customer hardware.** The one thing no development environment could stand in
+for is settled: **SMB mandatory locking is honoured by an actual Windows Server 2022 share**, so
+invariant 3's foundation is measured rather than assumed. The audit trail and the diagnostics
+pipeline both worked on first contact.
+
+All three crates build and test green on **Windows and Linux** — 324 tests and 321 respectively, the
+difference being Windows-only tests — clippy clean at `-D warnings` on both, with the live smoke
+suite passing on the SMB and POSIX backends. macOS is **built in CI but has never been run**; treat
+those artifacts as compile-verified only.
 
 Known remaining work: real Kerberos/Negotiate on the control channel (needs a domain to develop
-against), DFS and drive-letter→UNC canonicalisation before real-SMB rollout, and validating SMB
-mandatory-lock semantics on an actual fileserver — the one thing a dev environment can't stand in
-for. MCPB signing is broken upstream, so the MVP ships unsigned; accountability rests on the audit
-trail. Delivering a large PDF's *content* to a model is unsolved (see "Read limits" above): the
-bytes arrive base64, which is not analysable — either an `EmbeddedResource` content block or
-`ReadContent::Ref` needs to become real, or PDF reading stays outside the tool surface.
+against). Mapped drive letters resolve to UNC via `WNetGetUniversalNameW`, but that path is still
+unconfirmed against a real server — the self-test reports it as SKIP rather than pass, which is the
+point. **DFS resolution is not implemented**; it was not needed for the first deployment and a DFS
+namespace would need it before rollout. MCPB signing is broken upstream, so bundles ship unsigned;
+accountability rests on the audit trail. Delivering a large PDF's *content* to a model is unsolved
+(see [Read limits](#read-limits-and-what-a-model-can-write-back)): the bytes arrive base64, which is
+not analysable — either an `EmbeddedResource` content block or `ReadContent::Ref` needs to become
+real, or PDF reading stays outside the tool surface.
 
 ### Scope
 
