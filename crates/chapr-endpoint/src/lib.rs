@@ -33,6 +33,7 @@ pub mod backend;
 pub mod canon;
 pub mod coord_client;
 pub mod diag;
+pub mod hostconfig;
 pub mod identity;
 pub mod lease_manager;
 pub mod mount;

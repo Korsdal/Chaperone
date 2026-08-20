@@ -24,7 +24,8 @@ Tool namespace: `chapr.<method>` — `chapr.read`, `chapr.write`, and so on.
 
 Two deployable artifacts, N-to-1:
 
-- **`chapr-endpoint`** — one per user laptop, run as a stdio child of Claude Desktop. Does file I/O
+- **`chapr-endpoint`** — one per user machine, run as a stdio child of an MCP host (Claude Desktop,
+  the Claude Code CLI, or any other MCP client — see [Any MCP host](#any-mcp-host)). Does file I/O
   **as the logged-in user** (Kerberos on SMB), and owns the exclusive-open write path, the CAS
   check, the in-place write, the lease-renewal thread, and the read state machine.
 - **`chapr-coord`** — exactly one, on-prem beside the fileserver. Stateful. Owns the lease table,
@@ -141,10 +142,13 @@ fileserver:
 
 | Artifact | What it is |
 | --- | --- |
-| `chapr-coord-<ver>-windows-x86_64.exe` / `-linux-x86_64` | The coordinator. Run it with **no arguments** — the executable *is* the installer, and a bare invocation runs the setup wizard. |
-| `chaperone-endpoint-<ver>-windows-x86_64.mcpb` | The endpoint, as a one-click Claude Desktop bundle (Settings → Extensions). |
-| `chaperone-endpoint-<ver>-linux-x86_64.mcpb` + raw binary | Same for Linux. The raw binary is published too, because Claude Desktop's Linux story is thin and a bare binary wires into any MCP client. |
+| `chapr-coord-<ver>-<os>` | The coordinator. Run it with **no arguments** — the executable *is* the installer, and a bare invocation runs the setup wizard. |
+| `chaperone-endpoint-<ver>-<os>.mcpb` | The endpoint as a one-click **Claude Desktop** bundle (Settings → Extensions). |
+| `chapr-endpoint-<ver>-<os>` | The same endpoint as a bare binary, for **any other MCP host**. `.mcpb` is Desktop's install format, so a host like the Claude Code CLI wants a command to point at instead — see [Any MCP host](#any-mcp-host). |
 | `SHA256SUMS` | `sha256sum -c SHA256SUMS`, or `Get-FileHash` on Windows. |
+
+Each is built for `windows-x86_64`, `linux-x86_64` and `macos-arm64`. macOS is **built but not
+exercised** — it compiles down the same POSIX path as Linux, but nobody has run it there.
 
 The coordinator's OS and the endpoints' OS are independent: an Ubuntu fileserver running coord with
 Windows laptops, or a Windows/SMB coord with Linux endpoints, are both ordinary. Take the coordinator
@@ -157,6 +161,44 @@ audit trail.
 
 Building it yourself is three words of `cargo` (below) — the binaries exist because asking a DBA to
 install a Rust toolchain on a production fileserver to evaluate a tool is a rude way to say hello.
+
+### Any MCP host
+
+The endpoint is a plain **MCP server over stdio** with no vendor-specific surface: `rmcp` (the
+official SDK), and every setting is an environment variable. Nothing in the tool descriptions or the
+MCP `instructions` names a vendor. So anything that speaks MCP can drive it, and the portable
+interface is simply *"run this command with this environment"*.
+
+The binary prints its own registration rather than making you assemble one:
+
+```sh
+chapr-endpoint print-config              # list the host keys
+chapr-endpoint print-config claude-code  # a `claude mcp add …` one-liner
+chapr-endpoint print-config generic      # the portable mcpServers JSON block
+```
+
+The config goes to **stdout alone** and advice to stderr, so `print-config generic > .mcp.json`
+produces a usable file. It resolves its own absolute path, and emits the values already set in the
+environment — so run it with `CHAPR_COORD_URL` and `CHAPR_ROOT` set and the output needs no editing.
+It never writes to a host's config file: that breaks the moment the host changes its schema, and
+silently editing another application's files is not this tool's business.
+
+The `generic` block is the same `mcpServers` shape Claude Desktop's config file and Claude Code's
+`.mcp.json` both use, and it is what most other clients read. The environment contract, if you would
+rather write the config by hand:
+
+| Variable | |
+| --- | --- |
+| `CHAPR_COORD_URL` | Coordinator base URL. Required in practice. |
+| `CHAPR_ROOT` | Comma-separated coordinated root(s). Confines the endpoint **and** is announced to the model. Unset means unconfined. |
+| `CHAPR_BACKEND` | `smb` \| `posix`. Defaults to SMB on Windows, POSIX elsewhere. |
+| `CHAPR_PRINCIPAL` | Override the identity. Normally derived from the OS logon. |
+| `CHAPR_MAX_INLINE_BYTES` | Per-read context cap. See [Read limits](#read-limits-and-what-a-model-can-write-back). |
+| `CHAPR_DIAG_LOG` | Local JSON-lines diagnostics sink. Empty value disables it. |
+| `RUST_LOG` | Tracing filter. Logs go to stderr, never the MCP channel. |
+
+Honest scope: **Claude Desktop and Claude Code are the hosts we drive end to end.** Others should
+work and we have no reason to think they don't — but we don't test them, so we don't claim them.
 
 ## Build
 

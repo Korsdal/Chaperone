@@ -53,17 +53,37 @@ touches coord.
 6. Verify: `GET /healthz` → `ok`, **from a laptop** rather than from the coordinator
    itself. Loopback working proves nothing about what a user will experience.
 
-## Step 2 — Endpoints (MCPB)
+## Step 2 — Endpoints
+
+The endpoint is a standard MCP server over stdio, so the install route depends on the
+**host**, not on the fileserver. Both routes ship the same binary and behave identically;
+identity is auto-derived from the OS logon either way.
+
+**Route A — Claude Desktop (one-click).**
 1. Get one bundle **per client OS**: download `chaperone-endpoint-<version>-<os>.mcpb` from
    [Releases](https://github.com/Korsdal/Chaperone/releases), or build it — see
    [`../packaging/mcpb/README.md`](../packaging/mcpb/README.md). A packager who builds it can
    pre-fill the coordinator URL and coordinated location as defaults, so users type nothing;
-   released bundles ship without those defaults, so users enter them once. Identity is
-   auto-derived from the OS logon either way.
+   released bundles ship without those defaults, so users enter them once.
 2. Distribute the `.mcpb`. Users install it in Claude Desktop
    (Settings → Extensions) and enter the coordinator URL once.
-3. On first connect the endpoint reads coord's backend announcement, confirms it
-   against its own capabilities, and selects the matching backend.
+
+**Route B — Claude Code, or any other MCP host.** `.mcpb` is Desktop's install format, so
+elsewhere the artifact is the bare `chapr-endpoint-<version>-<os>` binary.
+1. Put the binary somewhere stable (it is self-contained — no runtime, no redistributable).
+2. Set `CHAPR_COORD_URL` and `CHAPR_ROOT`, then let the binary print its own registration:
+   `chapr-endpoint print-config claude-code` for a `claude mcp add` one-liner, or
+   `chapr-endpoint print-config generic` for the portable `mcpServers` JSON block —
+   which is also what Claude Code reads from `.mcp.json`. The config goes to stdout
+   alone, so it can be redirected straight into a file.
+3. For a fleet, do step 2 once and distribute the resulting block; the only
+   machine-specific part is the binary's path.
+
+Either way, on first connect the endpoint reads coord's backend announcement, confirms it
+against its own capabilities, and selects the matching backend.
+
+Only Claude Desktop and Claude Code have been driven end to end. Other MCP hosts should work
+— nothing in the tool surface is vendor-specific — but they are not tested here.
 
 ## Step 3 — Verify end to end
 - From a laptop: `chapr.read` a file on the share → returns content + a version.

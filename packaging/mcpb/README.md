@@ -1,12 +1,20 @@
 # Packaging: endpoint MCPB bundles
 
-The Chaperone endpoint ships to laptops as an **MCPB** — a one-click MCP bundle
-that Claude Desktop installs (Settings → Extensions). An `.mcpb` is a zip of a
-`manifest.json` + the compiled `chapr-endpoint` binary. Because Chaperone derives
-identity from the OS logon (D-024), a user configures only **two** things: the
-coordinator URL, and the **coordinated location** — the share path the endpoint is
-allowed to act on, which is also announced to the model so it routes writes through
-Chaperone (E-025). A packager can set defaults for both so users type nothing.
+**MCPB is one delivery path, not the only one.** The endpoint is a plain MCP server
+over stdio configured entirely by environment variables, so any MCP host can drive
+it; `.mcpb` is **Claude Desktop's** install format specifically. For any other host
+— the Claude Code CLI included — the artifact is the bare `chapr-endpoint` binary,
+and `chapr-endpoint print-config <host>` prints the registration for it. This
+directory is only about the Desktop bundle. Keep that distinction in mind before
+adding anything here that assumes it is the sole install route.
+
+The bundle is a one-click MCP install that Claude Desktop handles (Settings →
+Extensions): a zip of a `manifest.json` + the compiled `chapr-endpoint` binary.
+Because Chaperone derives identity from the OS logon (D-024), a user configures only
+**two** things: the coordinator URL, and the **coordinated location** — the share
+path the endpoint is allowed to act on, which is also announced to the model so it
+routes writes through Chaperone (E-025). A packager can set defaults for both so
+users type nothing.
 
 > Spec: <https://github.com/modelcontextprotocol/mcpb> · manifest reference:
 > `MANIFEST.md` in that repo. CLI: `npm i -g @anthropic-ai/mcpb`.

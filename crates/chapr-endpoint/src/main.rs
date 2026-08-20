@@ -47,12 +47,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // corrupts the protocol stream.
     init_tracing();
 
-    // One explicit argument check, deliberately not a clap parser: Claude Desktop
-    // launches this binary with no arguments and expects an MCP server on stdio.
-    // Anything that could reinterpret the no-argument case would break every
-    // installed extension, so the no-argument path below is left untouched.
-    if std::env::args().nth(1).as_deref() == Some("self-test") {
-        std::process::exit(chapr_endpoint::selftest::run().await as i32);
+    // Explicit argument checks, deliberately not a clap parser: an MCP host
+    // launches this binary with **no arguments** and expects an MCP server on
+    // stdio. Anything that could reinterpret the no-argument case would break
+    // every installed extension, so the fall-through below is left untouched and
+    // each subcommand is matched by name and nothing else.
+    match std::env::args().nth(1).as_deref() {
+        Some("self-test") => std::process::exit(chapr_endpoint::selftest::run().await as i32),
+        // `print-config <host>` emits this binary's MCP client config; see
+        // `hostconfig`. Read-only, and its config goes to stdout alone so it can
+        // be redirected straight into a host's config file.
+        Some("print-config") => {
+            let host = std::env::args().nth(2);
+            std::process::exit(chapr_endpoint::hostconfig::run(host.as_deref()) as i32);
+        }
+        _ => {}
     }
 
     let coord_url =

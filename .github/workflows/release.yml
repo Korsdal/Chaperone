@@ -75,6 +75,15 @@ jobs:
             platform: linux
             slug: linux-x86_64
             exe: ""
+          # Built, never run. Nothing in the endpoint is Linux-specific — there is
+          # no `cfg(target_os)`, `cfg(unix)` or `libc` use anywhere in it, so the
+          # split is Windows vs not-Windows and macOS takes the same POSIX path.
+          # That makes it cheap to build and still unexercised, which the release
+          # notes say out loud rather than letting a green artifact imply testing.
+          - os: macos-latest
+            platform: darwin
+            slug: macos-arm64
+            exe: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -119,14 +128,20 @@ jobs:
           v="${{ needs.version-gate.outputs.version }}"
           cp "target/release/chapr-coord${{ matrix.exe }}" \
              "dist/chapr-coord-$v-${{ matrix.slug }}${{ matrix.exe }}"
-          # The endpoint ships as an .mcpb on Windows, where Claude Desktop
-          # installs it in one click. The raw Linux binary is published as well
-          # because Claude Desktop's Linux story is thin, and a bare binary you
-          # can wire into any MCP client is more useful there than a bundle
-          # format that host may not accept.
-          if [ "${{ matrix.platform }}" != "win32" ]; then
-            cp "target/release/chapr-endpoint" "dist/chapr-endpoint-$v-${{ matrix.slug }}"
-          fi
+          # Both endpoint forms, on every platform. The `.mcpb` is a one-click
+          # install for Claude Desktop — but `.mcpb` is *Desktop's* install format,
+          # not a cross-vendor one, and the endpoint is a plain MCP stdio server
+          # that any host can drive. Someone using the Claude Code CLI, or another
+          # MCP client, needs a command to point at, which is what the bare binary
+          # is for (`chapr-endpoint print-config <host>` prints the config).
+          #
+          # This was previously gated to non-Windows on the mistaken grounds that
+          # Claude Desktop's Linux support was thin. It is not; the real
+          # distinction is bundle-format versus bare command, which is orthogonal
+          # to the OS. The gate meant a Windows user of any non-Desktop host had
+          # nothing to download at all.
+          cp "target/release/chapr-endpoint${{ matrix.exe }}" \
+             "dist/chapr-endpoint-$v-${{ matrix.slug }}${{ matrix.exe }}"
           ls -l dist
 
       - uses: actions/upload-artifact@v4
@@ -175,8 +190,8 @@ jobs:
             n=$((n+1))
           done
           echo "$n artifacts staged"
-          # 2 coord binaries + 2 .mcpb bundles + the bare Linux endpoint.
-          [ "$n" -eq 5 ] || { echo "::error::expected 5 artifacts, staged $n"; exit 1; }
+          # 3 platforms x (coord + .mcpb bundle + bare endpoint binary).
+          [ "$n" -eq 9 ] || { echo "::error::expected 9 artifacts, staged $n"; exit 1; }
 
       # Attest BEFORE the checksum file exists, so the subjects are exactly the
       # things a user runs. Tag-only: attesting a dry run would mint provenance
@@ -223,11 +238,25 @@ jobs:
           wizard, and \`serve\` takes over once a \`coord.toml\` exists. Note that \`addr\` (where
           the socket binds) and \`public_url\` (what a laptop connects to) are different settings.
 
-          **Endpoint** — one per user laptop.
+          **Endpoint** — one per user machine. Two forms, same binary.
 
-          Download \`chaperone-endpoint-$VERSION-windows-x86_64.mcpb\` and double-click it in
-          Claude Desktop (Settings → Extensions). It asks for the coordinator URL and the
-          coordinated location; identity comes from the OS logon, so there is nothing else to set.
+          *Claude Desktop:* download \`chaperone-endpoint-$VERSION-<os>.mcpb\` and double-click it
+          (Settings → Extensions). It asks for the coordinator URL and the coordinated location;
+          identity comes from the OS logon, so there is nothing else to set.
+
+          *Any other MCP host:* download the bare \`chapr-endpoint-$VERSION-<os>\` binary. The
+          endpoint is a standard MCP server over stdio configured entirely by environment
+          variables, so anything speaking MCP can drive it — \`.mcpb\` is Claude Desktop's install
+          format, not a requirement. The binary prints its own registration:
+
+          \`\`\`sh
+          chapr-endpoint print-config claude-code   # a \`claude mcp add …\` one-liner
+          chapr-endpoint print-config generic       # the portable mcpServers JSON block
+          \`\`\`
+
+          The config goes to stdout alone, so \`print-config generic > .mcp.json\` is a usable file.
+          Set \`CHAPR_COORD_URL\` and \`CHAPR_ROOT\` first and it prints your real values instead of
+          placeholders.
 
           ## Verify
 
@@ -244,8 +273,14 @@ jobs:
           - **Windows binaries link the CRT statically**, so no Visual C++ redistributable is
             needed — the trade is that CRT security fixes arrive with a Chaperone rebuild rather
             than via Windows Update.
-          - **The Linux endpoint bundle is the least exercised artifact here.** The POSIX backend
-            is tested, but the bundle format on a Linux host is not something we run in anger.
+          - **The macOS artifacts are built, not exercised.** Nothing in the endpoint is
+            Linux-specific, so macOS takes the same POSIX path Linux does and compiles cleanly —
+            but no one has run it there. Treat it as untested rather than supported.
+          - **Only Claude Desktop and Claude Code have been driven end to end.** The endpoint is a
+            standard MCP server, so other hosts should work, and \`print-config generic\` emits the
+            portable form — but "should" is not "does", and we do not test them.
+          - **The coordinator's OS and the endpoints' OS are independent.** A Linux coordinator with
+            Windows endpoints, or the reverse, is an ordinary deployment.
           - Every artifact carries LICENSE and NOTICE; the .mcpb bundles carry them inside.
 
           $source_line

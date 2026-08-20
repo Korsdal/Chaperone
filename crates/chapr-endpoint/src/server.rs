@@ -28,7 +28,9 @@ use chapr_proto::{
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo,
+};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 
 /// Default cap on the rendered inline body of a `chapr_read`, in bytes.
@@ -625,8 +627,30 @@ impl ServerHandler for ChaprServer {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(instructions(crate::canon::coordinated_roots()));
+        info.server_info = server_identity();
         info
     }
+}
+
+/// How this server names itself at `initialize`.
+///
+/// A free function, like [`instructions`], so it is testable without standing up a
+/// server, a coord client and a runtime for a value that depends on none of them.
+///
+/// It matters more than it looks. `Implementation::default()` reports the **SDK's**
+/// name and version — `rmcp` — and every MCP host displays `serverInfo.name` in its
+/// server list, so Chaperone announced itself to every client as the library it
+/// happens to be built with, telling an operator nothing about what they were
+/// running. The version is this crate's, so a bug report names something we can act
+/// on.
+pub fn server_identity() -> Implementation {
+    // `Implementation` is `#[non_exhaustive]`, so build from Default and assign —
+    // the same reason `get_info` cannot use a struct literal for `ServerInfo`.
+    let mut me = Implementation::default();
+    me.name = "chaperone".to_string();
+    me.title = Some("Chaperone".to_string());
+    me.version = env!("CARGO_PKG_VERSION").to_string();
+    me
 }
 
 /// The server's `instructions` — MCP's slot for guidance the host surfaces to the
@@ -1475,6 +1499,23 @@ mod tests {
         assert!(
             !text.contains("NOTHING WAS CHANGED"),
             "must not carry the untouched-file wording"
+        );
+    }
+
+    /// Every MCP host displays `serverInfo.name` in its server list, and
+    /// `Implementation::default()` reports the SDK's name — so this shipped
+    /// announcing itself as "rmcp" to every client, telling an operator nothing
+    /// about what they were running. Asserting the name is not pedantry: it is the
+    /// only identity a host has for us, and the SDK's default silently wins.
+    #[test]
+    fn the_server_identifies_as_chaperone_not_as_the_sdk() {
+        let me = server_identity();
+        assert_eq!(me.name, "chaperone");
+        assert_eq!(me.version, env!("CARGO_PKG_VERSION"));
+        assert_ne!(
+            me.name,
+            Implementation::default().name,
+            "the SDK default leaked back in"
         );
     }
 
