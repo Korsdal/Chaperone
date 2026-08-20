@@ -588,15 +588,34 @@ fn generate_self_signed(dir: &Path, hostname: &str) -> Result<TlsConfig, String>
 /// (at least two named components) rejects a bare volume or `/var`; the name list
 /// rejects a shared system directory that happens to be deep enough. `C:\
 /// ProgramData` is refused, `C:\ProgramData\Chaperone` is allowed.
+///
+/// Both guards compare *canonicalised* components, which is why a leading
+/// `private` is dropped first — see the note in the body.
 fn is_unsafe_to_harden(p: &Path) -> bool {
     use std::path::Component;
-    let named: Vec<String> = p
+    let mut named: Vec<String> = p
         .components()
         .filter_map(|c| match c {
             Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
             _ => None,
         })
         .collect();
+    // macOS puts the real `/var`, `/etc` and `/tmp` under `/private`, reaching them
+    // through symlinks — and the caller checks the **canonicalised** path, so
+    // `/var/lib` arrives here as `/private/var/lib`. With the extra component this
+    // is three levels deep and equal to nothing in the list below, so it read as a
+    // private directory and `restrict_dir` went on to chmod a shared system
+    // directory. Only the CI runner's permissions stopped it; setup runs elevated.
+    //
+    // Stripped unconditionally rather than behind `cfg(target_os = "macos")`. It is
+    // one code path exercised on every platform instead of a branch only one
+    // platform ever runs — this file has already been bitten twice by
+    // platform-conditional logic nothing else executes — and the cost elsewhere is
+    // that a genuine `/private/...` directory is *refused*, which is the safe
+    // direction for a guard whose job is to decline.
+    if named.first().is_some_and(|c| c == "private") {
+        named.remove(0);
+    }
     if named.len() < 2 {
         return true;
     }
@@ -1185,8 +1204,27 @@ mod tests {
         // would be worse: it would misread a legitimately-named Unix directory,
         // to buy portability the hardening path never needs, since it only ever
         // sees local paths on the host it runs on.
-        let mut refuse: Vec<&str> = vec!["/", "/var", "/var/lib", "/etc", "/home"];
-        let mut allow: Vec<&str> = vec!["/var/lib/chapr", "/srv/chapr/blobs"];
+        // The `/private/...` forms are macOS's canonicalisation of exactly these
+        // paths, and they are asserted on every platform on purpose. They shipped
+        // as a hole because they were only reachable on the one OS nobody built
+        // for; a POSIX-shaped literal costs nothing to check everywhere.
+        let mut refuse: Vec<&str> = vec![
+            "/",
+            "/var",
+            "/var/lib",
+            "/etc",
+            "/home",
+            "/private/var",
+            "/private/var/lib",
+            "/private/etc",
+            "/private/tmp",
+        ];
+        let mut allow: Vec<&str> = vec![
+            "/var/lib/chapr",
+            "/srv/chapr/blobs",
+            // Still allowed once it is genuinely the coordinator's own directory.
+            "/private/var/lib/chapr",
+        ];
         if cfg!(windows) {
             refuse.extend([r"C:\", r"C:\ProgramData", r"C:\Windows", r"C:\Program Files"]);
             allow.extend([r"C:\ProgramData\Chaperone", r"C:\ProgramData\Chaperone\blobs"]);
@@ -1216,6 +1254,31 @@ mod tests {
         let warnings = harden_data_dirs(&cfg);
         assert_eq!(warnings.len(), 1, "one refusal expected, got {warnings:?}");
         assert!(warnings[0].contains("did NOT restrict"));
+    }
+
+    /// The regression that shipped: on macOS `/var` is a symlink into `/private`,
+    /// and `harden_data_dirs` checks the **canonicalised** path — so `/var/lib`
+    /// arrived at the guard as `/private/var/lib`, matched nothing, and was handed
+    /// to `restrict_dir`, which tried to chmod a shared system directory. The CI
+    /// runner lacked permission; setup runs elevated, so it would have succeeded.
+    ///
+    /// Driven through `harden_data_dirs` with the already-canonical form rather
+    /// than relying on a real symlink, so it reproduces the actual failure on every
+    /// platform instead of only the one that has `/private`.
+    #[test]
+    fn harden_data_dirs_refuses_the_macos_canonical_form_of_a_shared_directory() {
+        let cfg = Config {
+            blob_root: "/private/var/lib".into(),
+            db_url: "sqlite::memory:".into(),
+            ..Config::default()
+        };
+        let warnings = harden_data_dirs(&cfg);
+        assert_eq!(warnings.len(), 1, "one refusal expected, got {warnings:?}");
+        assert!(
+            warnings[0].contains("did NOT restrict"),
+            "must refuse, not attempt: {}",
+            warnings[0]
+        );
     }
 
     #[test]
