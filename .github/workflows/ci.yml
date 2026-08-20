@@ -52,16 +52,31 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   msrv:
-    # The README and Cargo.toml both claim 1.85. That claim was wrong once
-    # already (it said 1.75 while the dependency tree needed 1.85, so a box
-    # provisioned from the README could not build the tree) — this job is what
-    # stops it drifting again.
-    name: MSRV 1.85
+    # Builds with exactly the toolchain Cargo.toml declares, read FROM Cargo.toml
+    # rather than pinned here. Hardcoding it created a second place for the number
+    # to live, and the two promptly disagreed: the job pinned 1.85.0 while the
+    # locked graph had moved to needing 1.88. Now a bump in one place is a bump in
+    # both, and a dependency update that raises the real floor fails here — which
+    # is the whole point, since a reader provisioning a box from the README is the
+    # person who otherwise discovers it.
+    name: MSRV (as declared)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [ -z "$v" ]; then echo "::error::no rust-version in [workspace.package]"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $v"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
 

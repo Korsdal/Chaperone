@@ -156,8 +156,10 @@ install a Rust toolchain on a production fileserver to evaluate a tool is a rude
 
 ## Build
 
-Requires Rust 1.85+ (`clap` and `clap_builder` declare 1.85, `axum-server` 1.82 — the tree does
-not build on the 1.75 this used to claim).
+Requires **Rust 1.88+**. That is the highest `rust-version` in the locked dependency graph, not an
+estimate: `darling` 0.23 and `time` 0.3.55 set the floor, with the `icu_*` 2.2 crates at 1.86 just
+under it. The number is measured with `cargo metadata` and enforced by CI, because it has twice been
+declared too low and each time the person who found out was someone trying to build the tree.
 
 ```sh
 cargo build --workspace
@@ -194,7 +196,8 @@ git-ignored.
 ### Releasing
 
 CI (`.github/workflows/ci.yml`) runs those three commands on Windows and Linux for every push and
-PR, plus a build against the declared MSRV so the 1.85 claim above cannot drift again.
+PR, plus a build on the toolchain `Cargo.toml` declares as the MSRV — read from that field rather
+than pinned in the workflow, so the two cannot disagree.
 
 A release is a tag:
 
