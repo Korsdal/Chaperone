@@ -2,9 +2,10 @@
 # Copyright 2026 SerenIT ApS
 # Copyright 2026 Prompted EV
 
-# The three commands the README documents, run on both OSes the project claims to
-# support. Nothing here is Chaperone-specific cleverness on purpose: if the README
-# says these three pass on Windows and Linux, CI is what keeps that sentence true.
+# Two layers. `check` runs the three commands the README documents, on all three
+# OSes the project ships artifacts for — if the README says they pass, this is what
+# keeps that sentence true. `e2e` then runs what `cargo test` structurally cannot:
+# a real coordinator, real processes, and on Windows a real SMB share.
 name: CI
 
 on:
@@ -17,6 +18,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # windows-latest runners drop DNS intermittently, and the first run of the e2e
+  # job hit it hard: `Could not resolve host: static.crates.io`, repeated until
+  # cargo gave up, at the very first `cargo build`. Cargo's default is 3 tries.
+  CARGO_NET_RETRY: "10"
+  # Fetch the index over HTTP rather than by cloning it. Far fewer connections and
+  # far less to resolve, which is the failure mode above.
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   # Deliberately NOT setting RUSTFLAGS here, tempting as `-D warnings` is: the
   # RUSTFLAGS environment variable REPLACES `target.*.rustflags` from
   # .cargo/config.toml rather than adding to it, which would silently drop
@@ -48,6 +56,8 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}
 
       - name: Build
         run: cargo build --workspace --all-targets
@@ -73,6 +83,12 @@ jobs:
     # against a real SMB server rather than local NTFS. That is the first automated
     # check of the mandatory lock the whole write path rests on.
     name: e2e (${{ matrix.os }}, ${{ matrix.backend }})
+    # Sequenced after `check`, for two reasons that both showed up on the first run.
+    # It restores the cache `check` just saved for the same OS instead of doing its
+    # own cold `cargo fetch` alongside it — six concurrent cold fetches is what
+    # tripped windows-latest's DNS. And there is no point spending three runners on
+    # end-to-end behaviour when the unit suite is already red.
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -97,6 +113,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with the `check` job on the same OS. Without this, e2e kept its
+          # own cache key and did a full cold `cargo fetch` in parallel with
+          # check — six concurrent cold fetches on the first run, which is what
+          # tripped the Windows DNS flake.
+          shared-key: ${{ matrix.os }}
 
       - name: Build binaries and smoke suites
         run: cargo build --workspace --all-targets
