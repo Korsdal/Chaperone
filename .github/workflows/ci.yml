@@ -211,8 +211,15 @@ jobs:
           set -euo pipefail
           pkill -f chapr-coord || taskkill //IM chapr-coord.exe //F || true
           sleep 2
-          sed -i 's/auth = "disabled"/auth = "shared-secret"/' "$COORD_DIR/coord.toml"
-          ./target/debug/chapr-coord${{ matrix.exe }} serve --config "$COORD_DIR/coord.toml" \
+          # Flip the mode with the env override, NOT by editing the file. This step
+          # used `sed -i`, which is a GNU-ism: BSD sed on macOS requires an argument
+          # to -i, so it took the script as a backup suffix and then failed with
+          # "command c expects \ followed by text". Config precedence is
+          # defaults → file → env (config.rs), so this exercises the same code path
+          # a real operator's override would, and validate-on-load still sees it
+          # because `apply_overrides` runs first.
+          CHAPR_COORD_AUTH=shared-secret \
+            ./target/debug/chapr-coord${{ matrix.exe }} serve --config "$COORD_DIR/coord.toml" \
             > "$COORD_DIR/coord-auth.log" 2>&1 &
           for i in $(seq 1 30); do
             curl -sf "$CHAPR_COORD_URL/healthz" >/dev/null && break

@@ -141,10 +141,14 @@ fn parse(buf: &[u8]) -> Vec<(u32, String)> {
         if name_start + name_len > buf.len() {
             break;
         }
-        let units: Vec<u16> = buf[name_start..name_start + name_len]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        // `as_chunks::<2>()` rather than `chunks_exact(2)`: the chunk size is a
+        // constant, so this hands back `&[[u8; 2]]` and `from_le_bytes` takes the
+        // array directly instead of re-indexing it. Behaviour is identical — both
+        // drop a trailing odd byte, and `name_len` is always even because the field
+        // is UTF-16. (clippy 1.98's `chunks_exact_to_as_chunks`; `as_chunks` is
+        // stable as of 1.88, which is this workspace's declared MSRV.)
+        let (pairs, _odd_tail) = buf[name_start..name_start + name_len].as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         out.push((action, String::from_utf16_lossy(&units)));
         if next == 0 {
             break;

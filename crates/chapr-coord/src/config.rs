@@ -551,7 +551,11 @@ mod tests {
         };
         // Trailing slash trimmed, because callers append `/admin` and `/healthz`.
         assert_eq!(cfg.advertised_url(), "http://FILESRV01:8787");
-        assert_eq!(cfg.advertised_url(), format!("{}", cfg.advertised_url()));
+        // A second assertion here compared `advertised_url()` against
+        // `format!("{}", advertised_url())` — a tautology, since the method returns
+        // a String. Removed rather than rewritten: clippy 1.98's `useless_format`
+        // flagged it, and its suggested `.to_string()` fix would have kept an
+        // assertion that cannot fail.
     }
 
     #[test]
