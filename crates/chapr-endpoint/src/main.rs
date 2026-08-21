@@ -7,6 +7,9 @@
 //!
 //! Configuration (environment):
 //! - `CHAPR_COORD_URL` — coord base URL. Default `http://127.0.0.1:8787`.
+//! - `CHAPR_COORD_TOKEN` — the deployment's shared secret on the control channel,
+//!   printed by `chapr-coord setup`. Required by a coordinator running
+//!   `auth = "shared-secret"`; unused by one running `trusted-header`.
 //! - `CHAPR_BACKEND`   — `smb` | `posix`. Default: SMB on Windows, POSIX else
 //!   (E-019). The endpoint is local-authoritative (decision D-A); coord's
 //!   announcement is only cross-checked, never overrides this.
@@ -93,9 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| std::io::Error::other("coordinated roots were already set"))?;
 
     tracing::info!(%coord_url, backend = %backend_kind, principal = principal.as_str(), confined, "chapr-endpoint starting");
-    // Present our identity to coord (dev auth boundary; real deployments use
-    // Negotiate/Kerberos on the transport instead of this header — I-001/I-002).
-    let coord = CoordClient::new(&coord_url).with_principal(principal.as_str());
+    // Two credentials, two questions. The token proves this is one of the
+    // deployment's endpoints (coord's `shared-secret` mode refuses without it);
+    // the principal header says which user it is acting for, and stays asserted
+    // rather than proven until E-015. Unset token is legitimate — a
+    // `trusted-header` deployment does not use one — so it is not fatal here;
+    // an enforcing coord answers 401 and the diagnostic says why.
+    let coord_token = std::env::var("CHAPR_COORD_TOKEN").unwrap_or_default();
+    if coord_token.trim().is_empty() {
+        tracing::info!("no CHAPR_COORD_TOKEN set; a coordinator enforcing shared-secret auth will reject this endpoint");
+    }
+    let coord = CoordClient::new(&coord_url)
+        .with_principal(principal.as_str())
+        .with_token(coord_token);
 
     // Where unexpected failures land locally (E-026). Logged at start-up because a
     // support path nobody can find is not a support path.

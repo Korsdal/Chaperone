@@ -15,6 +15,10 @@ agent-initiated change **attributable** (stamped with the AD principal that caus
 The workload is read-heavy by design — agents read large materials (PDFs, tenders, proposals) and
 write rarely, into smaller derived artifacts.
 
+**Chaperone targets on-prem fileservers.** The gap it fills is agent collaboration on infrastructure
+that sits in nobody's cloud control plane — which is also where data sovereignty for a small or
+mid-sized business actually lives. Cloud backends are deferred, not in progress.
+
 > [!NOTE]
 > Chaperone is a collaboration/sync engine that values security and traceability — **not a security
 > tool**. The audit trail proves a user is responsible for their agents (accountability), not
@@ -150,22 +154,30 @@ Tests and clippy are green on **Windows and Linux** (see the CI badge), with the
 passing on the SMB and POSIX backends.
 
 > [!NOTE]
-> **macOS is built in CI but has never been run.** It compiles down the same POSIX path as Linux —
-> nothing in the endpoint is Linux-specific — but treat those artifacts as compile-verified only.
+> **macOS runs the POSIX path in CI, not the SMB one.** The unit suite and the end-to-end job both
+> run on macOS, so the artifacts are no longer compile-only — but POSIX uses *advisory* `flock`,
+> so none of it covers a Mac driving an SMB share. Invariant 3 is proven on Windows against a real
+> SMB share, and nowhere else.
 
 <details>
 <summary>Known remaining work</summary>
 
-- Real **Kerberos/Negotiate** on the control channel — needs a domain to develop against.
+- **The acting user is authenticated but not verified.** The control channel enforces a
+  per-deployment shared secret, so a stranger on the network is refused — but an endpoint holding
+  that secret can still name any principal, and the blob store applies no ACL check to an
+  authenticated caller. Real **Kerberos/Negotiate** (or OIDC) is what makes identity verified, and
+  needs a domain to develop against. See [security notes](docs/security.md).
 - **Mapped drive letters** resolve to UNC via `WNetGetUniversalNameW`, but that path is unconfirmed
   against a real server. The self-test reports it as SKIP rather than pass, which is the point.
 - **DFS resolution is not implemented.** It was not needed for the first deployment; a DFS namespace
   would need it before rollout.
 - **MCPB signing is broken upstream**, so bundles ship unsigned and Claude Desktop reports every
   bundle as unsigned regardless. Accountability rests on the audit trail.
-- **Delivering a large PDF's *content* to a model is unsolved.** The bytes arrive base64, which is
-  not analysable — either an `EmbeddedResource` content block or `ReadContent::Ref` needs to become
-  real, or PDF reading stays outside the tool surface. See
+- **Delivering a large PDF's *content* to a model is unsolved.** `chapr_read` now refuses binary
+  containers outright rather than returning unanalysable base64 a model would confabulate from, and
+  points at a text mirror instead — but producing that mirror is upstream work, not Chaperone's.
+  Either an `EmbeddedResource` content block or `ReadContent::Ref` would have to become real for
+  PDF reading to move inside the tool surface. See
   [Read limits](docs/architecture.md#read-limits-and-what-a-model-can-write-back).
 
 </details>
@@ -175,7 +187,7 @@ passing on the SMB and POSIX backends.
 | | |
 | --- | --- |
 | **In (v1)** | The tool surface above; leases with renewal and all-or-none ordered sets; intent journal with lazy and proactive recovery; content-addressed history with restore-to-copy; conflict registry; audit log; whole-file dedup; the untrusted-data envelope on reads; SMB and POSIX backends |
-| **Deferred** | ACL-aware metadata index (v2), chunked dedup (v2), cell-level xlsx CAS (v2), dashboard push (v2), coord HA (v3), cloud backends |
+| **Deferred** | ACL-aware **linkage** index (v2 — relationships between documents; lexical/semantic retrieval is out), chunked dedup (v2), cell-level xlsx CAS (v2), dashboard push (v2), coord HA (v3), cloud backends |
 | **Out of scope** | Cross-file atomic transactions, three-way merge of Office binaries, CRDT or character-level co-editing, multi-server replication |
 
 ## Build

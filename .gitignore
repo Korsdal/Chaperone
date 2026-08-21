@@ -57,8 +57,39 @@ desktop.ini
 # NOTE: the 2026-08-14 backup argument was real and is now live again — the
 # logbook is irreplaceable project memory sitting on one laptop. It needs a home
 # in a private repo.
+#
+# NOTE (2026-08-21) — REVERSED for the logbook, by jok: "add the logs to the repo,
+# they belong there for open source -> open project." `LOGBOOK.md` and `logbook/`
+# are now TRACKED. Everything above about them stands as history, not as policy.
+#
+# What made that safe rather than just decided: the customer-identifying strings
+# were scrubbed first — the deployable repo, the collaborator's plugin, its scripts
+# and its Danish folder names are now described by role instead of named. The
+# engineering reasoning never depended on the names. Named *people* stay: they are
+# this project's own contributors, listed in NOTICE.
+#
+# What is deliberately still public-by-choice inside it: open issue narratives with
+# exact file:line locations, including unfixed ones. That is consistent with
+# docs/security.md, which already says there is no embargo process because
+# pretending otherwise would be theatre.
+#
+# `CLAUDE.md` stays untracked — it is agent instructions, not project memory, and
+# nobody asked for it. That is a separate call if it ever comes up.
+# NOTE (2026-08-21): `specs/` consolidates everything that is jok's *working
+# material* rather than documentation — the original architecture/implementation
+# specs, the 0.2→0.5 plan and its review, design inspiration, scratch HTML. It
+# replaces the per-file rules that used to list `docs/init spec/` and
+# `docs/status.html`.
+#
+# The dividing line, and the reason `docs/` is now short: **`docs/` holds what a
+# reader needs; `specs/` holds what development ran on.** A whole DIRECTORY again,
+# for D-036's reason — a scratch file added later cannot slip into the public repo
+# by nobody remembering to add a line.
+#
+# Known consequence, unchanged by the move: the code cites ~30 `§n` anchors that
+# point into `specs/fmcp-architecture-concept.md`, so those references do not
+# resolve for a public reader. Publishing that one spec is roadmap item 2.3's
+# remaining half — it is language-agnostic architecture, not customer material.
 .claude/
-docs/init spec/
-docs/status.html
+specs/
 CLAUDE.md
-LOGBOOK.md

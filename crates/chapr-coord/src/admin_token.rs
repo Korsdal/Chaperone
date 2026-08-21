@@ -50,21 +50,31 @@ pub fn path_in(dir: &Path) -> PathBuf {
 /// Idempotent: a coordinator that restarts keeps the token an administrator has
 /// already been given. Only [`rotate`] replaces it.
 pub fn load_or_create(dir: &Path) -> io::Result<String> {
-    let path = path_in(dir);
-    match std::fs::read_to_string(&path) {
+    load_or_create_at(&path_in(dir))
+}
+
+/// The generic core, shared with [`crate::endpoint_token`].
+///
+/// Extracted rather than duplicated: the "empty file is a half-written file"
+/// rule and the 0600 best-effort below are exactly the properties a second
+/// credential in the same directory needs, and a copy of them would be a copy
+/// that drifts.
+pub(crate) fn load_or_create_at(path: &Path) -> io::Result<String> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    match std::fs::read_to_string(path) {
         Ok(existing) => {
             let trimmed = existing.trim().to_string();
             if trimmed.is_empty() {
                 // An empty file is a half-written one; replace it rather than
                 // start up with a credential nobody can present.
-                write_new(&path)
+                write_new(path)
             } else {
                 Ok(trimmed)
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             std::fs::create_dir_all(dir)?;
-            write_new(&path)
+            write_new(path)
         }
         Err(e) => Err(e),
     }

@@ -207,6 +207,7 @@ async fn acquire(
 
 async fn release(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Path(lease_id): Path<String>,
 ) -> Result<Json<LeaseReleaseResponse>, ApiError> {
     lease::release(&st, &LeaseId::new_unchecked(lease_id)).await?;
@@ -215,6 +216,7 @@ async fn release(
 
 async fn renew(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Path(lease_id): Path<String>,
 ) -> Result<Json<LeaseRenewResponse>, ApiError> {
     let resp = lease::renew(&st, &LeaseId::new_unchecked(lease_id)).await?;
@@ -223,6 +225,7 @@ async fn renew(
 
 async fn resolve(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Json(req): Json<ResolveRequest>,
 ) -> Result<Json<ResolveResponse>, ApiError> {
     let resp = index::resolve(&st, req).await?;
@@ -231,6 +234,7 @@ async fn resolve(
 
 async fn refresh_index(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Json(req): Json<RefreshIndexRequest>,
 ) -> Result<StatusCode, ApiError> {
     index::refresh(&st, &req.path, &req.version, req.mtime, req.size).await?;
@@ -257,6 +261,7 @@ async fn open_journal(
 
 async fn clear_journal(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Json(req): Json<ClearJournalRequest>,
 ) -> Result<StatusCode, ApiError> {
     journal::clear(&st, &req.path).await?;
@@ -282,6 +287,7 @@ async fn recover_journal(
 /// `Bytes` must be the final extractor.
 async fn put_blob(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     body: Bytes,
 ) -> Result<Json<PutBlobResponse>, ApiError> {
     let stored = history::put_blob(&st.blob_root, &body).await?;
@@ -559,7 +565,7 @@ async fn put_settings(
         .partition(|f| crate::config::RELOADABLE_FIELDS.contains(f));
 
     if applied.contains(&"auth") || applied.contains(&"auth_fallback") {
-        st.set_auth(crate::auth::from_config(&next));
+        st.set_auth(crate::auth::from_config(&next, st.endpoint_token().as_deref()));
         tracing::warn!(
             auth = %next.auth,
             fallback = next.auth_fallback.as_deref().unwrap_or("-"),
@@ -785,6 +791,7 @@ async fn register_conflict(
 
 async fn query_conflicts(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Json(req): Json<ConflictsQuery>,
 ) -> Result<Json<ConflictsResponse>, ApiError> {
     let conflicts = crate::conflict::list(&st.pool, &req.scope).await?;
@@ -831,6 +838,7 @@ async fn move_paths(
 
 async fn record_read(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Json(req): Json<ReadReceipt>,
 ) -> Result<StatusCode, ApiError> {
     crate::reads::record(&st, &req.session_id, &req.path, &req.version).await?;
@@ -839,6 +847,7 @@ async fn record_read(
 
 async fn assert_read(
     State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
     Json(req): Json<ReadReceipt>,
 ) -> Result<StatusCode, ApiError> {
     crate::reads::assert(&st.pool, &req.session_id, &req.path, &req.version).await?;
@@ -1297,7 +1306,7 @@ mod tests {
         cfg.source = Some(path);
         AppState::new(db::test_pool().await)
             .with_admin_token(TEST_TOKEN)
-            .with_auth(crate::auth::from_config(&cfg))
+            .with_auth(crate::auth::from_config(&cfg, None))
             .with_config(cfg)
     }
 
@@ -1983,6 +1992,208 @@ mod tests {
         let who: Vec<&str> = g.occurrences.iter().map(|o| o.principal.as_str()).collect();
         assert_eq!(who, vec!["CONTOSO\\authed"]);
         assert!(!who.contains(&"CONTOSO\\spoofed"));
+    }
+
+    /// **The criterion for 1.1.** The old one — "an unauthenticated
+    /// `GET /blobs/{version}` returns 401" — already passed before any of this
+    /// existed, because `trusted-header` 401s a request with no header at all. It
+    /// could go green while the actual hole stayed open, which is the wrong shape
+    /// for an acceptance test.
+    ///
+    /// This is the shape that can only pass once a credential is genuinely
+    /// verified: a **syntactically valid but unissued** token is refused, on every
+    /// route that carries content, history or a mutation.
+    #[tokio::test]
+    async fn a_valid_but_unissued_credential_is_refused_everywhere_it_matters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = "a".repeat(64);
+        let state = AppState::new(db::test_pool().await)
+            .with_blob_root(tmp.path().to_path_buf())
+            .with_auth(std::sync::Arc::new(crate::auth::SharedSecretAuth {
+                expected: issued.clone(),
+            }));
+
+        // Well-formed, right length, right shape — and never issued.
+        let forged = "b".repeat(64);
+        let version = VersionToken::hash(b"a pre-image nobody should be able to fetch");
+        let path = "\\\\srv\\share\\a.md";
+
+        // Every route reachable from the network that serves content, hands out
+        // version hashes, or mutates coordination state. The two the original
+        // roadmap never mentioned are here on purpose: `POST /journal/clear`
+        // destroys crash-recovery state, `PUT /blobs` writes into the content
+        // store, and both carried no extractor at all.
+        let cases: Vec<(&str, String, Body)> = vec![
+            ("GET", format!("/blobs/{version}"), Body::empty()),
+            ("PUT", "/blobs".into(), Body::from("bytes")),
+            ("POST", "/history".into(), body_json(&serde_json::json!({"path": path}))),
+            (
+                "POST",
+                "/version-log".into(),
+                body_json(&serde_json::json!({"path": path})),
+            ),
+            (
+                "POST",
+                "/resolve".into(),
+                body_json(&serde_json::json!({"path": path, "mtime": "2026-08-21T00:00:00Z", "size": 1})),
+            ),
+            (
+                "POST",
+                "/conflicts/query".into(),
+                body_json(&serde_json::json!({"scope": path})),
+            ),
+            (
+                "POST",
+                "/journal/clear".into(),
+                body_json(&serde_json::json!({"path": path})),
+            ),
+            (
+                "PUT",
+                "/index".into(),
+                body_json(&serde_json::json!({"path": path, "version": version.to_string(), "mtime": "2026-08-21T00:00:00Z", "size": 1})),
+            ),
+            ("DELETE", "/leases/some-lease".into(), Body::empty()),
+            ("POST", "/leases/some-lease/renew".into(), Body::empty()),
+            ("POST", "/reads".into(), body_json(&serde_json::json!({"session_id": "s", "path": path, "version": version.to_string()}))),
+            ("POST", "/reads/assert".into(), body_json(&serde_json::json!({"session_id": "s", "path": path, "version": version.to_string()}))),
+        ];
+
+        for (method, uri, body) in cases {
+            let req = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {forged}"))
+                .header("x-chapr-principal", "CONTOSO\\attacker")
+                .body(body)
+                .unwrap();
+            assert_eq!(
+                router(state.clone()).oneshot(req).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} accepted a token that was never issued"
+            );
+        }
+    }
+
+    /// The other half: the issued token *works*. A gate that refuses everything
+    /// would pass the test above and ship a dead coordinator.
+    #[tokio::test]
+    async fn the_issued_credential_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = "c".repeat(64);
+        let state = AppState::new(db::test_pool().await)
+            .with_blob_root(tmp.path().to_path_buf())
+            .with_auth(std::sync::Arc::new(crate::auth::SharedSecretAuth {
+                expected: issued.clone(),
+            }));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/conflicts/query")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {issued}"))
+            .header("x-chapr-principal", "CONTOSO\\alice")
+            .body(body_json(&serde_json::json!({"scope": "\\\\srv\\share"})))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "the issued token must actually admit a request"
+        );
+    }
+
+    /// Both halves are required, and the token is checked first. A caller with the
+    /// secret but no principal has nothing to attribute the action to; a caller
+    /// with a principal and no secret is the stranger this whole item is about.
+    #[tokio::test]
+    async fn the_token_and_the_principal_are_both_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = "d".repeat(64);
+        let state = AppState::new(db::test_pool().await)
+            .with_blob_root(tmp.path().to_path_buf())
+            .with_auth(std::sync::Arc::new(crate::auth::SharedSecretAuth {
+                expected: issued.clone(),
+            }));
+
+        let only_token = Request::builder()
+            .method("POST")
+            .uri("/conflicts/query")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {issued}"))
+            .body(body_json(&serde_json::json!({"scope": "\\\\srv\\share"})))
+            .unwrap();
+        assert_eq!(
+            router(state.clone()).oneshot(only_token).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "a secret with no principal leaves the audit trail with nobody to name"
+        );
+
+        let only_principal = Request::builder()
+            .method("POST")
+            .uri("/conflicts/query")
+            .header("content-type", "application/json")
+            .header("x-chapr-principal", "CONTOSO\\attacker")
+            .body(body_json(&serde_json::json!({"scope": "\\\\srv\\share"})))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(only_principal).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "this is the exact request that used to succeed"
+        );
+    }
+
+    /// `/healthz` and `GET /admin` stay open on purpose, and that has to be
+    /// deliberate rather than an oversight: monitoring must work without a
+    /// credential, and the admin page is where the admin token gets typed in.
+    #[tokio::test]
+    async fn healthz_and_the_admin_page_stay_reachable_under_enforcement() {
+        let state = AppState::new(db::test_pool().await).with_auth(std::sync::Arc::new(
+            crate::auth::SharedSecretAuth { expected: "e".repeat(64) },
+        ));
+        for uri in ["/healthz", "/admin"] {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            assert_eq!(
+                router(state.clone()).oneshot(req).await.unwrap().status(),
+                StatusCode::OK,
+                "{uri} must not need a credential"
+            );
+        }
+    }
+
+    /// The cutover D-031 asks for: run the new mode with the old one as fallback,
+    /// and each request reports which one admitted it. Without this an
+    /// administrator cannot tell a finished cutover from one where every endpoint
+    /// is quietly failing over.
+    #[tokio::test]
+    async fn a_shared_secret_cutover_reports_which_mode_admitted_each_request() {
+        use crate::auth::Authenticator;
+        let issued = "f".repeat(64);
+        let layered = crate::auth::LayeredAuth {
+            primary: std::sync::Arc::new(crate::auth::SharedSecretAuth {
+                expected: issued.clone(),
+            }),
+            fallback: std::sync::Arc::new(crate::auth::TrustedHeaderAuth),
+        };
+        assert_eq!(layered.mode(), "shared-secret", "the primary names the cutover");
+
+        let mut with_token = axum::http::HeaderMap::new();
+        with_token.insert("authorization", format!("Bearer {issued}").parse().unwrap());
+        with_token.insert("x-chapr-principal", "CONTOSO\\alice".parse().unwrap());
+        assert_eq!(
+            layered.authenticate(&with_token).unwrap().mode,
+            "shared-secret",
+            "an upgraded endpoint must show up on the new mode"
+        );
+
+        // A laptop that has not been given the token yet still works, and is
+        // visibly still on the old mode — which is what tells the administrator
+        // the cutover is not finished.
+        let mut header_only = axum::http::HeaderMap::new();
+        header_only.insert("x-chapr-principal", "CONTOSO\\bob".parse().unwrap());
+        assert_eq!(
+            layered.authenticate(&header_only).unwrap().mode,
+            "trusted-header"
+        );
     }
 
     #[tokio::test]

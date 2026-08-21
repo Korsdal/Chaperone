@@ -44,13 +44,22 @@ touches coord.
 3. Answer four questions: **listen address**, **hostname the laptops connect to**,
    **share to coordinate**, and whether to run the change-watcher. The first two are
    separate on purpose — a bind address is not a URL (D-032).
-4. Choose the **backend** coord announces (`smb`/`posix`) and the **auth** mode
-   (`trusted-header` for the MVP — zero end-user setup; `negotiate`/`oidc` to
-   harden later, E-015).
-5. Read the handover it prints. It is the whole set of things to pass on: the admin
+4. Choose the **backend** coord announces (`smb`/`posix`) and the **auth** mode.
+   The default is `shared-secret`: endpoints must present this deployment's token,
+   which the handover prints. `trusted-header` is the older posture and accepts any
+   principal header from anyone who can reach the port; `negotiate`/`oidc` are the
+   hardening paths that make the acting identity verified rather than asserted
+   (E-015). Changing the mode on a **live** deployment is a cutover via
+   `auth_fallback`, never a switch — see the admin page section below.
+5. Confirm **TLS**, which defaults to yes and generates a self-signed pair. Say no
+   only deliberately: the control channel carries the principal header that stamps
+   the audit trail and the pre-image bytes of every write, and coord warns at every
+   start while it is serving plaintext. A self-signed certificate still has to be
+   trusted on the laptops — an internal CA is the better answer if you have one.
+6. Read the handover it prints. It is the whole set of things to pass on: the admin
    token, the coordinator URL, the coordinated share, where both logs live, and what
    to back up.
-6. Verify: `GET /healthz` → `ok`, **from a laptop** rather than from the coordinator
+7. Verify: `GET /healthz` → `ok`, **from a laptop** rather than from the coordinator
    itself. Loopback working proves nothing about what a user will experience.
 
 ## Step 2 — Endpoints

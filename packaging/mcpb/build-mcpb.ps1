@@ -44,7 +44,7 @@
   ./build-mcpb.ps1 -Manifest ./manifest.json -Pack
 
 .EXAMPLE
-  ./build-mcpb.ps1 -Template ./manifest.template.json -Version 0.1.1 -Pack `
+  ./build-mcpb.ps1 -Template ./manifest.template.json -Version 0.1.2 -Pack `
                    -Output ./chaperone-endpoint.mcpb
 #>
 [CmdletBinding()]

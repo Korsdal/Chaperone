@@ -28,11 +28,18 @@ jobs:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
-      # Both platforms report. A Windows failure must not hide a Linux one —
+      # Every platform reports. A Windows failure must not hide a Linux one —
       # the SMB and POSIX backends fail in genuinely different places.
+      #
+      # macOS joined 2026-08-21 (I-012). It had been in the *release* matrix while
+      # `chapr-endpoint`'s suite had never executed there at all: cargo stops at the
+      # first failing test binary, so coord's failure hid the endpoint's on every
+      # macOS run. That gap already produced one genuine safety bug — the data-dir
+      # hardening was fooled by `/var` being a symlink into `/private` and tried to
+      # chmod a shared system directory.
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +57,185 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  e2e:
+    # What `cargo test` structurally cannot prove.
+    #
+    # The correctness core is exclusive-open + CAS under one held handle, journal
+    # recovery, and conflict sidecars — all of which need two real processes, a real
+    # coordinator and a real filesystem. Every one of the 364 unit tests runs
+    # against a mock or a tempdir, and before this job the `examples/` suites were
+    # compiled by `--all-targets` and then never executed. Invariants 3 and 4 were
+    # field-verified exactly once, by hand, at one customer.
+    #
+    # The Windows leg is the one that matters most: it runs against a real SMB share
+    # (`\\<runner>\chaprci`), so `CreateFileW` with FILE_SHARE_NONE is exercised
+    # against a real SMB server rather than local NTFS. That is the first automated
+    # check of the mandatory lock the whole write path rests on.
+    name: e2e (${{ matrix.os }}, ${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: posix
+            exe: ""
+          - os: windows-latest
+            backend: smb
+            exe: ".exe"
+          # macOS runs the POSIX leg, and the limit is worth stating rather than
+          # implying: POSIX uses **advisory** `flock`, so a green run here proves the
+          # endpoint drives a shared filesystem without crashing — it proves nothing
+          # about invariant 3 for a Mac talking to an SMB share, which is the
+          # realistic Mac deployment. The self-test agrees: its mandatory-lock check
+          # reports SKIP off Windows, and a SKIP is not a pass.
+          - os: macos-latest
+            backend: posix
+            exe: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries and smoke suites
+        run: cargo build --workspace --all-targets
+
+      # The only genuinely OS-specific step. Everything below is `shell: bash`,
+      # which the Windows runner also has — the suites care about the backend and
+      # the path, not the shell.
+      - name: Create the share (POSIX)
+        if: matrix.backend == 'posix'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/chapr-share /tmp/chapr-coord
+          echo "SMOKE_DIR=/tmp/chapr-share" >> "$GITHUB_ENV"
+          # The self-test FAILS a loopback coordinator URL by design (D-032), so
+          # this job has to advertise a real hostname — and on a fresh runner,
+          # macOS especially, that name does not reliably resolve. Pin it instead
+          # of depending on the image's resolver, or the leg fails on DNS rather
+          # than on anything Chaperone did.
+          HOST=$(hostname)
+          grep -q "[[:space:]]$HOST\$" /etc/hosts \
+            || echo "127.0.0.1 $HOST" | sudo tee -a /etc/hosts >/dev/null
+
+      - name: Create the share (SMB)
+        if: matrix.backend == 'smb'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force C:\chapr-share, C:\chapr-coord | Out-Null
+          # A real SMB share, reached over the network stack by its UNC name. A
+          # local NTFS path would exercise the same code and prove much less: the
+          # question this job exists to answer is whether the SMB *server* honours
+          # the mandatory lock.
+          New-SmbShare -Name chaprci -Path C:\chapr-share -FullAccess Everyone | Out-Null
+          "SMOKE_DIR=\\$env:COMPUTERNAME\chaprci" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Write the coordinator config
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The hostname, never 127.0.0.1. `public_url` is what an endpoint is told
+          # to connect to, and the self-test FAILS a loopback one on purpose
+          # (D-032) — so a loopback config here would fail the job for the wrong
+          # reason. `validate` also refuses a loopback URL on a reachable listener.
+          HOST=$(hostname)
+          DIR=$([ "${{ matrix.backend }}" = "smb" ] && echo "C:/chapr-coord" || echo "/tmp/chapr-coord")
+          cat > "$DIR/coord.toml" <<EOF
+          db_url = "sqlite:$DIR/coord.db?mode=rwc"
+          addr = "0.0.0.0:18899"
+          public_url = "http://$HOST:18899"
+          blob_root = "$DIR/blobs"
+          auth = "disabled"
+          backend = "${{ matrix.backend }}"
+          EOF
+          echo "COORD_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "CHAPR_COORD_URL=http://$HOST:18899" >> "$GITHUB_ENV"
+          echo "CHAPR_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+
+      # Phase 1 — the coordination invariants, against an unauthenticated
+      # coordinator. Auth is deliberately out of the way here: these suites
+      # simulate four users from one process, and entangling that with credentials
+      # would weaken both tests. Enforcement gets its own phase below.
+      - name: Start the coordinator (auth disabled)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/chapr-coord${{ matrix.exe }} serve --config "$COORD_DIR/coord.toml" \
+            > "$COORD_DIR/coord.log" 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf "$CHAPR_COORD_URL/healthz" >/dev/null && break
+            sleep 1
+          done
+          curl -sf "$CHAPR_COORD_URL/healthz" || { cat "$COORD_DIR/coord.log"; exit 1; }
+
+      - name: Smoke — lifecycle, CAS conflict, sidecar, history, restore, move
+        shell: bash
+        run: cargo run -q -p chapr-endpoint --example smoke_parts
+
+      - name: Smoke — size ladder to 16 MiB, four concurrent writers on one path
+        shell: bash
+        run: cargo run -q -p chapr-endpoint --example smoke_pilot
+
+      # Phase 2 — the shipped auth posture, end to end through the real binaries.
+      # `chapr-endpoint self-test` is what a customer runs, and it carries the two
+      # checks no unit test can make: two sessions contending on one file, and
+      # whether the server refuses a second exclusive open while the first is held.
+      - name: Restart the coordinator with auth enforced
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkill -f chapr-coord || taskkill //IM chapr-coord.exe //F || true
+          sleep 2
+          sed -i 's/auth = "disabled"/auth = "shared-secret"/' "$COORD_DIR/coord.toml"
+          ./target/debug/chapr-coord${{ matrix.exe }} serve --config "$COORD_DIR/coord.toml" \
+            > "$COORD_DIR/coord-auth.log" 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf "$CHAPR_COORD_URL/healthz" >/dev/null && break
+            sleep 1
+          done
+          grep -q "endpoint token ready" "$COORD_DIR/coord-auth.log" \
+            || { cat "$COORD_DIR/coord-auth.log"; echo "::error::no endpoint token"; exit 1; }
+
+      - name: Enforcement — a stranger and a forged token are both refused
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLOB="$CHAPR_COORD_URL/blobs/$(printf 'a%.0s' $(seq 64))"
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+          # Open on purpose: monitoring must not need a credential.
+          [ "$(code "$CHAPR_COORD_URL/healthz")" = 200 ] || { echo "::error::/healthz must stay open"; exit 1; }
+
+          # The request that used to succeed against any coordinator on the network.
+          got=$(code -H 'X-Chapr-Principal: CONTOSO\attacker' "$BLOB")
+          [ "$got" = 401 ] || { echo "::error::a principal header alone was accepted ($got)"; exit 1; }
+
+          # Well-formed, right length, never issued.
+          got=$(code -H "Authorization: Bearer $(printf 'b%.0s' $(seq 64))" \
+                     -H 'X-Chapr-Principal: CONTOSO\attacker' "$BLOB")
+          [ "$got" = 401 ] || { echo "::error::an unissued token was accepted ($got)"; exit 1; }
+
+          # A mutating route that carried no guard at all before this landed.
+          got=$(code -X POST -H 'Content-Type: application/json' \
+                     -d '{"path":"//srv/share/a.md"}' "$CHAPR_COORD_URL/journal/clear")
+          [ "$got" = 401 ] || { echo "::error::journal/clear was reachable unauthenticated ($got)"; exit 1; }
+
+      - name: Self-test — contention and the mandatory lock, via the shipped binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CHAPR_COORD_TOKEN=$(tr -d '\r\n' < "$COORD_DIR/endpoint-token")
+          export CHAPR_SELFTEST_DIR="$SMOKE_DIR"
+          export CHAPR_ROOT="$SMOKE_DIR"
+          ./target/debug/chapr-endpoint${{ matrix.exe }} self-test
+
+      - name: Coordinator logs
+        if: always()
+        shell: bash
+        run: tail -n 100 "$COORD_DIR"/coord*.log || true
 
   msrv:
     # Builds with exactly the toolchain Cargo.toml declares, read FROM Cargo.toml
@@ -82,3 +268,10 @@ jobs:
 
       - name: Build with the declared minimum toolchain
         run: cargo build --workspace --all-targets
+
+      # Build-only left a gap: an MSRV break that only shows up in a test body —
+      # a newer `assert` form, a stabilised method used in a fixture — compiled
+      # here and failed for whoever provisioned a box from the README. Tests are
+      # cheap on top of a build that already happened.
+      - name: Test with the declared minimum toolchain
+        run: cargo test --workspace

@@ -157,6 +157,12 @@ pub struct AppState {
     /// administrative surface fail closed rather than open. Behind a lock because
     /// rotation replaces it on a running coordinator.
     admin_token: Arc<RwLock<Option<String>>>,
+    /// The deployment's endpoint token (the shared secret on the control channel),
+    /// or `None` if none was established. Held here so a settings reload can
+    /// rebuild the authenticator without re-reading the file. Not behind rotation:
+    /// rotating it invalidates every laptop at once, so it is a redeploy, not a
+    /// button (see [`crate::endpoint_token`]).
+    endpoint_token: Arc<RwLock<Option<String>>>,
     /// The configuration this coordinator is running. Held so the settings surface
     /// can render and rewrite it, and so the overview can answer "what is this
     /// coordinator set up for" — the first question in any support call.
@@ -185,6 +191,7 @@ impl AppState {
             auth: Arc::new(RwLock::new(Arc::new(DisabledAuth) as Arc<dyn Authenticator>)),
             auth_usage: Arc::new(AuthUsage::default()),
             admin_token: Arc::new(RwLock::new(None)),
+            endpoint_token: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(Config::default())),
             backend_default: BackendKind::default(),
             backend_routes: Arc::new(Vec::new()),
@@ -224,6 +231,27 @@ impl AppState {
             Ok(slot) => slot.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// The endpoint token, if one was established.
+    pub fn endpoint_token(&self) -> Option<String> {
+        match self.endpoint_token.read() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Give this coordinator its endpoint token.
+    ///
+    /// No `set_` counterpart on purpose: rotating this invalidates every laptop at
+    /// once, so it is a redeploy rather than a button on a page.
+    pub fn with_endpoint_token(self, token: impl Into<String>) -> Self {
+        let token = Some(token.into());
+        match self.endpoint_token.write() {
+            Ok(mut slot) => *slot = token,
+            Err(poisoned) => *poisoned.into_inner() = token,
+        }
+        self
     }
 
     /// Replace the admin token (rotation).

@@ -16,12 +16,42 @@ use chapr_proto::BackendKind;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// TLS material for serving HTTPS (concept §13.1 transport). Both paths are
-/// PEM files the admin/PKI provides — the wizard does not generate certs.
+/// TLS material for serving HTTPS (concept §13.1 transport).
+///
+/// Both paths are PEM files, from one of two places: the admin's own CA, or
+/// `chapr-coord setup`, which offers a self-signed pair and takes it by default
+/// (`--tls-generate` non-interactively). TLS is the intended posture — the
+/// plaintext path exists, warns at every start, and is not what a deployment
+/// should be running.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TlsConfig {
     pub cert_path: String,
     pub key_path: String,
+}
+
+impl TlsConfig {
+    /// Check the PEM pair is present before the server tries to bind.
+    ///
+    /// Without this, a hand-written config naming a certificate that does not
+    /// exist fails deep inside `RustlsConfig::from_pem_file` as a bare
+    /// `NotFound`, with no indication of which of the two paths was wrong or what
+    /// to do about it. That matters more now that the shipped template enables
+    /// TLS: the first thing an operator does with the template is point it at
+    /// their own PKI, and the first thing they get wrong is a path.
+    pub fn preflight(&self) -> Result<(), String> {
+        for (label, path) in [("certificate", &self.cert_path), ("private key", &self.key_path)] {
+            if !Path::new(path).is_file() {
+                return Err(format!(
+                    "TLS is configured but the {label} is not there: {path}\n\
+                     Either run `chapr-coord setup` to generate a self-signed pair, point \
+                     cert_path/key_path at your own PEM files, or remove the [tls] section to \
+                     serve plaintext HTTP (not recommended — the control channel carries \
+                     principal headers and file pre-images)."
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A backend route: a canonical path prefix (a share root, e.g. `\\srv\share`)
@@ -55,7 +85,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
     pub blob_root: String,
-    /// Connection auth mode: `disabled` | `trusted-header` | `negotiate`.
+    /// Connection auth mode: `disabled` | `trusted-header` | `shared-secret` | `negotiate`.
     pub auth: String,
     pub reap_secs: u64,
     pub gc_secs: u64,
@@ -140,6 +170,21 @@ impl Config {
         };
         cfg.source = path.map(|p| p.to_path_buf());
         cfg.apply_overrides(|k| std::env::var(k).ok());
+
+        // Validate here, not at the call site. Both callers — `serve` and the
+        // Windows service — go straight on to start a server, and neither checked
+        // anything: the structural rules were enforced only by the setup wizard's
+        // `probe` and by the admin settings API. A **hand-written** config
+        // therefore bypassed all of them, which is precisely the config the shipped
+        // template invites, and precisely the one nobody reviews.
+        //
+        // Found by running `serve` against an https URL with no [tls] section and
+        // watching it start happily. That is the mistake the template's own
+        // "delete these three lines" instruction sets up, so the guard has to hold
+        // on this path or it does not hold anywhere that matters.
+        //
+        // After `apply_overrides`, so an env var cannot smuggle past the check.
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -309,9 +354,9 @@ impl Config {
             .into_iter()
             .flatten()
         {
-            if !matches!(name, "disabled" | "trusted-header" | "negotiate") {
+            if !matches!(name, "disabled" | "trusted-header" | "shared-secret" | "negotiate") {
                 return Err(ConfigError(format!(
-                    "unknown auth mode {name:?}; expected disabled, trusted-header or negotiate"
+                    "unknown auth mode {name:?}; expected disabled, trusted-header, shared-secret or negotiate"
                 )));
             }
         }
@@ -334,6 +379,34 @@ impl Config {
                 return Err(ConfigError(format!(
                     "public_url {raw:?} needs a scheme — e.g. http://{raw}"
                 )));
+            }
+
+            // Same category of mistake as the bind-address-as-URL above, and the
+            // same reason to refuse rather than warn: the service starts, and the
+            // only symptom is every laptop failing to connect.
+            //
+            // The realistic route in is editing a config rather than writing one.
+            // The shipped template enables TLS and advertises https; turning TLS
+            // off means deleting the [tls] block, and the scheme two screens up is
+            // exactly what gets left behind. The wizard already reconciles these
+            // two, so this only ever fires on a hand-edited file.
+            match (raw.starts_with("https://"), self.tls.is_some()) {
+                (true, false) => {
+                    return Err(ConfigError(format!(
+                        "public_url {raw:?} advertises https but no [tls] section is \
+                         configured, so this coordinator serves plain HTTP. Endpoints would be \
+                         handed a URL that cannot connect. Either configure [tls] (or run \
+                         `chapr-coord setup`), or change the scheme to http://."
+                    )));
+                }
+                (false, true) => {
+                    return Err(ConfigError(format!(
+                        "public_url {raw:?} advertises http but [tls] is configured, so this \
+                         coordinator serves HTTPS. Endpoints would be handed a URL that cannot \
+                         connect. Change the scheme to https://, or remove the [tls] section."
+                    )));
+                }
+                _ => {}
             }
             const UNREACHABLE: &[&str] = &["0.0.0.0", "127.0.0.1", "::", "::1", "localhost"];
             let host = url_host(raw);
@@ -541,6 +614,177 @@ mod tests {
         };
         let err = cfg.validate().expect_err("a bare host:port is not a URL");
         assert!(err.to_string().contains("needs a scheme"), "{err}");
+    }
+
+    /// The **shipped template must load.** Nothing checked this before, and it is
+    /// now load-bearing in a way it was not: `load` validates, so a template that
+    /// contradicts a validation rule is an install-time failure handed to a
+    /// customer. It also pins the template's own TLS posture — it advertises https
+    /// and enables [tls], and those two have to agree.
+    #[test]
+    fn the_shipped_config_template_loads_and_validates() {
+        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/coord/config.template.toml");
+        assert!(template.is_file(), "template moved: {}", template.display());
+
+        let cfg = Config::load(Some(&template)).expect("the shipped template must load");
+        assert!(cfg.tls.is_some(), "the template ships with TLS enabled");
+        assert!(
+            cfg.advertised_url().starts_with("https://"),
+            "and advertises it: {}",
+            cfg.advertised_url()
+        );
+    }
+
+    /// `load` must refuse a structurally invalid config, because both of its
+    /// callers go straight on to start a server.
+    ///
+    /// This was the actual hole: the rules were enforced by the setup wizard and
+    /// the admin settings API only, so a hand-written config — the one the template
+    /// invites — started a server with none of them checked. Found by running
+    /// `serve` against the bad config below and watching it come up.
+    #[test]
+    fn load_refuses_a_config_that_would_start_a_broken_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(
+            &bad,
+            "db_url = \"sqlite:./x.db?mode=rwc\"\n\
+             addr = \"0.0.0.0:18802\"\n\
+             public_url = \"https://coordtest:18802\"\n\
+             blob_root = \"./blobs\"\n\
+             auth = \"trusted-header\"\n\
+             backend = \"smb\"\n",
+        )
+        .unwrap();
+        let err = Config::load(Some(&bad)).expect_err("https with no [tls] must not load");
+        assert!(err.to_string().contains("advertises https"), "{err}");
+
+        // And the same file with the scheme corrected loads fine, so this is a
+        // real check rather than `load` having become unusable.
+        let good = dir.path().join("good.toml");
+        std::fs::write(
+            &good,
+            "db_url = \"sqlite:./x.db?mode=rwc\"\n\
+             addr = \"0.0.0.0:18802\"\n\
+             public_url = \"http://coordtest:18802\"\n\
+             blob_root = \"./blobs\"\n\
+             auth = \"trusted-header\"\n\
+             backend = \"smb\"\n",
+        )
+        .unwrap();
+        assert!(Config::load(Some(&good)).is_ok());
+    }
+
+    /// The trap the shipped template creates: TLS is on and advertised, so turning
+    /// it off means deleting the [tls] block — and the scheme two screens up is
+    /// what gets left behind. Same category as handing out the bind address: the
+    /// service starts and every laptop fails to connect.
+    #[test]
+    fn validate_refuses_an_https_url_with_no_tls_configured() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("https://FILESRV01:8787".into()),
+            tls: None,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("https advertised over plain HTTP");
+        let msg = err.to_string();
+        assert!(msg.contains("advertises https"), "{msg}");
+        assert!(msg.contains("cannot connect"), "must say what breaks: {msg}");
+        assert!(msg.contains("chapr-coord setup"), "must name the fix: {msg}");
+    }
+
+    /// And the mirror image, which is how a pre-TLS config looks after someone
+    /// adds a certificate and forgets the URL.
+    #[test]
+    fn validate_refuses_an_http_url_when_tls_is_configured() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("http://FILESRV01:8787".into()),
+            tls: Some(TlsConfig {
+                cert_path: "c.pem".into(),
+                key_path: "k.pem".into(),
+            }),
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("http advertised over HTTPS");
+        assert!(err.to_string().contains("advertises http but [tls]"), "{err}");
+    }
+
+    /// Both matching combinations stay legal — this must not become a rule that
+    /// only permits TLS. A deliberate plaintext deployment is still a deployment.
+    #[test]
+    fn validate_accepts_a_scheme_that_matches_the_tls_setting() {
+        let https = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("https://FILESRV01:8787".into()),
+            tls: Some(TlsConfig {
+                cert_path: "c.pem".into(),
+                key_path: "k.pem".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(https.validate().is_ok());
+
+        let http = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("http://FILESRV01:8787".into()),
+            tls: None,
+            ..Default::default()
+        };
+        assert!(http.validate().is_ok());
+    }
+
+    /// A derived `public_url` (none set) cannot contradict anything — the scheme
+    /// comes from the TLS setting itself.
+    #[test]
+    fn a_derived_url_needs_no_scheme_reconciliation() {
+        let cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: None,
+            tls: Some(TlsConfig {
+                cert_path: "c.pem".into(),
+                key_path: "k.pem".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.advertised_url().starts_with("https://"), "{}", cfg.advertised_url());
+    }
+
+    #[test]
+    fn tls_preflight_names_the_missing_file_and_the_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("coord.crt");
+        let key = dir.path().join("coord.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+
+        let tls = TlsConfig {
+            cert_path: cert.to_string_lossy().into(),
+            key_path: key.to_string_lossy().into(),
+        };
+        let err = tls.preflight().expect_err("the key is not there");
+        assert!(err.contains("private key"), "must say WHICH half: {err}");
+        assert!(err.contains("coord.key"), "must name the path: {err}");
+        assert!(err.contains("chapr-coord setup"), "must name the remedy: {err}");
+
+        // And the certificate half, so the two are not conflated.
+        let missing_cert = TlsConfig {
+            cert_path: dir.path().join("nope.crt").to_string_lossy().into(),
+            key_path: cert.to_string_lossy().into(),
+        };
+        assert!(missing_cert.preflight().unwrap_err().contains("certificate"));
+
+        // Present pair passes. A directory is not a file, which is the other way
+        // a path can look plausible and be wrong.
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\n").unwrap();
+        assert!(tls.preflight().is_ok());
+        let dir_as_cert = TlsConfig {
+            cert_path: dir.path().to_string_lossy().into(),
+            key_path: key.to_string_lossy().into(),
+        };
+        assert!(dir_as_cert.preflight().is_err(), "a directory is not a PEM file");
     }
 
     #[test]

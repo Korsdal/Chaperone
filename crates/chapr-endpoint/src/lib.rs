@@ -44,6 +44,7 @@ pub mod posixfs;
 pub mod read;
 pub mod selftest;
 pub mod server;
+pub mod sniff;
 #[cfg(windows)]
 pub mod winfs;
 pub mod write;

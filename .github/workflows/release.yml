@@ -75,11 +75,15 @@ jobs:
             platform: linux
             slug: linux-x86_64
             exe: ""
-          # Built, never run. Nothing in the endpoint is Linux-specific — there is
-          # no `cfg(target_os)`, `cfg(unix)` or `libc` use anywhere in it, so the
+          # Exercised on the POSIX path since 2026-08-21 (I-012): CI now runs the
+          # unit suite and the end-to-end job on macos-latest, so this is no longer
+          # a build-only artifact. Nothing in the endpoint is Linux-specific — no
+          # `cfg(target_os)`, `cfg(unix)` or `libc` use anywhere in it — so the
           # split is Windows vs not-Windows and macOS takes the same POSIX path.
-          # That makes it cheap to build and still unexercised, which the release
-          # notes say out loud rather than letting a green artifact imply testing.
+          #
+          # The remaining gap, stated because a green artifact must not imply more
+          # than it proves: POSIX uses **advisory** `flock`, so nothing here covers
+          # a Mac driving an SMB share, which is the realistic Mac deployment.
           - os: macos-latest
             platform: darwin
             slug: macos-arm64
@@ -273,9 +277,11 @@ jobs:
           - **Windows binaries link the CRT statically**, so no Visual C++ redistributable is
             needed — the trade is that CRT security fixes arrive with a Chaperone rebuild rather
             than via Windows Update.
-          - **The macOS artifacts are built, not exercised.** Nothing in the endpoint is
-            Linux-specific, so macOS takes the same POSIX path Linux does and compiles cleanly —
-            but no one has run it there. Treat it as untested rather than supported.
+          - **macOS is exercised on the POSIX path only.** CI runs the unit suite and the
+            end-to-end job (coordinator + smoke suites + self-test) on macOS, so these artifacts
+            are no longer build-only. But POSIX uses *advisory* \`flock\`: nothing covers a Mac
+            driving an SMB share. Invariant 3 — the mandatory lock the write path rests on — is
+            proven on Windows against a real SMB share, and nowhere else.
           - **Only Claude Desktop and Claude Code have been driven end to end.** The endpoint is a
             standard MCP server, so other hosts should work, and \`print-config generic\` emits the
             portable form — but "should" is not "does", and we do not test them.

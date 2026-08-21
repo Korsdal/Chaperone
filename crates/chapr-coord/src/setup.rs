@@ -102,12 +102,21 @@ fn default_data_dir() -> std::path::PathBuf {
 
 /// Build a config from defaults + any provided flags (the unattended baseline).
 fn config_from_args(args: &SetupArgs) -> Config {
-    // Wizard baseline: trusted-header is the MVP identity mode (D-024) — the
-    // endpoint auto-derives the logged-in user and coord stamps it into the audit
-    // trail. `--auth` overrides (e.g. `disabled` for a bare loopback demo,
-    // `negotiate`/`oidc` for the enforced hardening paths, E-015).
+    // Wizard baseline: `shared-secret`. It is the weakest mode that actually
+    // refuses a stranger, and a **new** install has no laptops to break, so
+    // defaulting to it costs one value in the handover and closes the hole that
+    // `trusted-header` leaves wide open (anyone who can reach the port acts as
+    // anyone). The endpoint still auto-derives the logged-in user (D-024), so the
+    // zero-config identity story is unchanged — a packager can bake the token into
+    // the bundle and users type nothing.
+    //
+    // Deliberately does not change existing installs: their config already names a
+    // mode, and switching one is a **cutover** via `auth_fallback` (D-031), never a
+    // flag day. `--auth` still overrides (`disabled` for a loopback demo,
+    // `trusted-header` for a deployment that wants the old posture, `negotiate` for
+    // E-015).
     let mut cfg = Config {
-        auth: "trusted-header".to_string(),
+        auth: "shared-secret".to_string(),
         ..Config::default()
     };
     if let Some(v) = &args.addr {
@@ -186,6 +195,13 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // After every path that can turn TLS on — interactive answer or
+    // `--tls-generate` — and before `probe`, which is where `validate` refuses a
+    // scheme that contradicts the TLS setting.
+    if let Some(url) = reconcile_public_url_scheme(&mut cfg) {
+        println!("  → coordinator URL is now {url}");
+    }
+
     println!("\nChecking the environment…");
     probe(&cfg).map_err(|e| format!("environment check failed: {e}"))?;
     println!("  ok");
@@ -209,6 +225,15 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map(|t| (t, crate::admin_token::path_in(&dir)))
             .map_err(|e| format!("could not create the admin token: {e}")),
         None => Err("no data directory (an in-memory database?), so no admin token".to_string()),
+    };
+
+    // The endpoint token, created here for exactly the reason above: before the
+    // door is locked. It is also the value every laptop needs, so a wizard that
+    // failed to create it has produced an install nobody can connect to — which is
+    // why the handover states it rather than leaving it to be discovered.
+    let endpoint_token = match cfg.data_dir() {
+        Some(dir) => crate::endpoint_token::load_or_create(&dir).ok(),
+        None => None,
     };
 
     // Before the service starts, so SQLite's WAL and the first blobs are created
@@ -236,7 +261,8 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         endpoint_snippet(
             &cfg,
-            token.as_ref().map(|(t, p)| (t.as_str(), p.as_path()))
+            token.as_ref().map(|(t, p)| (t.as_str(), p.as_path())),
+            endpoint_token.as_deref(),
         )
     );
 
@@ -303,17 +329,19 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
 
     // Default to trusted-header — the MVP identity mode (D-024): the endpoint
     // auto-derives the logged-in user, coord stamps it. Zero end-user setup.
-    let auth_opts = ["disabled", "trusted-header", "negotiate"];
+    let auth_opts = ["shared-secret", "trusted-header", "disabled", "negotiate"];
     let sel = Select::new()
         .with_prompt("Connection auth")
         .items(&auth_opts)
-        .default(1)
+        // Index 0 — shared-secret. The default is the one that refuses a stranger.
+        .default(0)
         .interact()?;
     cfg.auth = auth_opts[sel].to_string();
     match cfg.auth.as_str() {
+        "shared-secret" => println!("  ✓ Endpoints must present this deployment's token; the handover prints it. The acting user is still asserted rather than proven (that is E-015)."),
         "disabled" => println!("  ! warning: no connection auth — development / trusted-LAN only."),
-        "trusted-header" => println!("  ✓ MVP mode: endpoint asserts the logged-in OS identity (accountability, not spoof-proof — concept §13.1)."),
-        "negotiate" => println!("  ! note: enforced Negotiate/OIDC is deferred (E-015, D-024); use trusted-header for the MVP."),
+        "trusted-header" => println!("  ! warning: accepts ANY principal header from anyone who can reach the port. Accountability only, and not spoof-proof (concept §13.1)."),
+        "negotiate" => println!("  ! note: enforced Negotiate/OIDC is deferred (E-015, D-024); use shared-secret for now."),
         _ => {}
     }
 
@@ -370,17 +398,32 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
         println!("  ! warning: serving plaintext HTTP — not for production.");
     }
 
-    // The URL was echoed as `http://` before the TLS question was asked, so it has
-    // to be reconciled now. Handing out an `http://` URL for a service that only
-    // speaks TLS is the same class of mistake as handing out the bind address:
-    // a value that looks right and connects to nothing.
-    if cfg.tls.is_some() || generate_tls {
-        if let Some(url) = cfg.public_url.take() {
-            cfg.public_url = Some(url.replacen("http://", "https://", 1));
-            println!("  → coordinator URL is now {}", cfg.public_url.as_deref().unwrap_or(""));
-        }
-    }
     Ok(generate_tls)
+}
+
+/// Bring `public_url`'s scheme into line with whether TLS is configured.
+///
+/// Handing out an `http://` URL for a service that only speaks TLS is the same
+/// class of mistake as handing out the bind address: a value that looks right and
+/// connects to nothing. `Config::validate` now refuses the mismatch outright, so
+/// this has to run on **every** path that can enable TLS.
+///
+/// It used to live inside [`interactive_fill`], which is skipped entirely under
+/// `--non-interactive` — so `setup --non-interactive --tls-generate` produced TLS
+/// plus an `http://` URL. That combination was merely wrong before and is now
+/// fatal, which would have broken the scripted installer.
+///
+/// Deliberately one-directional. `https` with no TLS is *not* rewritten down to
+/// `http`: an operator who typed https and configured no certificate more likely
+/// wanted TLS than wanted plaintext, and silently downgrading the advertised
+/// scheme would hide that. `validate` refuses it and says so.
+fn reconcile_public_url_scheme(cfg: &mut Config) -> Option<String> {
+    cfg.tls.as_ref()?;
+    let url = cfg.public_url.take()?;
+    let fixed = url.replacen("http://", "https://", 1);
+    let changed = fixed != url;
+    cfg.public_url = Some(fixed);
+    changed.then(|| cfg.public_url.clone().unwrap_or_default())
 }
 
 /// Ask which share this coordinator fronts, offering what the machine serves.
@@ -860,7 +903,11 @@ fn print_manual_start(config_path: &Path) {
 /// change necessary was a *wrong line in this text*, shipped and unnoticed
 /// because nothing could read it back. `handover_never_advertises_a_bind_address`
 /// is the test that could not exist while this function only called `println!`.
-fn endpoint_snippet(cfg: &Config, token: Result<(&str, &Path), &String>) -> String {
+fn endpoint_snippet(
+    cfg: &Config,
+    token: Result<(&str, &Path), &String>,
+    endpoint_token: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     // Never `cfg.addr` — that is a bind address, and formatting it as a URL is
@@ -899,6 +946,40 @@ fn endpoint_snippet(cfg: &Config, token: Result<(&str, &Path), &String>) -> Stri
     }
 
     let _ = write!(s, "\n── Give this to the users ──\n  Coordinator URL:      {base}\n");
+    // The token belongs in *this* section, not with the admin token: it is not a
+    // secret for the administrator to keep, it is a value every laptop needs. An
+    // install whose handover omitted it would look complete and admit nobody.
+    match (cfg.auth.as_str(), endpoint_token) {
+        ("shared-secret", Some(t)) => {
+            let _ = write!(
+                s,
+                "  Coordinator token:    {t}\n    \
+                 The same value for everyone here — it proves a laptop is one of this\n    \
+                 deployment's endpoints, and is not a personal password. Without it this\n    \
+                 coordinator answers 401. A packager can bake it into the .mcpb so users\n    \
+                 type nothing; otherwise they paste it once, beside the URL.\n    \
+                 It does NOT make the acting user verified — that is E-015. What it stops\n    \
+                 is a stranger on the network acting as anyone at all.\n"
+            );
+        }
+        ("shared-secret", None) => {
+            let _ = write!(
+                s,
+                "  ! auth is \"shared-secret\" but no endpoint token could be created.\n    \
+                 This coordinator will refuse every endpoint. Fix the data directory's\n    \
+                 permissions and restart, or set auth = \"trusted-header\".\n"
+            );
+        }
+        _ => {
+            let _ = write!(
+                s,
+                "  Coordinator token:    (none — auth is \"{}\", which authenticates nobody)\n    \
+                 Anyone who can reach the port can act as any user. Acceptable only on a\n    \
+                 network where that is already true; switch to \"shared-secret\" otherwise.\n",
+                cfg.auth
+            );
+        }
+    }
     match cfg.share_unc.as_deref() {
         // The actual configured value, not an example of one. A handover that
         // prints `\\FILESRV\AICollab` leaves the administrator to work out what
@@ -961,6 +1042,68 @@ fn endpoint_snippet(cfg: &Config, token: Result<(&str, &Path), &String>) -> Stri
 mod tests {
     use super::*;
 
+    /// The regression that motivated pulling this out of `interactive_fill`.
+    /// `--non-interactive` skips that function entirely, so a scripted install with
+    /// `--tls-generate` built TLS plus an `http://` URL. Wrong before; fatal once
+    /// `validate` started refusing the mismatch. Asserted in both directions so the
+    /// test fails if either half regresses.
+    #[test]
+    fn non_interactive_tls_yields_a_config_that_validates() {
+        let mut cfg = Config {
+            addr: "0.0.0.0:8787".into(),
+            public_url: Some("http://FILESRV01:8787".into()),
+            tls: Some(TlsConfig {
+                cert_path: "c.pem".into(),
+                key_path: "k.pem".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "the unreconciled state must be the failure this guards against"
+        );
+
+        let changed = reconcile_public_url_scheme(&mut cfg);
+        assert_eq!(changed.as_deref(), Some("https://FILESRV01:8787"));
+        assert_eq!(cfg.public_url.as_deref(), Some("https://FILESRV01:8787"));
+        cfg.validate().expect("reconciled config must pass probe's validate");
+    }
+
+    #[test]
+    fn reconciling_is_idempotent_and_scoped() {
+        // Already https: nothing to report, nothing to change.
+        let mut https = Config {
+            public_url: Some("https://SRV:8787".into()),
+            tls: Some(TlsConfig { cert_path: "c".into(), key_path: "k".into() }),
+            ..Default::default()
+        };
+        assert_eq!(reconcile_public_url_scheme(&mut https), None);
+        assert_eq!(https.public_url.as_deref(), Some("https://SRV:8787"));
+
+        // No TLS: leave the URL exactly as typed, including an https one, so
+        // `validate` can object rather than this silently downgrading it.
+        let mut plaintext = Config {
+            public_url: Some("https://SRV:8787".into()),
+            tls: None,
+            ..Default::default()
+        };
+        assert_eq!(reconcile_public_url_scheme(&mut plaintext), None);
+        assert_eq!(
+            plaintext.public_url.as_deref(),
+            Some("https://SRV:8787"),
+            "a one-directional rewrite must not hide the operator's contradiction"
+        );
+
+        // A derived URL stays derived — the scheme comes from the TLS setting.
+        let mut derived = Config {
+            public_url: None,
+            tls: Some(TlsConfig { cert_path: "c".into(), key_path: "k".into() }),
+            ..Default::default()
+        };
+        assert_eq!(reconcile_public_url_scheme(&mut derived), None);
+        assert!(derived.public_url.is_none());
+    }
+
     #[test]
     fn config_from_args_applies_flags_and_tls() {
         let args = SetupArgs {
@@ -991,7 +1134,7 @@ mod tests {
             ..Config::default()
         };
         let path = std::path::Path::new("C:/ProgramData/Chaperone/admin-token");
-        let text = endpoint_snippet(&cfg, Ok(("tok-abc", path)));
+        let text = endpoint_snippet(&cfg, Ok(("tok-abc", path)), Some("endpoint-tok-xyz"));
 
         let handout = text
             .split("── Give this to the users ──")
@@ -1021,7 +1164,7 @@ mod tests {
     #[test]
     fn handover_says_so_when_no_share_was_recorded() {
         let cfg = Config::default();
-        let text = endpoint_snippet(&cfg, Err(&"no data directory".to_string()));
+        let text = endpoint_snippet(&cfg, Err(&"no data directory".to_string()), None);
         assert!(text.contains("not configured here"), "{text}");
         assert!(text.contains("refuse to show anything"), "{text}");
     }
@@ -1097,12 +1240,58 @@ mod tests {
     }
 
     #[test]
-    fn wizard_defaults_auth_to_trusted_header() {
-        // No --auth flag → the wizard baseline is trusted-header (MVP, D-024),
-        // even though the bare Config default is `disabled`.
+    fn wizard_defaults_auth_to_the_mode_that_refuses_a_stranger() {
+        // No --auth flag → the wizard baseline is `shared-secret`. Was
+        // `trusted-header` (D-024's MVP), which accepts any principal header from
+        // anyone who can reach the port; a new install has no laptops to break, so
+        // the default moved to the weakest mode that actually authenticates.
         let cfg = config_from_args(&SetupArgs::default());
-        assert_eq!(cfg.auth, "trusted-header");
-        assert_eq!(Config::default().auth, "disabled"); // serve/tests unaffected
+        assert_eq!(cfg.auth, "shared-secret");
+
+        // The bare `Config` default is still `disabled`, so `serve` with no config
+        // and the existing test fixtures are unaffected. Only new *installs* move.
+        assert_eq!(Config::default().auth, "disabled");
+
+        // And an operator can still ask for the old posture explicitly.
+        let opted_out = config_from_args(&SetupArgs {
+            auth: Some("trusted-header".into()),
+            ..Default::default()
+        });
+        assert_eq!(opted_out.auth, "trusted-header");
+    }
+
+    /// The token is a thing to hand to users, so it has to be *in* the handover.
+    /// An install whose handover omitted it would look complete and admit nobody.
+    #[test]
+    fn the_handover_states_the_endpoint_token_when_auth_needs_one() {
+        let cfg = Config {
+            auth: "shared-secret".into(),
+            public_url: Some("https://coord-01:8787".into()),
+            tls: Some(TlsConfig { cert_path: "c".into(), key_path: "k".into() }),
+            share_unc: Some(r"\\FILESRV\AICollab".into()),
+            ..Default::default()
+        };
+        let path = Path::new("C:/ProgramData/Chaperone/admin-token");
+        let text = endpoint_snippet(&cfg, Ok(("admin-tok", path)), Some("endpoint-tok-xyz"));
+        assert!(text.contains("endpoint-tok-xyz"), "the value itself must be printed");
+        assert!(text.contains("Coordinator token"));
+        assert!(
+            text.contains("not a personal password"),
+            "it is one value for everyone; saying so prevents a support call"
+        );
+        assert!(!text.contains("admin-tok\n  The same value"), "the two tokens must not be conflated");
+
+        // And when the mode does not need one, say that plainly rather than
+        // printing nothing — silence reads as "nothing to configure here".
+        let open = Config { auth: "trusted-header".into(), ..cfg.clone() };
+        let text = endpoint_snippet(&open, Ok(("admin-tok", path)), Some("unused"));
+        assert!(text.contains("authenticates nobody"), "{text}");
+        assert!(!text.contains("unused"), "an unused token must not be advertised");
+
+        // The failure case is the dangerous one: enforcing, with no token.
+        let broken = Config { auth: "shared-secret".into(), ..cfg };
+        let text = endpoint_snippet(&broken, Ok(("admin-tok", path)), None);
+        assert!(text.contains("refuse every endpoint"), "{text}");
     }
 
     #[test]

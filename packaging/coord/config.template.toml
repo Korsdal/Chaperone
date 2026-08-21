@@ -20,18 +20,36 @@ addr = "0.0.0.0:8787"
 # `127.0.0.1` are correct bind addresses and useless URLs. Leave it out and coord
 # derives it from this machine's hostname plus `addr`'s port, which is usually right.
 # Coord refuses to start with a loopback URL while `addr` listens for other machines.
-public_url = "http://FILESERVER:8787"
+# Note the scheme: https, to match the [tls] section below.
+public_url = "https://FILESERVER:8787"
 
 # Content-addressed history/blob store. A SEPARATE mount from the DB is
 # recommended (it grows with write volume). Back both up together.
 blob_root = "C:/ProgramData/Chaperone/blobs"
 
 # Control-channel auth (the pluggable Authenticator boundary):
-#   trusted-header  MVP: endpoint asserts the logged-in OS identity (accountability,
-#                   not spoof-proof — concept §13.1). The recommended default.
-#   disabled        no auth — loopback/dev only.
+#   shared-secret   RECOMMENDED. Endpoints must present this deployment's token,
+#                   AND name a principal. The token is created automatically on
+#                   first start, in the data directory beside the database, as
+#                   `endpoint-token`; coord logs the path. Give that value to every
+#                   laptop as CHAPR_COORD_TOKEN (a packager can bake it into the
+#                   .mcpb so users type nothing). It proves a caller is one of your
+#                   endpoints; it does NOT make the acting user verified — that is
+#                   E-015.
+#   trusted-header  Accepts ANY non-empty X-Chapr-Principal from ANYONE who can
+#                   reach this port. Attribution, not authentication. Only for a
+#                   network where that is already acceptable.
+#   disabled        no auth at all — loopback/dev only.
 #   negotiate|oidc  enforced hardening paths (deferred, E-015).
-auth = "trusted-header"
+#
+# Changing this on a LIVE deployment is a cutover, not a switch: set the new mode
+# here, keep the old one as auth_fallback below, watch the Settings tab until
+# nothing arrives on the fallback, then remove it (D-031).
+auth = "shared-secret"
+
+# The old mode, kept reachable during a cutover. Remove it once the Settings tab
+# shows no fallback use AND no rejections.
+# auth_fallback = "trusted-header"
 
 # The fileserver backend coord ANNOUNCES to endpoints (they confirm it locally).
 # smb | posix.
@@ -52,10 +70,24 @@ share_unc = "\\\\FILESERVER\\Share"
 # setting because they are distinct things.
 # watch_dir  = "\\\\fileserver\\share"
 
-# --- Optional: TLS (serve HTTPS on the control channel) ---
-# [tls]
-# cert_path = "C:/ProgramData/Chaperone/tls/coord.crt"
-# key_path  = "C:/ProgramData/Chaperone/tls/coord.key"
+# --- TLS on the control channel. ON by default; opting out is a real decision. ---
+# The control channel carries the principal header that stamps the audit trail and
+# the pre-image bytes of every write. Over plain HTTP all of it is readable on the
+# wire, and any credential on it is theatre.
+#
+# The easy path is `chapr-coord setup`, which generates a self-signed pair, writes
+# these paths, and sets public_url to https for you. Use this template instead when
+# you are supplying your own PEM pair from your CA — point the two paths at it.
+#
+# Coord refuses to start if either file is missing, and says which one.
+#
+# To serve plaintext anyway: delete these three lines AND change public_url above
+# back to http://. Coord refuses to start on a mismatch — an https URL served over
+# plain HTTP is a value that looks right and connects to nothing. It will also log a
+# warning at every start, which is deliberate and is not a bug to be silenced.
+[tls]
+cert_path = "C:/ProgramData/Chaperone/tls/coord.crt"
+key_path  = "C:/ProgramData/Chaperone/tls/coord.key"
 
 # --- Optional: mixed-backend routing (longest-prefix wins; else `backend`) ---
 # [[backend_routes]]

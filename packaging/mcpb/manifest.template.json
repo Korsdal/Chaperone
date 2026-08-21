@@ -16,6 +16,7 @@
       "args": [],
       "env": {
         "CHAPR_COORD_URL": "${user_config.coord_url}",
+        "CHAPR_COORD_TOKEN": "${user_config.coord_token}",
         "CHAPR_ROOT": "${user_config.coordinated_root}",
         "RUST_LOG": "${user_config.log_level}"
       }
@@ -27,6 +28,13 @@
       "title": "Coordinator URL",
       "description": "The address of the Chaperone coordinator (from your IT administrator, or your own coordinator setup). If you weren't given one, reach out before continuing. Example: http://coord-host:8787 (https:// if TLS is enabled). NOTE to packager: you MAY add a `default` here set to the REAL coordinator URL to pre-fill it for non-technical users — but never leave it as localhost.",
       "required": true
+    },
+    "coord_token": {
+      "type": "string",
+      "title": "Coordinator token",
+      "description": "The shared secret for this coordinator, printed by `chapr-coord setup` and given to you by your IT administrator. Required if the coordinator enforces authentication; leave empty if you were not given one. It proves this laptop is one of the deployment's endpoints — it is not a personal password, and it is the same value for everyone here. NOTE to packager: set a `default` here to the real token so non-technical users type nothing. Do that only in a bundle you distribute privately — a published bundle with a real token in it has published the credential.",
+      "sensitive": true,
+      "required": false
     },
     "coordinated_root": {
       "type": "string",
@@ -46,7 +54,7 @@
     "platforms": ["{{PLATFORM}}"]
   },
   "tools": [
-    { "name": "chapr_read", "description": "Read a file with coordinated versioning (content returned as untrusted data)." },
+    { "name": "chapr_read", "description": "Read a text file with coordinated versioning (content returned as untrusted data; binary containers are refused with advice)." },
     { "name": "chapr_write", "description": "Write a file with compare-and-swap; losing writes are parked in a sidecar." },
     { "name": "chapr_create", "description": "Create a new file (fails if it exists)." },
     { "name": "chapr_delete", "description": "Soft-delete a file (snapshotted to history first)." },

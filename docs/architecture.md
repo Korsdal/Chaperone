@@ -24,9 +24,14 @@ Two deployables, N-to-1:
   the lease table, version index, intent journal, history/blob store, conflict
   registry, audit log, and the change-watcher. Does **no file I/O of its own**.
 
-Auth is a pluggable boundary. The MVP asserts the logged-in OS identity
-(`trusted-header`) so install requires no tokens and no prompts; Negotiate/OIDC are
-the hardening paths.
+Auth is a pluggable boundary, because the deployment posture varies — some sites
+have on-prem AD, some are cloud-managed with a NAS and no Kerberos realm at all.
+The default is `shared-secret`: one token per deployment admits a caller to the
+control channel, and the logged-in OS identity is still derived automatically, so
+the user still sets nothing beyond the coordinator's URL and token. Negotiate and
+OIDC are the hardening paths that make the acting identity *verified* rather than
+asserted; `trusted-header` remains for a network where authenticating nothing is
+already acceptable.
 
 ## Load-bearing invariants
 
@@ -141,14 +146,28 @@ Collapsing these into a single cap makes reads as restrictive as writes, which i
 backwards here: the share is read-heavy over large materials and writes go into
 smaller, *different* derived artifacts.
 
-**Binary content is returned as base64, not extracted.** A non-UTF-8 file (xlsx,
-docx, pdf) comes back base64-encoded with `encoding=base64` in the envelope, so
-byte-exact round-trips are safe — but there is no text extraction, and a compressed
-PDF is not analysable in that form at any size. Reading tender PDFs *as documents*
-is therefore not something `chapr_read` delivers today; `ReadContent::Ref` is
-defined in the proto for this and is not yet produced anywhere. Chaperone
-coordinates the files; getting a PDF's text in front of a model is a separate
-problem.
+**Binary content is refused, not silently base64-encoded.** A PDF, Office
+document, image or archive is identified by **magic bytes — never by extension**,
+because the share contains misnamed files, and is refused as a tool-level result
+naming what to read instead. Handing those bytes over was an active footgun rather
+than a passive limitation: base64 is not analysable, and a model given it does not
+reliably refuse — it recognises the container header and confabulates, producing a
+confident summary of a document nobody read, written back into a coordinated file
+under the user's own AD principal.
+
+Format is judged **independently of UTF-8 validity**, because those are not the
+same test: an uncompressed PDF can be entirely ASCII and would otherwise be served
+as "text".
+
+Byte-exact round-trips are still available, and still safe, behind an explicit
+`allow_binary` on the read — the legitimate use is *copying* a file, not reading
+it. With it set, the body comes back base64 with `encoding=base64` in the envelope
+exactly as before.
+
+There is still no text extraction, and reading tender PDFs *as documents* is not
+something `chapr_read` delivers. `ReadContent::Ref` is defined in the proto for
+this and is not yet produced anywhere. Chaperone coordinates the files; getting a
+PDF's text in front of a model is a separate problem.
 
 In practice it is solved **upstream**: the workflow extracts each PDF, spreadsheet
 and document to a text mirror first, and the model reads those. That is why the

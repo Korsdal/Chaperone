@@ -104,7 +104,12 @@ pub async fn run() -> u8 {
     // in `trusted-header` mode answers 401 to everything and the self-test reports
     // a broken deployment when only the self-test was broken.
     let who = Principal::new_unchecked(crate::identity::logged_in_principal().as_str().to_string());
-    let coord = CoordClient::new(&coord_url).with_principal(who.as_str());
+    // Same reasoning one line up, for the other credential: against a coordinator
+    // enforcing `shared-secret`, a self-test without the token 401s on every check
+    // and reports a broken deployment when only the self-test was misconfigured.
+    let coord = CoordClient::new(&coord_url)
+        .with_principal(who.as_str())
+        .with_token(std::env::var("CHAPR_COORD_TOKEN").unwrap_or_default());
     match coord.healthz().await {
         Ok(()) => r.pass("coordinator reachable", format!("{coord_url}/healthz answered ok")),
         Err(e) => {
@@ -113,6 +118,37 @@ pub async fn run() -> u8 {
                 format!(
                     "{coord_url}/healthz failed: {e}. Check the URL, the port, and \
                      — if it is https — whether this laptop trusts the certificate."
+                ),
+            );
+            return r.finish().min(255) as u8;
+        }
+    }
+
+    // 1b. Reachability is not admission. `/healthz` is deliberately unauthenticated
+    //     so monitoring works without a credential — which means check 1 passes
+    //     with no token at all, and a missing or wrong CHAPR_COORD_TOKEN then
+    //     surfaces several checks later as an unrelated-looking failure. Probe one
+    //     route that actually requires the credential, so the diagnosis is here
+    //     rather than inferred.
+    match coord
+        .list_conflicts(&chapr_proto::ConflictsQuery {
+            scope: chapr_proto::CanonicalPath::new_unchecked(dir.clone()),
+        })
+        .await
+    {
+        Ok(_) => r.pass(
+            "credentials accepted",
+            "an authenticated route answered — the coordinator token and principal are good"
+                .to_string(),
+        ),
+        Err(e) => {
+            r.fail(
+                "credentials accepted",
+                format!(
+                    "the coordinator is reachable but refused an authenticated request: {e}. \
+                     If this coordinator enforces auth, set CHAPR_COORD_TOKEN to the value from \
+                     its handover (the `endpoint-token` file in its data directory). \
+                     /healthz needs no credential, which is why check 1 passed."
                 ),
             );
             return r.finish().min(255) as u8;

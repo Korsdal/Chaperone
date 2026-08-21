@@ -11,13 +11,25 @@
 //! primary deliverable). Handlers take the authenticated [`Caller`] and prefer
 //! it over any body principal.
 //!
-//! Three implementations:
+//! Four implementations:
 //! - [`DisabledAuth`] — no connection auth; handlers fall back to the body
 //!   principal. The default, so existing dev/tests are unchanged.
 //! - [`TrustedHeaderAuth`] — trusts an `X-Chapr-Principal` header set by the
-//!   endpoint. A dev/loopback stand-in for SSO; NOT for untrusted networks.
+//!   endpoint. A dev/loopback stand-in for SSO; NOT for untrusted networks,
+//!   because it accepts *any* non-empty header from *anyone* who can reach the
+//!   port.
+//! - [`SharedSecretAuth`] — the first mode that actually refuses a stranger: one
+//!   shared secret per deployment, plus the principal header. A bridge until
+//!   E-015, deliberately not an architecture (D-037, [`crate::endpoint_token`]).
 //! - [`NegotiateAuth`] — placeholder for SSPI/SPNEGO Kerberos (concept §13.1),
 //!   only exercisable against a real AD domain; wired so the boundary is ready.
+//!
+//! ## Two extractors, two questions
+//!
+//! [`Caller`] asks *who is this* and yields a principal. [`Authenticated`] asks
+//! only *may this request be here*, for the routes that carry no principal —
+//! including two that mutate. Both run the configured authenticator, so both
+//! start refusing the moment the mode is one that refuses.
 
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
@@ -86,6 +98,46 @@ impl Authenticator for TrustedHeaderAuth {
     }
 }
 
+/// Enforced admission: the caller must present the deployment's shared secret
+/// **and** name a principal.
+///
+/// The two halves answer different questions and neither substitutes for the
+/// other — see [`crate::endpoint_token`]. The token proves the caller is one of
+/// this deployment's endpoints; the header says which user it is acting for, and
+/// remains asserted rather than proven until E-015 lands a mode that binds
+/// identity to a verified subject.
+///
+/// Ordering is deliberate: the token is checked first, so an unauthenticated
+/// caller learns nothing about whether a principal header would have been
+/// accepted.
+pub struct SharedSecretAuth {
+    pub expected: String,
+}
+
+impl Authenticator for SharedSecretAuth {
+    fn mode(&self) -> &'static str {
+        "shared-secret"
+    }
+    fn authenticate(&self, headers: &HeaderMap) -> Result<Outcome, AuthError> {
+        let presented = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .trim();
+        if !crate::endpoint_token::verify(&self.expected, presented) {
+            return Err(AuthError);
+        }
+        match headers.get("x-chapr-principal").and_then(|v| v.to_str().ok()) {
+            Some(p) if !p.is_empty() => Ok(Outcome {
+                principal: Some(Principal::new_unchecked(p)),
+                mode: "shared-secret",
+            }),
+            _ => Err(AuthError),
+        }
+    }
+}
+
 /// Placeholder for Negotiate/Kerberos (SSPI/SPNEGO, concept §13.1). Only
 /// exercisable against a real AD domain. TODO(auth): perform the SPNEGO
 /// handshake and extract the AD principal from the security context.
@@ -126,22 +178,44 @@ impl Authenticator for LayeredAuth {
 }
 
 /// Select an authenticator by name (env `CHAPR_COORD_AUTH`).
-pub fn from_name(name: &str) -> std::sync::Arc<dyn Authenticator> {
+///
+/// `secret` is the deployment's endpoint token, needed only by `shared-secret`.
+/// When that mode is asked for and no secret could be established, this returns
+/// [`NegotiateAuth`] — an authenticator that refuses everything. **Failing closed
+/// is the whole point:** a coordinator told to enforce, that cannot, must not
+/// silently fall back to accepting any header. `main` refuses to start in that
+/// state; this is the belt to that braces, for the settings-reload path.
+pub fn from_name(name: &str, secret: Option<&str>) -> std::sync::Arc<dyn Authenticator> {
     match name {
         "trusted-header" => std::sync::Arc::new(TrustedHeaderAuth),
         "negotiate" => std::sync::Arc::new(NegotiateAuth),
+        "shared-secret" => match secret {
+            Some(s) if !s.is_empty() => {
+                std::sync::Arc::new(SharedSecretAuth { expected: s.to_string() })
+            }
+            _ => {
+                tracing::error!(
+                    "auth mode shared-secret was selected but no endpoint token could be \
+                     established; refusing every request rather than accepting any header"
+                );
+                std::sync::Arc::new(NegotiateAuth)
+            }
+        },
         _ => std::sync::Arc::new(DisabledAuth),
     }
 }
 
 /// Build the authenticator a config asks for, layering a fallback if one is set.
-pub fn from_config(cfg: &crate::config::Config) -> std::sync::Arc<dyn Authenticator> {
+pub fn from_config(
+    cfg: &crate::config::Config,
+    secret: Option<&str>,
+) -> std::sync::Arc<dyn Authenticator> {
     match &cfg.auth_fallback {
         Some(fallback) => std::sync::Arc::new(LayeredAuth {
-            primary: from_name(&cfg.auth),
-            fallback: from_name(fallback),
+            primary: from_name(&cfg.auth, secret),
+            fallback: from_name(fallback, secret),
         }),
-        None => from_name(&cfg.auth),
+        None => from_name(&cfg.auth, secret),
     }
 }
 
@@ -178,6 +252,42 @@ impl FromRequestParts<AppState> for Caller {
 
 /// Proof that the caller holds the coordinator's admin token.
 ///
+/// Admission without attribution: run the configured authenticator and discard
+/// the principal.
+///
+/// [`Caller`] already authenticates — that is why the twelve routes carrying it
+/// gain real enforcement the moment the mode actually authenticates. The problem
+/// was the eleven that carried **no extractor at all**, so nothing ran. Some of
+/// those have no principal to attribute (`POST /resolve`, `POST /conflicts/query`)
+/// and two of them *mutate*: `POST /journal/clear` destroys crash-recovery state,
+/// `PUT /blobs` writes into the content store.
+///
+/// Bolting `Caller` onto those would work by side effect and read as if a
+/// principal mattered. This says what it means. `/healthz` and `GET /admin` stay
+/// open deliberately — the first is monitoring, the second is the page where the
+/// admin token is typed.
+pub struct Authenticated;
+
+impl FromRequestParts<AppState> for Authenticated {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match state.authenticator().authenticate(&parts.headers) {
+            Ok(outcome) => {
+                state.auth_usage.record_success(outcome.mode);
+                Ok(Authenticated)
+            }
+            Err(_) => {
+                state.auth_usage.record_failure();
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+    }
+}
+
 /// A separate extractor from [`Caller`] because it answers a different question.
 /// `Caller` asks *who is this* — attribution, and under `trusted-header` it is
 /// asserted rather than proven. `AdminAuth` asks *may this request change the
@@ -292,11 +402,11 @@ mod tests {
             auth: "trusted-header".into(),
             ..Default::default()
         };
-        assert_eq!(from_config(&cfg).mode(), "trusted-header");
+        assert_eq!(from_config(&cfg, None).mode(), "trusted-header");
 
         cfg.auth = "negotiate".into();
         cfg.auth_fallback = Some("trusted-header".into());
-        let layered = from_config(&cfg);
+        let layered = from_config(&cfg, None);
         assert_eq!(layered.mode(), "negotiate");
         assert_eq!(
             layered

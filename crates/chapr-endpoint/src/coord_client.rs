@@ -42,6 +42,15 @@ pub struct CoordClient {
     /// set, sent as `X-Chapr-Principal` on every request; coord's authenticator
     /// derives the acting principal from it (real deployments use Kerberos).
     principal: Option<String>,
+    /// The deployment's shared secret, presented as `Authorization: Bearer …` on
+    /// every request when set.
+    ///
+    /// Distinct from `principal` and not a substitute for it: the token says *this
+    /// is one of this deployment's endpoints*, the header says *acting for this
+    /// user*. Coord's `shared-secret` mode requires both. Absent here, an
+    /// enforcing coord returns 401 — which is the point, and is why the wizard
+    /// prints this value in the handover.
+    token: Option<String>,
 }
 
 /// How long to wait for a TCP connect to coord before giving up.
@@ -78,6 +87,7 @@ impl CoordClient {
             base: base_url.into().trim_end_matches('/').to_string(),
             http,
             principal: None,
+            token: None,
         }
     }
 
@@ -87,12 +97,32 @@ impl CoordClient {
         self
     }
 
+    /// Present the deployment's shared secret on every request.
+    ///
+    /// An empty value is treated as absent, so an unset or blank
+    /// `CHAPR_COORD_TOKEN` does not turn into an `Authorization: Bearer ` header
+    /// that coord has to reason about.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.token = (!token.trim().is_empty()).then(|| token.trim().to_string());
+        self
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
 
-    /// Attach the caller-identity header if one is configured.
+    /// Attach the credentials this client has: the shared secret and the caller
+    /// identity.
+    ///
+    /// The single chokepoint — `recv_json` and `recv_empty` both route through
+    /// here, and the two non-JSON paths call it directly — so a credential added
+    /// here reaches every request by construction rather than by remembering.
     fn authed(&self, rb: RequestBuilder) -> RequestBuilder {
+        let rb = match &self.token {
+            Some(t) => rb.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}")),
+            None => rb,
+        };
         match &self.principal {
             Some(p) => rb.header("x-chapr-principal", p),
             None => rb,

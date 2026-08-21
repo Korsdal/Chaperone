@@ -21,6 +21,7 @@ mod config;
 mod conflict;
 mod db;
 mod diagnostics;
+mod endpoint_token;
 mod gc;
 mod history;
 mod host;
@@ -205,13 +206,55 @@ pub(crate) async fn run_server_ready(
         }
     };
 
+    // The endpoint token — the shared secret that admits a caller to the control
+    // channel at all. Same directory and same reasoning as the admin token, but a
+    // different failure direction: the admin surface degrades to "unavailable",
+    // whereas an *enforcing* auth mode that cannot enforce must not come up at all.
+    // A coordinator that believes it is authenticating while accepting any header
+    // is worse than one that is honestly open.
+    let enforcing = cfg.auth == "shared-secret" || cfg.auth_fallback.as_deref() == Some("shared-secret");
+    let endpoint_token = match cfg.data_dir() {
+        Some(dir) => match endpoint_token::load_or_create(&dir) {
+            Ok(t) => {
+                tracing::info!(path = %endpoint_token::path_in(&dir).display(), "endpoint token ready");
+                Some(t)
+            }
+            Err(e) if enforcing => {
+                return Err(format!(
+                    "auth mode {:?} needs the endpoint token in {}, and it could not be \
+                     established: {e}\nFix the data directory's permissions, or set auth to \
+                     \"trusted-header\" if this deployment is deliberately open.",
+                    cfg.auth,
+                    dir.display()
+                )
+                .into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %dir.display(), "could not establish an endpoint token; shared-secret auth is unavailable");
+                None
+            }
+        },
+        None if enforcing => {
+            return Err("auth mode \"shared-secret\" needs a data directory to hold the \
+                        endpoint token, and this coordinator has none (an in-memory \
+                        database?). Point db_url at a file, or use \"trusted-header\"."
+                .into());
+        }
+        None => None,
+    };
+
     let mut state = AppState::new(pool)
         .with_blob_root(cfg.blob_root.as_str())
-        .with_auth(auth::from_config(&cfg))
+        .with_auth(auth::from_config(&cfg, endpoint_token.as_deref()))
         .with_backends(cfg.backend, cfg.backend_routes.clone())
         .with_config(cfg.clone());
     if let Some(t) = admin_token {
         state = state.with_admin_token(t);
+    }
+    // Held on state so the settings-reload path can rebuild the authenticator
+    // without re-reading the file (http.rs `put_settings`).
+    if let Some(t) = endpoint_token {
+        state = state.with_endpoint_token(t);
     }
     if let Some(fallback) = &cfg.auth_fallback {
         tracing::warn!(
@@ -254,6 +297,9 @@ pub(crate) async fn run_server_ready(
 
     match &cfg.tls {
         Some(tls) => {
+            // Fail with a sentence an operator can act on, rather than a bare
+            // NotFound from inside from_pem_file naming neither path nor remedy.
+            tls.preflight()?;
             // A workspace build compiles rustls with BOTH `aws-lc-rs` (via
             // axum-server) and `ring` (via the endpoint's reqwest), and rustls
             // then refuses to infer a process-level provider — `ServerConfig::
@@ -276,6 +322,19 @@ pub(crate) async fn run_server_ready(
                 .await?;
         }
         None => {
+            // TLS is the intended default: the wizard generates a certificate and
+            // takes it unless told otherwise, and the shipped template enables it.
+            // Reaching this arm means someone opted out — so say what that costs,
+            // at every start rather than once at install time. A bearer token or a
+            // principal header over plain HTTP is theatre, and the pre-image bytes
+            // of every write cross the same wire.
+            tracing::warn!(
+                %addr,
+                "serving the control channel over PLAINTEXT HTTP — principal headers, \
+                 control-plane credentials and file pre-images all cross the network \
+                 unencrypted. Run `chapr-coord setup` to generate a certificate, or set \
+                 [tls] cert_path/key_path in the config."
+            );
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!(%addr, "chapr-coord listening");
             signal_ready(ready);

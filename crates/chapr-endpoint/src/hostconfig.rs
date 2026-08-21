@@ -133,6 +133,11 @@ pub fn settings_from_env() -> Settings {
     let mut extra = BTreeMap::new();
     for k in [
         "CHAPR_BACKEND",
+        // The deployment's shared secret. Emitted only when this process has it,
+        // like the rest of `extra` — so `print-config` on a configured machine
+        // reproduces that machine, and on a fresh one stays silent rather than
+        // printing a placeholder that looks like a credential.
+        "CHAPR_COORD_TOKEN",
         "CHAPR_PRINCIPAL",
         "CHAPR_MAX_INLINE_BYTES",
         "CHAPR_DIAG_LOG",
