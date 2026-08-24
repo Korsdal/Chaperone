@@ -7,6 +7,7 @@ and how to install it; read this before changing how it works.
 - [Load-bearing invariants](#load-bearing-invariants)
 - [The write path](#the-write-path)
 - [The read path](#the-read-path)
+- [Failure directions](#failure-directions)
 - [Read limits, and what a model can write back](#read-limits-and-what-a-model-can-write-back)
 - [Layout](#layout)
 - [Backends](#backends)
@@ -15,16 +16,16 @@ and how to install it; read this before changing how it works.
 
 Two deployables, N-to-1:
 
-- **`chapr-endpoint`** — one per user machine, run as a stdio child of an MCP host
+- **`chapr-endpoint`**: one per user machine, run as a stdio child of an MCP host
   (Claude Desktop, the Claude Code CLI, or any other MCP client). Does file I/O
   **as the logged-in user** (Kerberos on SMB), and owns the exclusive-open write
   path, the CAS check, the in-place write, the lease-renewal thread, and the read
   state machine.
-- **`chapr-coord`** — exactly one, on-prem beside the fileserver. Stateful. Owns
+- **`chapr-coord`**: exactly one, on-prem beside the fileserver. Stateful. Owns
   the lease table, version index, intent journal, history/blob store, conflict
   registry, audit log, and the change-watcher. Does **no file I/O of its own**.
 
-Auth is a pluggable boundary, because the deployment posture varies — some sites
+Auth is a pluggable boundary, because the deployment posture varies: some sites
 have on-prem AD, some are cloud-managed with a NAS and no Kerberos realm at all.
 The default is `shared-secret`: one token per deployment admits a caller to the
 control channel, and the logged-in OS identity is still derived automatically, so
@@ -53,25 +54,25 @@ already acceptable.
    casefolded, UNC, normalized separators). Two users naming a file differently
    must map to the same lease.
 6. **File bytes reach the model directly; coord sees bytes only for history.** The
-   200 MB PDF a model reads never goes through coord — endpoint → share → model. A
+   200 MiB PDF a model reads never goes through coord: endpoint → share → model. A
    write *does* send the file's previous contents to coord (`PUT /blobs`), because
    that pre-image snapshot is what history and crash recovery are made of. That is
    the only byte flow on the control channel, it is one direction, and it is
    bounded explicitly by `http::MAX_BLOB_BYTES` (256 MiB). Both ends buffer whole,
-   so that bound is also coord's per-in-flight-write memory cost — and the largest
+   so that bound is also coord's per-in-flight-write memory cost, and the largest
    file Chaperone can write at all, since a write whose pre-image will not fit is
    refused up front. The bound is stated on the *route* as well as on the types: an
    invariant enforced on type shape alone let an unsized raw-body channel exist
    unnoticed.
 
-The deliberate failure directions that follow from these are tabulated in the
-README under [Failure directions](../README.md#failure-directions).
+The deliberate failure directions that follow from these are tabulated under
+[Failure directions](#failure-directions) below.
 
 ## The write path
 
 This is the one place where a subtle mistake costs someone their data. It is
 intentionally the most boring, linear, synchronous-looking code in the repo, and
-should stay that way. Writes are in-place, never temp-then-rename — a rename
+should stay that way. Writes are in-place, never temp-then-rename, because a rename
 carries the source ACL and strips the target's ACEs. Crash safety comes from the
 journal plus the snapshot, not from an atomic rename.
 
@@ -86,7 +87,7 @@ flowchart TD
     L -->|"no"| LE["acquire lease from coord"]
     LE --> OP["exclusive open"]
 
-    subgraph HELD ["under one held handle — invariant 4"]
+    subgraph HELD ["under one held handle, invariant 4"]
         direction TB
         OP --> RH["re-hash the bytes on disk"]
         RH --> CAS{"hash equals<br/>base_version?"}
@@ -104,13 +105,13 @@ flowchart TD
 
 Two refusals rather than one failure mode: an Office lock file means a human has
 the document open, and a CAS mismatch means somebody else wrote first. Neither
-loses bytes — the lock case never opens, and the conflict case parks the loser's
+loses bytes: the lock case never opens, and the conflict case parks the loser's
 content in a sidecar and registers it.
 
 ## The read path
 
 Reads mutate nothing and are the core capability, so they degrade rather than
-refuse — the opposite direction from writes:
+refuse, the opposite direction from writes:
 
 ```mermaid
 %%{init:{'theme':'base','themeVariables':{'primaryColor':'#e6f1fb','primaryTextColor':'#185fa5','primaryBorderColor':'#d3d1c7','secondaryColor':'#eeedfe','secondaryTextColor':'#534ab7','tertiaryColor':'#eaf3de','tertiaryTextColor':'#3b6d11','lineColor':'#7a7870','textColor':'#1f1e1c','edgeLabelBackground':'#faf9f5'}}}%%
@@ -125,16 +126,30 @@ flowchart TD
 
 A reader never sees torn bytes, and a coordinator outage never stops a read.
 
+## Failure directions
+
+Every one of these is a deliberate choice of which way to fail, not a fallback that
+happened.
+
+| Situation | Direction | Why |
+| --- | --- | --- |
+| Coord unreachable, **write** | **Fail closed**, refuse | Writes are rare; refusing costs a retry, guessing costs data |
+| Coord unreachable, **read** | **Degrade open**: serve with `integrity = "unverified"`, version omitted | Reads mutate nothing and are the core capability |
+| Torn file (dangling journal) on read | **Recover, then serve** the pre-image | A reader must never see torn bytes |
+| CAS conflict | Loser's bytes to a `.conflict-{user}-{ts}` sidecar, registered, surfaced on next touch | Never lose either party's bytes; never fake-merge an Office binary |
+| Office lock (`~$F`) present | **Refuse the write** | Humans always win. Leases are advisory with respect to Excel |
+| Retry storm | Bounded retries, exponential backoff + jitter, per-file budget, terminal "ask the human" state | An LLM will otherwise retry forever |
+
 ## Read limits, and what a model can write back
 
 Two independent limits, deliberately not one number:
 
 - **`DEFAULT_MAX_INLINE_BYTES`** (1 MiB, override with `CHAPR_MAX_INLINE_BYTES`)
-  is a *context* limit — how much of a file usefully enters the model's input
+  is a *context* limit: how much of a file usefully enters the model's input
   window. Over it, the read is refused rather than truncated: a silently shortened
   body written back destroys the file's tail. The refusal is a **tool-level**
-  result, not a protocol error, and it says what the caller can do instead —
-  raising the cap is an operator action on that machine, so it is phrased as
+  result, not a protocol error, and it says what the caller can do instead.
+  Raising the cap is an operator action on that machine, so it is phrased as
   something to pass on rather than something to attempt.
 - **`WRITEBACK_BUDGET_BYTES`** (128 KiB) is what a model can realistically echo
   back through `chapr_write` in one call. It refuses nothing; it reports
@@ -147,11 +162,11 @@ backwards here: the share is read-heavy over large materials and writes go into
 smaller, *different* derived artifacts.
 
 **Binary content is refused, not silently base64-encoded.** A PDF, Office
-document, image or archive is identified by **magic bytes — never by extension**,
+document, image or archive is identified by **magic bytes, never by extension**,
 because the share contains misnamed files, and is refused as a tool-level result
 naming what to read instead. Handing those bytes over was an active footgun rather
 than a passive limitation: base64 is not analysable, and a model given it does not
-reliably refuse — it recognises the container header and confabulates, producing a
+reliably refuse: it recognises the container header and confabulates, producing a
 confident summary of a document nobody read, written back into a coordinated file
 under the user's own AD principal.
 
@@ -160,7 +175,7 @@ same test: an uncompressed PDF can be entirely ASCII and would otherwise be serv
 as "text".
 
 Byte-exact round-trips are still available, and still safe, behind an explicit
-`allow_binary` on the read — the legitimate use is *copying* a file, not reading
+`allow_binary` on the read. The legitimate use is *copying* a file, not reading
 it. With it set, the body comes back base64 with `encoding=base64` in the envelope
 exactly as before.
 
@@ -171,7 +186,7 @@ PDF's text in front of a model is a separate problem.
 
 In practice it is solved **upstream**: the workflow extracts each PDF, spreadsheet
 and document to a text mirror first, and the model reads those. That is why the
-inline cap is sized for one extracted document rather than for a source PDF — and
+inline cap is sized for one extracted document rather than for a source PDF, and
 why the cap, not the base64 path, is the limit that actually matters day to day.
 
 ## Layout
@@ -180,28 +195,28 @@ A Cargo workspace of three crates, built in this order:
 
 | Crate | Role |
 | --- | --- |
-| `crates/chapr-proto` | Shared wire contract — records, IDs, version token, the `chapr.*` request/response types, and an exhaustive error enum. Both binaries import it, so neither can drift. |
+| `crates/chapr-proto` | Shared wire contract: records, IDs, version token, the `chapr.*` request/response types, and an exhaustive error enum. Both binaries import it, so neither can drift. |
 | `crates/chapr-coord` | Coordination service. `axum` + `sqlx`/SQLite, background jobs (lease reaping, journal sweep, blob GC), setup wizard, native service install. No Windows-specific primitives in the core. |
 | `crates/chapr-endpoint` | Local MCP server. `rmcp` over stdio, pluggable filesystem backends, lease-renewal thread, read state machine. |
 
 Also here: `packaging/` (MCPB bundle builder for the endpoint, coord config
 template and service install notes) and [`deployment-guide.md`](deployment-guide.md).
 
-Chaperone is the reusable engine. Customer-specific deployables — which commit
-built binaries — live in their own repos.
+Chaperone is the reusable engine. Customer-specific deployables, which commit
+built binaries, live in their own repos.
 
 ## Backends
 
 The endpoint selects a backend at runtime (`CHAPR_BACKEND`), against a shared
 write-path core:
 
-- **`smb`** — Windows. `CreateFileW` with `FILE_SHARE_NONE` for the exclusive
+- **`smb`**: Windows. `CreateFileW` with `FILE_SHARE_NONE` for the exclusive
   open, `ReadDirectoryChangesW` for the watcher.
-- **`posix`** — Linux and macOS. Advisory `flock`.
+- **`posix`**: Linux and macOS. Advisory `flock`.
 
 > [!NOTE]
 > The two are not equivalent, and the adapter declares that rather than hiding it.
-> SMB's lock is **mandatory** — it excludes non-Chaperone writers too, which is why
+> SMB's lock is **mandatory**: it excludes non-Chaperone writers too, which is why
 > invariant 3 holds against Excel. POSIX `flock` is **advisory**: it coordinates
 > Chaperone sessions with each other and cannot stop an unrelated process.
 

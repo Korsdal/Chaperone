@@ -1,4 +1,4 @@
-# Chaperone — deployment guide (generic)
+# Chaperone deployment guide (generic)
 
 How to stand Chaperone up at a customer. This is the reusable playbook; a concrete
 per-customer instantiation (binaries filled in, one OS, one coord) lives in that
@@ -8,17 +8,17 @@ customer's own deployable repo.
 
 Two artifacts, N-to-1:
 
-- **Coordinator** — one per environment, on-prem beside the fileserver. A single
+- **Coordinator**: one per environment, on-prem beside the fileserver. A single
   binary (`chapr-coord`) + SQLite + a blob store. Owns leases, version index,
   journal, history, conflicts, audit. Does **no** file I/O.
-- **Endpoints** — one MCPB per laptop, a stdio child of Claude Desktop. Does file
+- **Endpoints**: one MCPB per laptop, a stdio child of Claude Desktop. Does file
   I/O as the logged-in user; owns the write path, CAS, read state machine.
 
 File **bytes** go endpoint → fileserver directly; **metadata** goes endpoint ↔
 coord over HTTP. The one deliberate exception is the **pre-image snapshot**: a
 write sends the bytes it is about to replace to coord's blob store, because that
 snapshot is what history and crash recovery are made of (D-026). It caps the
-largest writable file at 256 MiB. The 200 MB PDF a model *reads* still never
+largest writable file at 256 MiB. The 200 MiB PDF a model *reads* still never
 touches coord.
 
 ## Prerequisites
@@ -28,14 +28,14 @@ touches coord.
 - Claude Desktop on each laptop.
 - To build from source: the Rust toolchain (`cargo`) and, to pack MCPBs, Node +
   `@anthropic-ai/mcpb`. Not needed if you take the published
-  [Releases](https://github.com/Korsdal/Chaperone/releases) — the binaries there are built by CI
+  [Releases](https://github.com/Korsdal/Chaperone/releases). The binaries there are built by CI
   from a tag, with `SHA256SUMS` alongside them.
 
-## Step 1 — Coordinator
+## Step 1. Coordinator
 1. Get the binary: download `chapr-coord-<version>-<os>` from the project's
    [Releases](https://github.com/Korsdal/Chaperone/releases) page (checksums in `SHA256SUMS`), or
    build it with `cargo build --release -p chapr-coord`. The result is one self-contained
-   `.exe` — no Visual C++ redistributable, no Rust on the target host, no script.
+   `.exe`: no Visual C++ redistributable, no Rust on the target host, no script.
 2. Copy it to the coordinator host and run it **elevated** with no arguments. That
    *is* the installer: a bare invocation runs the setup wizard. See
    [`../packaging/coord/service-install.md`](../packaging/coord/service-install.md);
@@ -43,58 +43,77 @@ touches coord.
    documents every field if you would rather write the config by hand.
 3. Answer four questions: **listen address**, **hostname the laptops connect to**,
    **share to coordinate**, and whether to run the change-watcher. The first two are
-   separate on purpose — a bind address is not a URL (D-032).
+   separate on purpose, because a bind address is not a URL (D-032).
 4. Choose the **backend** coord announces (`smb`/`posix`) and the **auth** mode.
    The default is `shared-secret`: endpoints must present this deployment's token,
    which the handover prints. `trusted-header` is the older posture and accepts any
    principal header from anyone who can reach the port; `negotiate`/`oidc` are the
    hardening paths that make the acting identity verified rather than asserted
    (E-015). Changing the mode on a **live** deployment is a cutover via
-   `auth_fallback`, never a switch — see the admin page section below.
+   `auth_fallback`, never a switch. See the admin page section below.
 5. Confirm **TLS**, which defaults to yes and generates a self-signed pair. Say no
    only deliberately: the control channel carries the principal header that stamps
    the audit trail and the pre-image bytes of every write, and coord warns at every
    start while it is serving plaintext. A self-signed certificate still has to be
-   trusted on the laptops — an internal CA is the better answer if you have one.
+   trusted on the laptops, and an internal CA is the better answer if you have one.
 6. Read the handover it prints. It is the whole set of things to pass on: the admin
    token, the coordinator URL, the coordinated share, where both logs live, and what
    to back up.
 7. Verify: `GET /healthz` → `ok`, **from a laptop** rather than from the coordinator
    itself. Loopback working proves nothing about what a user will experience.
 
-## Step 2 — Endpoints
+> [!WARNING]
+> `addr` (where the socket binds) and `public_url` (what a laptop connects to) are
+> two different settings. Conflating them is how an administrator once came to be
+> told to configure `http://127.0.0.1:8787` fleet-wide.
+
+## Step 2. Endpoints
 
 The endpoint is a standard MCP server over stdio, so the install route depends on the
 **host**, not on the fileserver. Both routes ship the same binary and behave identically;
 identity is auto-derived from the OS logon either way.
 
-**Route A — Claude Desktop (one-click).**
+**Route A: Claude Desktop (one-click).**
 1. Get one bundle **per client OS**: download `chaperone-endpoint-<version>-<os>.mcpb` from
-   [Releases](https://github.com/Korsdal/Chaperone/releases), or build it — see
+   [Releases](https://github.com/Korsdal/Chaperone/releases), or build it. See
    [`../packaging/mcpb/README.md`](../packaging/mcpb/README.md). A packager who builds it can
    pre-fill the coordinator URL and coordinated location as defaults, so users type nothing;
    released bundles ship without those defaults, so users enter them once.
 2. Distribute the `.mcpb`. Users install it in Claude Desktop
    (Settings → Extensions) and enter the coordinator URL once.
 
-**Route B — Claude Code, or any other MCP host.** `.mcpb` is Desktop's install format, so
+**Route B: Claude Code, or any other MCP host.** `.mcpb` is Desktop's install format, so
 elsewhere the artifact is the bare `chapr-endpoint-<version>-<os>` binary.
-1. Put the binary somewhere stable (it is self-contained — no runtime, no redistributable).
+1. Put the binary somewhere stable (it is self-contained: no runtime, no redistributable).
 2. Set `CHAPR_COORD_URL` and `CHAPR_ROOT`, then let the binary print its own registration:
    `chapr-endpoint print-config claude-code` for a `claude mcp add` one-liner, or
-   `chapr-endpoint print-config generic` for the portable `mcpServers` JSON block —
+   `chapr-endpoint print-config generic` for the portable `mcpServers` JSON block,
    which is also what Claude Code reads from `.mcp.json`. The config goes to stdout
    alone, so it can be redirected straight into a file.
 3. For a fleet, do step 2 once and distribute the resulting block; the only
    machine-specific part is the binary's path.
 
+**The environment contract**, if you would rather write the config by hand than let
+`print-config` emit it:
+
+| Variable | |
+| --- | --- |
+| `CHAPR_COORD_URL` | Coordinator base URL. Required in practice. |
+| `CHAPR_COORD_TOKEN` | The deployment's endpoint token, under `shared-secret`. Printed by the setup wizard. |
+| `CHAPR_ROOT` | Comma-separated coordinated root(s). Confines the endpoint **and** is announced to the model. Unset means unconfined. |
+| `CHAPR_BACKEND` | `smb` or `posix`. Defaults to SMB on Windows, POSIX elsewhere. |
+| `CHAPR_PRINCIPAL` | Override the identity. Normally derived from the OS logon. |
+| `CHAPR_MAX_INLINE_BYTES` | Per-read context cap. See [read limits](architecture.md#read-limits-and-what-a-model-can-write-back). |
+| `CHAPR_DIAG_LOG` | Local JSON-lines diagnostics sink. An empty value disables it. |
+| `RUST_LOG` | Tracing filter. Logs go to stderr, never the MCP channel. |
+
 Either way, on first connect the endpoint reads coord's backend announcement, confirms it
 against its own capabilities, and selects the matching backend.
 
 Only Claude Desktop and Claude Code have been driven end to end. Other MCP hosts should work
-— nothing in the tool surface is vendor-specific — but they are not tested here.
+(nothing in the tool surface is vendor-specific) but they are not tested here.
 
-## Step 3 — Verify end to end
+## Step 3. Verify end to end
 - From a laptop: `chapr.read` a file on the share → returns content + a version.
 - `chapr.write` it back with that version → succeeds; a stale write → CONFLICT +
   sidecar (bytes never lost).
@@ -103,7 +122,7 @@ Only Claude Desktop and Claude Code have been driven end to end. Other MCP hosts
 
 ## The admin page
 
-`GET /admin` on the coordinator — the same host and port the laptops use. Served
+`GET /admin` on the coordinator, the same host and port the laptops use. Served
 by coord itself, so there is nothing extra to install and it works on a network
 with no route out.
 
@@ -111,7 +130,7 @@ Six tabs: **Overview** (counts, plus what this coordinator is configured for),
 **Errors**, **Conflicts**, **Leases**, **Audit trail**, **Settings**.
 
 **Signing in.** The page asks for the coordinator's admin token, kept as
-`admin-token` in the coordinator's data directory — the directory beside the
+`admin-token` in the coordinator's data directory, the directory beside the
 database, which the installer restricts to administrators and the service account.
 The setup wizard prints it; you can read the file again at any time.
 
@@ -127,7 +146,7 @@ left may still have a copy".
    Both apply immediately; no restart.
 2. Watch the Settings tab. It shows which mode has been admitting the recent
    requests, and how many have been rejected.
-3. Remove the fallback when the page says it is safe — which needs **both** no
+3. Remove the fallback when the page says it is safe, which needs **both** no
    recent fallback use **and** no recent rejections. One without the other cannot
    tell a finished cutover from one where every client is simply failing: a client
    that cannot authenticate never appears in the fallback's own usage count.
@@ -135,27 +154,27 @@ left may still have a copy".
 Other settings save to the config file. Only `auth` and `auth_fallback` take effect
 without a restart; the page says which of your changes are live and which are
 waiting, rather than implying everything reloads. A field held by a
-`CHAPR_COORD_*` environment variable is shown as locked — saving it would write a
+`CHAPR_COORD_*` environment variable is shown as locked, because saving it would write a
 value the environment discards on the next start.
 
 ## When something breaks
 
-Two places to look, and you need both — the second exists because a failure that
+Two places to look, and you need both. The second exists because a failure that
 happens *before* coord is reachable cannot report itself to coord.
 
 1. **Coord, for the whole fleet.** The admin page's Errors tab, or
    `POST /diagnostics/query` with `{}` for the same data as JSON: unexpected
    failures grouped by `(code, path)`, newest first, each with a `remedy` field
    saying what to do, `facts` carrying the OS-level detail, and the users and
-   hosts that hit it — which is how you tell one misconfigured laptop from a fault
+   hosts that hit it, which is how you tell one misconfigured laptop from a fault
    hitting everybody.
 2. **The laptop, for that laptop.** The endpoint appends the same records as JSON
    lines to `%LOCALAPPDATA%\Chaperone\diagnostics.jsonl` (override with
    `CHAPR_DIAG_LOG`). Check here for a wrong coordinator URL, a TLS mismatch or a
-   blocked port — none of which can be reported over the network they break.
+   blocked port, none of which can be reported over the network they break.
 
 **Only unexpected failures land there.** A CAS conflict, a document a human has
-open in Word, a busy file — those are designed outcomes, not faults, and they
+open in Word, a busy file: those are designed outcomes, not faults, and they
 surface as conflict and lease state instead. If the diagnostics list is empty,
 that is the intended steady state.
 
@@ -163,13 +182,13 @@ that is the intended steady state.
 - **Availability:** coord availability == write availability. Run it as a service,
   monitor `/healthz`.
 - **Backup:** the SQLite DB **and** the blob store, together (audit + history).
-- **Storage:** history retention defaults (90 d / last-10 / 50 GB) are tunable;
+- **Storage:** history retention defaults (90 d / last-10 / 50 GiB) are tunable;
   validate against real write volume after a pilot.
 
 ## Per-customer checklist
 - [ ] Backend type (SMB / POSIX) → coord `backend`
 - [ ] Coord host + address + persistent DB/blob volumes
-- [ ] Auth mode (MVP `trusted-header` vs enforced)
+- [ ] Auth mode (`shared-secret` by default; `negotiate`/`oidc` to make identity verified)
 - [ ] Admin page URL passed to whoever supports this (`<coord>/admin`)
 - [ ] Admin token handed over (printed by `setup`; also `admin-token` in the data
       directory). Rotate it when someone with access leaves.
@@ -178,8 +197,8 @@ that is the intended steady state.
 - [ ] **Coordinated root** (`CHAPR_ROOT` / the bundle's "Coordinated location"):
       the share path, as UNC. Bounds what the endpoint will touch, and is
       announced to the model so it routes writes through Chaperone. Users on
-      mapped drives are fine — a drive letter is resolved to its UNC form, so
+      mapped drives are fine, because a drive letter is resolved to its UNC form, so
       two laptops with different letters still key one file identically.
 - [ ] TLS? (`chapr-coord setup --tls-generate` makes a self-signed pair if there is no
-      internal CA — it still has to be trusted on the laptops)
+      internal CA; it still has to be trusted on the laptops)
 - [ ] Backup + monitoring wired

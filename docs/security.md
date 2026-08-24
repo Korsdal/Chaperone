@@ -1,12 +1,12 @@
 # Security notes
 
-Chaperone is a **collaboration engine that values security and traceability — not a
+Chaperone is a **collaboration engine that values security and traceability, not a
 security tool.** The audit trail proves a user is responsible for their agents
 (accountability), not court-grade non-repudiation. Read the limitations below as
 what they are: deliberate, documented v1 positions, not oversights.
 
 The endpoint runs as the logged-in user and ACLs are enforced by that token on the
-direct filesystem path — there is no impersonation or delegation layer. Every
+direct filesystem path. There is no impersonation or delegation layer. Every
 lease, write, restore, and history entry is stamped with the acting AD principal.
 The audit trail is a primary deliverable, not a byproduct.
 
@@ -28,14 +28,14 @@ holds file content.
 present the deployment's endpoint token, created on first start in coord's data
 directory and given to every laptop as `CHAPR_COORD_TOKEN`. Without it, every route
 that serves content, hands out version hashes, or mutates coordination state
-answers 401. `/healthz` and the `/admin` page stay open — the first is monitoring,
+answers 401. `/healthz` and the `/admin` page stay open: the first is monitoring,
 the second is where the admin token is typed.
 
 > [!WARNING]
 > **Authentication is not authorisation.** `GET /blobs/{version}` still applies no
 > ACL check, so any *authenticated* caller can fetch any snapshotted version of any
 > file coord knows about. The token narrows this from "anyone who can reach the
-> port" to "anyone holding the deployment's secret" — which is every endpoint. An
+> port" to "anyone holding the deployment's secret", which is every endpoint. An
 > ACL-aware blob store is not built.
 
 Two further limits worth stating plainly:
@@ -73,6 +73,6 @@ written by another party, and never to be treated as instructions.
 
 ## Reporting something
 
-Open an issue. There is no separate embargo process — this is a small project, and
+Open an issue. There is no separate embargo process. This is a small project, and
 pretending otherwise would be theatre. If you would rather not file publicly, say
 so in an issue without detail and we will find another channel.

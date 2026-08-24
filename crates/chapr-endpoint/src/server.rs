@@ -36,7 +36,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 /// Default cap on the rendered inline body of a `chapr_read`, in bytes.
 ///
 /// A **context** limit: how much of a file can usefully enter the model's input
-/// window at once. Text runs ~4 chars/token, so 512 KiB is roughly 130k tokens —
+/// window at once. Text runs ~4 chars/token, so 1 MiB is roughly 260k tokens —
 /// enough for essentially any text tender, proposal or spreadsheet export on the
 /// share, and still a fraction of a large context.
 ///
@@ -44,7 +44,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 /// collapsing them into one number made reads as restrictive as writes, which is
 /// backwards for this workload: the share is read-heavy over large materials, and
 /// writes go into smaller, *different* derived artifacts (concept §2). Sizing the
-/// read cap to what a model can *emit* refused a 400 KB tender that was perfectly
+/// read cap to what a model can *emit* refused a ~400 KiB tender that was perfectly
 /// analyzable. A body too large to echo back is still worth reading; the envelope
 /// says so via `writable_inline=false` instead of refusing.
 ///
@@ -893,7 +893,7 @@ impl BodyTooLarge {
 /// Sibling to [`BodyTooLarge`] and reported the same way — a tool-level result the
 /// model can act on, not a protocol fault. Deliberately a *separate* type rather
 /// than a variant alongside it, because the two refusals are orthogonal: a PDF is
-/// refused for being a PDF whether it is 4 KB or 40 MB, and it is judged *before*
+/// refused for being a PDF whether it is 4 KiB or 40 MiB, and it is judged *before*
 /// the size cap so the message names the real problem instead of the incidental
 /// one.
 ///

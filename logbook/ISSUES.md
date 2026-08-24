@@ -114,6 +114,30 @@ CI is green on Windows and Linux, and a `workflow_dispatch` proved the release *
 
 **Note against over-fixing this.** Chaperone's framing is a collaboration engine, not a compliance product; three stale numbers in an internal doc cost one confused session, not a data-integrity defect. (b) is probably the right size unless the drift recurs a third time, in which case (c).
 
+**2026-08-24 — the two counts that actually drifted are now gone from `README.md`, which is option (c) applied narrowly.** The "Ten tools against eleven coord routes" sentence was **removed rather than corrected** to 11/29, on the reasoning that a number nothing checks should not be asserted in the document most likely to be read first; the README's Status section names the tool surface instead, which is what a reader wants anyway. `CLAUDE.md` §Status still asserts both counts (11 tools / 29 routes, measured 2026-08-21), so I-004's surface is unchanged and the (a)/(b)/(c) call is still open for everything else. See also **I-014**, the same root cause in source doc comments.
+
+<a id="i-014"></a>
+### I-014 — Storage units mixed decimal and binary, and three doc comments stated the wrong constant
+**Severity:** LOW | **Since:** 2026-08-24 | **Status:** **FIXED** 2026-08-24 (instances); prevention open, see I-013
+
+**Trigger:** jok, proof-reading the README rewrite: *"MiB and MB was presented next to each other. It is not wrong, but it is like presenting the metric and the imperial system side by side."*
+
+**Sibling of I-013, not a duplicate.** I-013 is about *counts* in the prose docs (tools, routes, test totals) drifting as features land. This is about *constants* being described in two unit systems and, in three places, with the wrong value — mostly in **source doc comments**, which I-013's scope does not reach. Same root cause: a hand-written number about code with nothing that fails when it stops being true.
+
+**The cosmetic half.** Every ceiling in the codebase is 1024-based (`MAX_BLOB_BYTES = 256 * 1024 * 1024`, `DEFAULT_MAX_INLINE_BYTES = 1024 * 1024`, `WRITEBACK_BUDGET_BYTES = 128 * 1024`, `GcConfig::ceiling_bytes = 50 * 1024³`), so IEC units are the accurate ones. But the illustrative "200 MB PDF" sat one or two lines from "256 MiB" in `README.md`, `docs/architecture.md`, `docs/deployment-guide.md` and `crates/chapr-proto/src/tools.rs` — the two numbers a reader most wants to compare, in two different systems.
+
+**The half that was actually wrong:**
+- `crates/chapr-endpoint/src/main.rs:26` documented the `CHAPR_MAX_INLINE_BYTES` default as **512 KiB**. The constant is `1024 * 1024` = **1 MiB**. Wrong by 2×, and it is the number an operator reads before overriding the cap.
+- `crates/chapr-endpoint/src/server.rs:39` reasoned from "512 KiB is roughly 130k tokens" fifteen lines above its own note "**Raised from 512 KiB to 1 MiB for the tender workload**". The comment contradicted itself; the opening half was stale leftover from before the raise, left behind *in the same comment block* that records the raise.
+- `crates/chapr-coord/src/gc.rs:37` and `docs/deployment-guide.md` labelled the blob ceiling **50 GB** for a `50 * 1024 * 1024 * 1024` constant. Not a style choice: it understated the real ceiling by 7.4% (50 GiB = 53.7 GB).
+- `crates/chapr-proto/src/tools.rs:42-43` called axum's `DefaultBodyLimit` **2 MB**, where `crates/chapr-coord/src/http.rs:143` calls that same default 2 MiB.
+
+**Fixed 2026-08-24** in the README-iteration commit: four docs plus `CLAUDE.md` and five source files onto binary units, and the three wrong values corrected. `cargo check` and `cargo clippy -D warnings` clean after (comment-only changes).
+
+**Deliberately not converted, so the next reader does not "fix" them:** the test-fixture sizes in `server.rs` (`400 KB`, `425 KB` ×2, `600 KB`) are approximations of raw byte counts, internally consistent, and converting them is churn no reader benefits from. `version.rs`'s "multi-GB/s" stays decimal because throughput is correctly SI. One residual inconsistency accepted: `server.rs:47` now reads "~400 KiB tender" while the test at `server.rs:1818` still says "400 KB" about the same tender.
+
+**Why this stays filed rather than resolved-and-forgotten:** nothing prevents a recurrence. The stale 512 KiB survived a change to the very constant it described, three paragraphs away from it. I-013's option (a) — a CI check that recomputes claimed numbers — would only have caught this if its scope included `//!` and `///` comments, which I-013's write-up does not mention. Worth deciding **together with I-013**, not separately.
+
 ---
 
 ## Resolved

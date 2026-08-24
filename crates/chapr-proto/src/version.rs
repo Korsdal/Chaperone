@@ -17,7 +17,7 @@ use std::fmt;
 ///   V" is a direct lookup (concept §12).
 /// - **Audit chain link** — `from_version`/`to_version` on every write commit.
 ///
-/// BLAKE3 is chosen for throughput (multi-GB/s over 200 MB PDFs), **not** for
+/// BLAKE3 is chosen for throughput (multi-GB/s over 200 MiB PDFs), **not** for
 /// cryptographic strength. It is a change detector, not a commitment — SMB
 /// offers no trustworthy cheap version token, so the file is hashed on read and
 /// re-hashed under the lock on write (concept §7, cost accepted).

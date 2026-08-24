@@ -34,7 +34,7 @@
 //! long after the old bytes are gone; restoring a GC'd version fails cleanly
 //! with `VersionNotFound`.
 //!
-//! The numbers (90 d / last-10 / ~50 GB) are runaway-protection defaults and an
+//! The numbers (90 d / last-10 / ~50 GiB) are runaway-protection defaults and an
 //! explicitly-open item (§18 #2 — validate against real write volume); all are
 //! tunable here without touching the mechanism.
 

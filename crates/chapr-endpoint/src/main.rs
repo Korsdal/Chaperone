@@ -23,7 +23,7 @@
 //!   at start-up. Set but unusable is fatal: an operator who meant to confine
 //!   must not silently get an unconfined endpoint.
 //! - `CHAPR_MAX_INLINE_BYTES` — cap on the rendered body of one `chapr_read`.
-//!   Default [`chapr_endpoint::server::DEFAULT_MAX_INLINE_BYTES`] (512 KiB). A
+//!   Default [`chapr_endpoint::server::DEFAULT_MAX_INLINE_BYTES`] (1 MiB). A
 //!   *context* limit — how much of a file can usefully enter the model's input
 //!   window — not a round-trip limit. What a model can write back is the separate
 //!   [`chapr_endpoint::server::WRITEBACK_BUDGET_BYTES`], reported per read as
