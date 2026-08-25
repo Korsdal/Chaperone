@@ -174,6 +174,32 @@ Format is judged **independently of UTF-8 validity**, because those are not the
 same test: an uncompressed PDF can be entirely ASCII and would otherwise be served
 as "text".
 
+**A text file in an encoding other than UTF-8 is also refused — and is told apart
+from a binary one.** Chaperone reads text as UTF-8 and deliberately does not
+convert encodings: the write side can only emit UTF-8, so transcoding on read
+would mean a verbatim echo silently rewriting the file in a different encoding and
+recording it as a deliberate edit under the user's own principal. For files where
+the encoding is a requirement rather than an accident — a `.bat` that `cmd.exe`
+reads as OEM, a `.ps1` that PowerShell 5.1 reads with a BOM — that would break the
+file's own function.
+
+So these refuse too, but they are a **different refusal with a different message**.
+A Windows-1252 Danish `.txt` or a UTF-16 file from PowerShell is not a binary and
+must never be described as one: the refusal names the encoding it found, says
+plainly that nothing is wrong with the file or the share, and gives the human
+remedy (re-save as UTF-8, or fix the export step that produces it). Calling that
+file "an unrecognised binary … worth their attention" made agents raise phantom
+findings with users about their own routine documents (I-015).
+
+The refusal also **files a `NON_UTF8_TEXT` diagnostic** (`Severity::Warning`) with
+the structural evidence — likely encoding, BOM, offset of the first invalid byte,
+share of high bytes — so the diagnosis reaches whoever administers the share
+through the channel built for it, grouped per file, instead of depending on an
+agent to relay it. Container refusals file nothing: a PDF on a shared drive is a
+designed outcome, and recording every one would bury the entries that need action.
+The classifier that separates the two cases chooses **only which message to
+print** — never whether to serve — which is what keeps its thresholds harmless.
+
 Byte-exact round-trips are still available, and still safe, behind an explicit
 `allow_binary` on the read. The legitimate use is *copying* a file, not reading
 it. With it set, the body comes back base64 with `encoding=base64` in the envelope

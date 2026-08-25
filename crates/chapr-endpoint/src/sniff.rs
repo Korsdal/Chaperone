@@ -35,6 +35,27 @@
 //! file is a worse bug than a missed refusal of a binary one, because the
 //! missed case still has [`crate::server::render_envelope`]'s base64 path and
 //! the envelope's `encoding=base64` header behind it.
+//!
+//! ## [`classify_unrecognised`] chooses a *sentence*, never an outcome
+//!
+//! Bytes that are not a known container and not valid UTF-8 are refused either
+//! way. What [`classify_unrecognised`] decides is only **how to describe them**,
+//! because "a Danish text file in a Windows code page" and "an unrecognised
+//! binary" need opposite messages: the first is a routine file needing a re-save,
+//! the second is worth an administrator's attention. Calling the first one binary
+//! made an agent report a phantom binary to a user about their own `.txt`
+//! (I-015).
+//!
+//! **Do not promote this into a serve-versus-refuse decision.** Both arms refuse,
+//! which is what keeps its thresholds harmless: a misclassification costs one
+//! wrong sentence, never a file served as text that should not have been. The
+//! `BM`-bitmap argument above applies with full force the moment that changes.
+//!
+//! Nor does it transcode. Chaperone coordinates files; converting encodings is
+//! not its job, and it could not do it safely from here anyway — the write side
+//! (`chapr-endpoint`'s `decode_content`) can only emit UTF-8, so a transcoded
+//! read echoed back would silently rewrite the file in a different encoding and
+//! record it as a deliberate edit.
 
 /// A recognised container format that cannot usefully be read as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +266,244 @@ fn zip_flavour(bytes: &[u8]) -> Container {
     }
 }
 
+/// A byte-order mark: a *declaration* by whoever wrote the file, not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bom {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Utf32Le,
+    Utf32Be,
+}
+
+impl Bom {
+    pub fn label(self) -> &'static str {
+        match self {
+            Bom::Utf8 => "utf-8",
+            Bom::Utf16Le => "utf-16le",
+            Bom::Utf16Be => "utf-16be",
+            Bom::Utf32Le => "utf-32le",
+            Bom::Utf32Be => "utf-32be",
+        }
+    }
+
+    /// The UTF-32 forms must be tested before the UTF-16 ones they contain:
+    /// `FF FE 00 00` (UTF-32LE) starts with `FF FE` (UTF-16LE).
+    fn detect(bytes: &[u8]) -> Option<Bom> {
+        if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+            return Some(Bom::Utf32Le);
+        }
+        if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+            return Some(Bom::Utf32Be);
+        }
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            return Some(Bom::Utf8);
+        }
+        if bytes.starts_with(&[0xFF, 0xFE]) {
+            return Some(Bom::Utf16Le);
+        }
+        if bytes.starts_with(&[0xFE, 0xFF]) {
+            return Some(Bom::Utf16Be);
+        }
+        None
+    }
+}
+
+/// What the bytes of a non-UTF-8 text file appear to be encoded in.
+///
+/// Deliberately coarse. Windows-1252 and ISO-8859-1 cannot be told apart from
+/// the bytes alone — the difference lives in `0x80..=0x9F`, and a file may simply
+/// not use it — so this names the *family* and leaves the exact code page to the
+/// person who knows which tool wrote the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    Utf16Le,
+    Utf16Be,
+    Utf32Le,
+    Utf32Be,
+    /// A single-byte code page: Windows-1252, ISO-8859-1 or a relative.
+    SingleByte,
+    /// A UTF-8 byte-order mark, but the bytes after it are not valid UTF-8. The
+    /// file declares an encoding it is not in, so the fault is in whatever wrote
+    /// it — worth saying separately, because "re-save as UTF-8" is the remedy for
+    /// a file that never claimed to be UTF-8, and this one did.
+    Utf8Mislabelled,
+    /// Not valid UTF-8 and plausibly text, but nothing identifies the encoding.
+    Unknown,
+}
+
+impl TextEncoding {
+    /// Phrased to complete "the file is saved in {label} rather than UTF-8".
+    pub fn label(self) -> &'static str {
+        match self {
+            TextEncoding::Utf16Le => "UTF-16, little-endian",
+            TextEncoding::Utf16Be => "UTF-16, big-endian",
+            TextEncoding::Utf32Le => "UTF-32, little-endian",
+            TextEncoding::Utf32Be => "UTF-32, big-endian",
+            TextEncoding::SingleByte => {
+                "a single-byte code page (Windows-1252 or a relative, which cannot be told \
+                 apart from the bytes alone)"
+            }
+            TextEncoding::Utf8Mislabelled => {
+                "something other than the UTF-8 its byte-order mark claims"
+            }
+            TextEncoding::Unknown => "an encoding that cannot be identified from its bytes",
+        }
+    }
+
+    /// The stable machine form, for a diagnostic's facts.
+    pub fn code(self) -> &'static str {
+        match self {
+            TextEncoding::Utf16Le => "utf-16le",
+            TextEncoding::Utf16Be => "utf-16be",
+            TextEncoding::Utf32Le => "utf-32le",
+            TextEncoding::Utf32Be => "utf-32be",
+            TextEncoding::SingleByte => "single-byte-code-page",
+            TextEncoding::Utf8Mislabelled => "utf-8-bom-but-not-utf-8",
+            TextEncoding::Unknown => "unknown",
+        }
+    }
+}
+
+/// What an administrator needs to tell one cause from another, and nothing more.
+///
+/// Structural only, deliberately: no excerpt of the file's content. These facts
+/// travel to the coordinator's diagnostics store, which the admin page renders
+/// without an ACL check, and the existence leak documented in concept §13.2 is
+/// not worth widening into a content leak to save somebody one glance at the
+/// file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextEvidence {
+    pub looks_like: TextEncoding,
+    pub bom: Option<Bom>,
+    /// Offset of the first byte that is not valid UTF-8 — the caller's own
+    /// `Utf8Error::valid_up_to`, which is the authority on it.
+    pub first_invalid_offset: usize,
+    pub first_invalid_byte: u8,
+    /// Share of bytes at or above `0x80`. A few percent reads as prose in a code
+    /// page; a compressed stream is around half.
+    pub high_byte_ratio: f32,
+}
+
+/// Bytes that are neither a known container nor valid UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Unrecognised {
+    /// Text in some encoding other than UTF-8. Still refused — see the module doc.
+    NonUtf8Text(TextEvidence),
+    /// Not plausibly text at all.
+    Binary,
+}
+
+/// A file of NULs is not UTF-16 with an empty high byte. Requiring some non-NUL
+/// bytes, and requiring *those* to look like text, is what separates the two.
+const MIN_UTF16_NUL_SHARE: f32 = 0.25;
+/// Almost all NULs must share one parity for a UTF-16 claim to be honest.
+const MIN_UTF16_PARITY_SHARE: f32 = 0.9;
+/// Above this share of high bytes, "text in a code page" stops being credible.
+const MAX_TEXT_HIGH_BYTE_RATIO: f32 = 0.30;
+/// Control bytes outside this set are the strongest single binary signal: prose
+/// in any code page does not contain them, and arbitrary bytes almost always do.
+fn is_allowed_control(b: u8) -> bool {
+    matches!(b, 0x09 | 0x0A | 0x0C | 0x0D)
+}
+
+fn is_stray_control(b: u8) -> bool {
+    (b < 0x20 && !is_allowed_control(b)) || b == 0x7F
+}
+
+/// Describe bytes that [`identify`] did not recognise and that failed UTF-8.
+///
+/// `first_invalid_offset` is the caller's `Utf8Error::valid_up_to()`. Taking it as
+/// an argument rather than recomputing it makes the precondition part of the
+/// signature: there is no "what if it was valid UTF-8" branch to get wrong,
+/// because a caller with valid UTF-8 has nothing to pass.
+///
+/// **This picks a message, not an outcome.** Both variants are refused.
+pub fn classify_unrecognised(bytes: &[u8], first_invalid_offset: usize) -> Unrecognised {
+    let len = bytes.len();
+    let first_invalid_byte = bytes.get(first_invalid_offset).copied().unwrap_or(0);
+
+    let mut high = 0usize;
+    let mut nul_even = 0usize;
+    let mut nul_odd = 0usize;
+    let mut strays = 0usize;
+    let mut non_nul = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b >= 0x80 {
+            high += 1;
+        }
+        if b == 0x00 {
+            if i % 2 == 0 {
+                nul_even += 1;
+            } else {
+                nul_odd += 1;
+            }
+        } else {
+            non_nul += 1;
+            if is_stray_control(b) {
+                strays += 1;
+            }
+        }
+    }
+    let ratio = if len == 0 { 0.0 } else { high as f32 / len as f32 };
+    let evidence = |looks_like, bom| {
+        Unrecognised::NonUtf8Text(TextEvidence {
+            looks_like,
+            bom,
+            first_invalid_offset,
+            first_invalid_byte,
+            high_byte_ratio: ratio,
+        })
+    };
+
+    // 1. A BOM is a declaration. Trust it over any amount of counting — including
+    //    when it is a lie, which is itself the useful finding.
+    if let Some(bom) = Bom::detect(bytes) {
+        let enc = match bom {
+            Bom::Utf8 => TextEncoding::Utf8Mislabelled,
+            Bom::Utf16Le => TextEncoding::Utf16Le,
+            Bom::Utf16Be => TextEncoding::Utf16Be,
+            Bom::Utf32Le => TextEncoding::Utf32Le,
+            Bom::Utf32Be => TextEncoding::Utf32Be,
+        };
+        return evidence(enc, Some(bom));
+    }
+
+    // 2. BOM-less UTF-16: what PowerShell and older Windows editors leave behind
+    //    when the BOM is stripped. Latin text puts a NUL in every other byte, and
+    //    which parity says which endianness.
+    let nuls = nul_even + nul_odd;
+    if nuls > 0 && non_nul > 0 {
+        let nul_share = nuls as f32 / len as f32;
+        let dominant = nul_even.max(nul_odd) as f32 / nuls as f32;
+        let text_like = (strays as f32 / non_nul as f32) < 0.05;
+        if nul_share >= MIN_UTF16_NUL_SHARE && dominant >= MIN_UTF16_PARITY_SHARE && text_like {
+            // Latin text as UTF-16LE is [lo, 00] pairs, so its NULs land on odd
+            // offsets; big-endian is [00, hi] and lands on even ones.
+            let enc = if nul_odd >= nul_even {
+                TextEncoding::Utf16Le
+            } else {
+                TextEncoding::Utf16Be
+            };
+            return evidence(enc, None);
+        }
+    }
+
+    // 3. No NULs and no stray controls is what a single-byte code page looks
+    //    like. The high-byte share separates prose from dense binary that
+    //    happens to avoid the control range.
+    if nuls == 0 && strays == 0 && len > 0 {
+        let enc = if ratio < MAX_TEXT_HIGH_BYTE_RATIO {
+            TextEncoding::SingleByte
+        } else {
+            TextEncoding::Unknown
+        };
+        return evidence(enc, None);
+    }
+
+    Unrecognised::Binary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +650,157 @@ mod tests {
             assert!(c.label().starts_with('a'), "{c:?} label must read as a noun phrase");
             let _ = c.class();
         }
+    }
+
+    // ---- classify_unrecognised ------------------------------------------
+    //
+    // Fixtures from the bug-hunt-2508 investigation (I-015), kept because they are
+    // the cases the old guard called "an unrecognised binary format".
+
+    /// Pass the real `valid_up_to`, the way `binary_guard` does.
+    fn classify(bytes: &[u8]) -> Unrecognised {
+        let off = std::str::from_utf8(bytes)
+            .expect_err("fixture must not be valid UTF-8")
+            .valid_up_to();
+        classify_unrecognised(bytes, off)
+    }
+
+    fn text(bytes: &[u8]) -> TextEvidence {
+        match classify(bytes) {
+            Unrecognised::NonUtf8Text(e) => e,
+            Unrecognised::Binary => panic!("expected text, got Binary"),
+        }
+    }
+
+    /// `Tilbud til æble A/S` in Windows-1252 — the case in the field report.
+    fn cp1252_danish() -> Vec<u8> {
+        let mut v = b"Tilbud til ".to_vec();
+        v.push(0xE6); // æ
+        v.extend_from_slice(b"ble A/S\r\nPris: 100 kr\r\nSagsbeh: S");
+        v.push(0xF8); // ø
+        v.extend_from_slice(b"ren ");
+        v.push(0xC5); // Å
+        v.extend_from_slice(b"strup\r\n");
+        v
+    }
+
+    fn utf16(s: &str, little_endian: bool, bom: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        if bom {
+            v.extend_from_slice(if little_endian { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+        }
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&if little_endian {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            });
+        }
+        v
+    }
+
+    #[test]
+    fn danish_text_in_a_code_page_is_text_not_binary() {
+        let ev = text(&cp1252_danish());
+        assert_eq!(ev.looks_like, TextEncoding::SingleByte);
+        assert_eq!(ev.bom, None);
+        // 0xE6 is the æ, eleven bytes in.
+        assert_eq!(ev.first_invalid_offset, 11);
+        assert_eq!(ev.first_invalid_byte, 0xE6);
+        assert!(ev.high_byte_ratio < 0.1, "prose is mostly ASCII: {}", ev.high_byte_ratio);
+    }
+
+    /// A spreadsheet export, which is the other half of the realistic set.
+    #[test]
+    fn a_code_page_csv_is_text() {
+        let mut v = b"navn;beloeb\nF".to_vec();
+        v.push(0xE5); // å
+        v.extend_from_slice(b"rup;100\n");
+        assert_eq!(text(&v).looks_like, TextEncoding::SingleByte);
+    }
+
+    /// One accented character in an otherwise ASCII file is still text. The old
+    /// guard refused this too, and it is the likeliest shape of all.
+    #[test]
+    fn a_single_high_byte_is_still_text() {
+        let ev = text(&[0x41, 0x42, 0xE5, 0x43, 0x44]);
+        assert_eq!(ev.looks_like, TextEncoding::SingleByte);
+        assert_eq!(ev.first_invalid_byte, 0xE5);
+    }
+
+    #[test]
+    fn utf16_is_recognised_with_and_without_a_bom() {
+        let s = "Tilbud til \u{e6}ble A/S\r\n";
+        let le_bom = text(&utf16(s, true, true));
+        assert_eq!(le_bom.looks_like, TextEncoding::Utf16Le);
+        assert_eq!(le_bom.bom, Some(Bom::Utf16Le));
+
+        let be_bom = text(&utf16(s, false, true));
+        assert_eq!(be_bom.looks_like, TextEncoding::Utf16Be);
+        assert_eq!(be_bom.bom, Some(Bom::Utf16Be));
+
+        // BOM-less is the harder half: parity of the NUL bytes is the only signal.
+        let le = text(&utf16(s, true, false));
+        assert_eq!(le.looks_like, TextEncoding::Utf16Le);
+        assert_eq!(le.bom, None);
+
+        let be = text(&utf16(s, false, false));
+        assert_eq!(be.looks_like, TextEncoding::Utf16Be);
+        assert_eq!(be.bom, None);
+    }
+
+    /// The UTF-32 BOMs contain the UTF-16 ones. Getting the order wrong reports
+    /// the wrong encoding to the administrator who has to fix the file.
+    #[test]
+    fn utf32_boms_are_not_mistaken_for_utf16() {
+        let mut le = vec![0xFF, 0xFE, 0x00, 0x00];
+        le.extend_from_slice(&[0x41, 0x00, 0x00, 0x00]);
+        assert_eq!(text(&le).looks_like, TextEncoding::Utf32Le);
+
+        let mut be = vec![0x00, 0x00, 0xFE, 0xFF];
+        be.extend_from_slice(&[0x00, 0x00, 0x00, 0x41]);
+        assert_eq!(text(&be).looks_like, TextEncoding::Utf32Be);
+    }
+
+    /// A file that claims UTF-8 and is not. The remedy differs from a file that
+    /// never claimed anything, so the class is worth keeping distinct.
+    #[test]
+    fn a_utf8_bom_over_non_utf8_bytes_is_named_as_mislabelled() {
+        let mut v = vec![0xEF, 0xBB, 0xBF];
+        v.extend_from_slice(&cp1252_danish());
+        let ev = text(&v);
+        assert_eq!(ev.looks_like, TextEncoding::Utf8Mislabelled);
+        assert_eq!(ev.bom, Some(Bom::Utf8));
+    }
+
+    #[test]
+    fn genuinely_binary_bytes_are_still_binary() {
+        // Stray control bytes are the signal prose never produces.
+        let mut blob = vec![0x00, 0x01, 0x02, 0x03, 0x1B, 0x7F, 0xFF, 0xFE];
+        blob.extend((0u8..=255).rev());
+        assert_eq!(classify(&blob), Unrecognised::Binary);
+    }
+
+    /// A sparse region of NULs is not UTF-16 with an empty high byte. Without the
+    /// "some non-NUL bytes, and those look like text" condition it would be.
+    ///
+    /// A file of *nothing but* NULs cannot be tested here, and that is worth
+    /// knowing rather than working around: NUL is valid UTF-8, so such a file
+    /// never reaches this function at all — it is served as text, by
+    /// `render_envelope`, exactly as it was before this classifier existed.
+    #[test]
+    fn a_run_of_nuls_is_not_utf16() {
+        assert!(std::str::from_utf8(&[0x00; 64]).is_ok(), "NUL is valid UTF-8");
+        let mut mostly_nul = vec![0x00; 60];
+        mostly_nul.extend_from_slice(&[0x01, 0x02, 0x1B, 0xFF]);
+        assert_eq!(classify(&mostly_nul), Unrecognised::Binary);
+    }
+
+    /// Dense high bytes with no controls are not credible as prose, but they are
+    /// not confidently anything either — say so rather than naming a code page.
+    #[test]
+    fn dense_high_bytes_are_text_of_an_unnamed_encoding() {
+        let dense: Vec<u8> = (0..200).map(|i| 0x80 + (i % 0x40) as u8).collect();
+        assert_eq!(text(&dense).looks_like, TextEncoding::Unknown);
     }
 }

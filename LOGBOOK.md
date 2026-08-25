@@ -4,7 +4,7 @@ logbook:
   type: engineering-logbook
   version: "1.0"
   created: "2026-07-21"
-  last_updated: "2026-08-21"
+  last_updated: "2026-08-25"
   last_updated_by: "Claude"
 
 state:
@@ -117,10 +117,10 @@ Three properties that make it useful vs. a file that gets abandoned:
 | `logbook/decisions/architecture.md` | 20 decision bodies — data model, protocol, read/write path, backends, invariants, coord internals |
 | `logbook/decisions/deployment.md` | 11 decision bodies — installer, service, packaging, releases, auth, admin authority, hosting |
 | `logbook/decisions/process.md` | 5 decision bodies — naming, licensing, repo posture, publication, agent/plugin behaviour |
-| `logbook/decisions/product.md` | 1 decision body — product scope, positioning, market boundaries (new 2026-08-21, D-037) |
-| `logbook/logs/2026-08.md` | 6 session entries (08-03 … 08-21) |
+| `logbook/decisions/product.md` | 2 decision bodies — product scope, positioning, market boundaries (new 2026-08-21, D-037) |
+| `logbook/logs/2026-08.md` | 7 session entries (08-03 … 08-21b) |
 | `logbook/logs/2026-07.md` | 18 session entries (07-21 … 07-22) |
-| `logbook/ISSUES.md` | all 13 issues in full, live and resolved |
+| `logbook/ISSUES.md` | all 14 issues in full, live and resolved |
 | `logbook/BACKLOG.md` | live backlog + Delivered appendix (26 rows) + removed duplicates |
 | `logbook/state-history.md` | narrative displaced from Current State, newest first |
 
@@ -133,25 +133,38 @@ Three properties that make it useful vs. a file that gets abandoned:
 > Superseded narrative → `logbook/state-history.md`.
 
 **Phase:** implementation — v1 complete, installed at a customer, pilot-tested on
-real hardware (2026-08-14), and **phase 1 of the 0.2 plan delivered (2026-08-21)**.
-Multi-backend (SMB + POSIX); Windows, Linux **and macOS** now all run the test
-suite in CI.
+real hardware (2026-08-14), **phase 1 of the 0.2 plan delivered (2026-08-21)** and
+**corrected (2026-08-25, I-015)**. Multi-backend (SMB + POSIX); Windows, Linux
+**and macOS** now all run the test suite in CI.
 
-**Version `0.1.2`** (set by jok 2026-08-21). A *patch* bump carrying phase 1,
-deliberately: **it stays 0.1.x until it is tested and true** — the minor number is a
-claim about proven-ness, not a changelog of effort. Versioning is a human
-responsibility; never fill in a bump.
+**Version `0.1.3`** (set by jok 2026-08-25), tagged `v0.1.3`. A *patch* bump again,
+correcting phase 1's read guardrail: **it stays 0.1.x until it is tested and true**
+— the minor number is a claim about proven-ness, not a changelog of effort.
+Versioning is a human responsibility; never fill in a bump.
 
-**Status:** three crates build clean; **364** tests pass (was 324); clippy
+**Status:** three crates build clean; **381** tests pass (was 364); clippy
 `-D warnings` clean. **29** coord routes + the **11-tool** MCP surface (unchanged —
 phase 1 added no tools), plus the six-tab token-gated admin page. MSRV **1.88.0**.
 *Every number here measured this session, not carried over.*
+
+**Read-path refusals now come in two kinds, and this is the shape to know
+(D-039, I-015).** A **container** — PDF, Office, image, archive — is refused by
+magic bytes with advice naming what to read instead. **Text in an encoding other
+than UTF-8** is *also* refused, but as a different thing entirely: the message
+names the encoding, says plainly that nothing is wrong with the file or the drive,
+and gives the human remedy, while a `NON_UTF8_TEXT` warning carries the structural
+evidence to coord's diagnostics for whoever administers the share. Chaperone
+coordinates files; it does not convert encodings or extract text (that is E-028).
+The classifier behind the split **chooses a message, never an outcome** — both arms
+refuse — and `instructions()` warns agents not to author text as base64 or to
+answer a refused read by copying its bytes elsewhere.
 
 **What phase 1 changed, in one line each:**
 - **1.3** `chapr_read` refuses binary containers (16 formats, magic bytes, never
   extension) with advice naming what to read instead. Base64 is now **opt-in on
   read** (`allow_binary`) — a behaviour change for any caller that relied on the
-  old default.
+  old default. *It also refused every non-UTF-8 **text** file as "an unrecognised
+  binary format" — see I-015, fixed 2026-08-25.*
 - **1.2** TLS on by default in the shipped template; plaintext warns at every
   start; a missing cert and a scheme/TLS mismatch are both refused with a usable
   message.
@@ -246,7 +259,7 @@ previously did.)*
 7. **Update `specs/fmcp-architecture-concept.md` to match D-026** — it still
    asserts the two channels "never cross". (CLAUDE.md's half is done.)
 
-Deferred engineering (E-015, E-020, E-021, E-024b, V3-cloud) → `logbook/BACKLOG.md`.
+Deferred engineering (E-015, E-020, E-021, E-024b, E-028, V3-cloud) → `logbook/BACKLOG.md`.
 
 ---
 
@@ -277,6 +290,7 @@ Deferred engineering (E-015, E-020, E-021, E-024b, V3-cloud) → `logbook/BACKLO
 |----|----------|------|-------|--------|
 | [D-038](logbook/decisions/process.md#d-038) | Project memory is published: `LOGBOOK.md` and `logbook/` become tracked, customer identifiers scrubbed | 2026-08-21 | process | CURRENT |
 | [D-038](logbook/decisions/process.md#d-038) | Project memory is published: `LOGBOOK.md` and `logbook/` become tracked, customer identifiers scrubbed | 2026-08-21 | process | CURRENT |
+| [D-039](logbook/decisions/product.md#d-039) | Chaperone coordinates; it does not extract or transcode. That is an add-on (E-028), not a missing feature | 2026-08-25 | product | CURRENT |
 | [D-037](logbook/decisions/product.md#d-037) | On-prem is the product; cloud stays deferred on a market judgment, not an architectural exclusion | 2026-08-21 | product | CURRENT (review 2027-02-21) |
 | [D-036](logbook/decisions/process.md#d-036) | Project memory splits by theme under `logbook/`; the root file becomes an index | 2026-08-21 | process | CURRENT |
 | [D-035](logbook/decisions/deployment.md#d-035) | The endpoint is delivered as an MCP server, not as a Claude Desktop extension | 2026-08-19 | deployment | CURRENT |
@@ -331,47 +345,29 @@ introduced by the split). CURRENT by inspection, 2026-08-21 — worth a one-line
 
 | Month | Entries |
 |---|---|
-| `logbook/logs/2026-08.md` | 5 — 2026-08-19/20, 08-14, 08-06, 08-05, 08-03 |
+| `logbook/logs/2026-08.md` | 7 — 2026-08-21b, 08-21, 08-19/20, 08-14, 08-06, 08-05, 08-03 |
 | `logbook/logs/2026-07.md` | 18 — 2026-07-22 (a–c), 2026-07-21 (base, b–o) |
 
-### Session 2026-08-21b — jok / Claude
-**Type:** engineering (roadmap review → phase 1 delivered)
-**Focus:** review the untracked 0.2→0.5 roadmap against the code, then run phase 1 through. Ended with a scope decision (D-037), five delivered items, a version bump, and the logbook itself going public.
+### Session 2026-08-25 — jok / Claude
+**Type:** engineering (bug hunt → correction → boundary decision)
+**Focus:** a suspected regression in the read path, brought as a written brief with an explicit instruction to verify before fixing. It confirmed, but the fix that followed was not the one the brief was costing — jok's reframing turned it from a capability question into a product boundary, and that is the session's real output.
 
-**Worked on:** *(per-item detail lives in Current State above and in the roadmap; this is the record of what happened, not a second copy of what it does)*
-- [x] **Audited the roadmap proposal item-by-item against the tree** — three parallel explore passes (coord auth/TLS/GC, endpoint read path/tools/watcher, CI/examples/leases/docs). Verdicts + `file:line` evidence in `specs/reviewed_roadmap.md` (local); plan rewritten as v2 with v1 preserved beside it. **Item IDs kept stable** so the audit's verdicts still map 1:1. The audit's own findings mattered as much as the plan: 1.2 was already ~90% shipped, 4.2's lease mechanism does not work as the plan assumed, and 1.1's acceptance criterion already passed before anything was built.
-- [x] **D-037** — on-prem is the product; cloud deferred on a *market judgment*, not an architectural exclusion (review 2027-02-21). New `product` decision theme. Phase 6 rescoped to linkage-only; identity stays pluggable.
-- [x] **Phase 1 delivered, all five items** — 1.3 binary read guardrail (new `sniff` module), 1.2 TLS residue, 1.1 authenticated control channel (new `endpoint_token` module + `Authenticated` extractor over nine unguarded routes), 1.5 macOS in CI, 1.4 the e2e job. **Tool count unchanged at 11** — phase 1 added no tools, which item 3.2's reasoning about context cost required.
-- [x] **Version → 0.1.2, set by jok.** A patch bump, deliberately: "it stays 0.1.x until it is tested and true."
-- [x] **The logbook is now tracked (D-038)**, reversing D-033's exclusion of it, with customer identifiers scrubbed first. Also **`specs/`**: a new gitignored directory for jok's working material, so `docs/` holds only what a reader needs (three files, down from nine).
-**Three bugs no test could see, all found by running the thing rather than testing it:**
-- **`serve` never validated its config.** `Config::load` went straight to `run_server`; the structural rules were enforced only by the wizard's `probe` and the admin settings API. So a **hand-written** config — exactly what the shipped template invites — started a server with the auth allow-list, bind-address-as-URL and loopback rules all unchecked. Found by pointing `serve` at an https URL with no `[tls]` and watching it come up happily. `validate()` now runs inside `load`, after `apply_overrides` so an env var cannot smuggle past it.
-- **The non-interactive wizard produced TLS with an `http://` URL.** The only scheme reconciliation lived inside `interactive_fill`, which `--non-interactive` skips entirely. Merely wrong before; **fatal** once the mismatch rule landed, and it would have broken the scripted installer.
-- **The self-test reported "coordinator reachable" with no credential.** `/healthz` is deliberately open, so a wrong token surfaced several checks later as something unrelated. It now probes an authenticated route and stops with the real diagnosis.
+**Worked on:**
+- [x] **Verified the brief's claim, and refuted half of it.** `binary_guard`'s second clause treated "not valid UTF-8" as "not text", so every CP1252 or UTF-16 file was refused as "an unrecognised binary format … worth their attention". Reproduced against the real function with five fixtures; prior behaviour at `abefc61` confirmed by reading the tree (`render_envelope` byte-identical, no guard, so base64 with `encoding=base64`). **But the regression is narrower than it looked:** base64 Danish prose was never analysable either, so what was lost is *default round-trippability* and *accurate diagnosis*, not readability. The refusal **policy** was always defensible. Findings in `specs/bug-hunt-2508-findings.md` (local).
+- [x] **jok's reframing, which changed the work:** *"It is not a file extraction service, it is a coordination service — and the coordination part works. The extraction of useful text is not Chaperone's job… it should not give the message that something is wrong with the service itself. The issue is the files."* Recorded as **D-039**, which also chose I-005's long-standing third option (declare it out of scope and coordinate the derived artifacts) and generalised it beyond PDFs. Capability booked as **E-028**, a separate deployable.
+- [x] **Fixed message and diagnosis, deliberately not capability.** `sniff::classify_unrecognised` (BOMs, NUL parity for endianness, high-byte ratio — `std` only, no dependency) splits unrecognised bytes into text-in-another-encoding versus binary, and **chooses a message, never an outcome**: both arms still refuse, which is what keeps its thresholds harmless. `RefusalKind` replaces `container: Option<_>`; the text class gets its own frame that never says "binary", separates Chaperone's health from the file's state in the first sentence, states the boundary in-band, and gives the human a remedy. All five classes gained the boundary sentence.
+- [x] **The diagnosis now reaches the people who can act on it.** A `NON_UTF8_TEXT` warning carries the structural evidence through `diag.rs` — which was built for exactly this and which the refusal path had **never reached**, since it returns before `tool_failure`. Coord groups by `(code, path)` and the remedy points at the *producing step*, so a folder of legacy files reads as one fix. Container refusals file nothing: a PDF on a share is a designed outcome, the same line `classify` already draws. Facts are structural only — no content excerpt, so §13.2's existence leak is not widened.
+- [x] **jok's follow-up question found the hole the fix had left**, and it was the sharpest moment of the session: *if extraction is agentic and writes through Chaperone, does Chaperone create files it then refuses to read?* Answer, measured: **no through `utf8`** (`String::into_bytes()` is valid UTF-8 by construction — an agent authoring text has no encoding to get wrong), **yes through `base64`** (nothing guards the write path). The reachable sequence is partly our own making: a read is refused → the refusal names `allow_binary` for copying → an agent told "produce a mirror" reads "copy" as its job → the same unreadable encoding lands somewhere new.
+- [x] **Mitigated with guidance, on jok's call** — the rule now sits in `server::instructions()` beside D-028's write-routing rule, naming the specific loop, plus one clause on `ContentEncoding::Base64`'s schema doc. jok's reasoning: *"If the model understands it, they can avoid it, and better, they can explain to the user what went wrong."* A symmetric write guard was **rejected**: it would refuse byte-exact copying, which is `allow_binary`'s one legitimate use. D-039 amended to record all of this against itself.
+- [x] **Two invariants pinned that were load-bearing and unasserted.** `any_utf8_write_can_be_read_back_as_text` (five hostile cases) and the companion test recording the base64 hole rather than hiding it. The first was **mutation-checked** — `decode_content`'s `utf8` arm temporarily made to emit `0xE6`, test went red naming offset 36, reverted and diffed byte-identical. A green test that cannot fail pins nothing.
 
-**Verified, not assumed:**
-- Every CI step run **verbatim locally on Windows** before being written into the workflow: config generation, hostname startup, the `pkill`→`taskkill` fallback, all four enforcement assertions, and the self-test at **8 passed / 0 failed / exit 0** — including *"a second exclusive open was refused while the first was held"*.
-- Enforcement checked over real HTTP with curl, not only in unit tests: issued token → 200 with a real body; forged 64-char token → 401; principal header alone → 401; `journal/clear` unauthenticated → 401; `/healthz` → 200.
-- Both smoke suites green against a live coordinator (`smoke_parts` 14/14, `smoke_pilot` 11/11 in 7.4 s including a 16 MiB blob).
+**Verified:** `cargo test --workspace` **381 passing** (was 364), 0 failed; `cargo clippy --workspace --all-targets -- -D warnings` clean. Serve-versus-refuse is byte-for-byte unchanged — the three pre-existing round-trip tests pass untouched, and `classifying_the_bytes_never_serves_them` pins that no read that worked before behaves differently. Every throwaway probe reverted and `git status` confirmed clean between passes.
 
-**Mistakes of my own, recorded because they will recur:**
-- **`sed` on Rust source bit three times.** An insertion anchored on a fn name landed *under* the `#[tokio::test]` belonging to the next function; a `\n` inside a temporary `println!` became real newlines, so deleting "the line" left five orphaned fragments; and a backslash in a folder-name pattern failed the whole expression. Use the file tools for code.
-- **The worst one was nearly silent.** After removing an orphaned attribute the test count came out 182 where 183 was expected — chasing that single-test gap found I had **disabled an existing auth test** (`content_routes_require_an_identity_under_enforced_auth`): still compiling, no longer running. Count your tests.
-- **Overreached twice on E-015**, claiming on-prem-only collapses it to `negotiate` and kills OIDC's rationale. Wrong both times: D-023 chose OIDC for three reasons and only the cloud one weakens here. Recorded in D-037 rather than quietly corrected.
+**State changes:** version `0.1.2` → **`0.1.3`** (jok, this session); tests 364 → 381; `sniff.rs` gains the classifier, `server.rs` gains `RefusalKind` + `report_encoding_finding` + the encoding paragraph in `instructions()`, `diag.rs` gains `record()` for findings that are not `ChaprError`s. New: **D-039**, **I-015**, **E-028**. `docs/architecture.md` updated for both refusal classes.
 
-**After the first CI runs — three commits, and one lesson worth more than the fixes:**
-- **`edbc8eb`** — run 1 died on windows-latest at its *first step*, `cargo build`: `Could not resolve host: static.crates.io`. Cause was CI's new shape, not the runner alone — three jobs with warm caches became six, four brand new, all doing a cold `cargo fetch` in parallel. Fixed with `needs: check` (e2e reuses the cache `check` just saved, and skips entirely on a red build), a per-OS `shared-key`, `CARGO_NET_RETRY: 10`, sparse registry. It did not recur, so: transient, load-related.
-- **`d4db4de`** — two real faults. clippy `useless_format` (`config.rs:554`), **not** a phase-1 regression: the line dates from `b1e7814` and only failed once CI's stable clippy reached **1.98.0**. Deleted rather than given clippy's `.to_string()` fix, which would have preserved a tautology. And macOS e2e died on **`sed -i`** — a GNU-ism; BSD sed reads the script as a backup suffix. Fixed by not editing the file: `CHAPR_COORD_AUTH=shared-secret` uses the documented defaults→file→env precedence.
-- **The lesson, worth more than either fix: "clippy clean" was measured on the wrong toolchain.** Local was **0.1.97**; CI enforces `stable` = **1.98.0**. Installing 1.98.0 locally found a **second** lint the reported legs structurally could not show — `chunks_exact_to_as_chunks` in `watch_win.rs`, `cfg(windows)`, so never compiled by ubuntu or macOS. Windows hit it the moment its build cleared DNS. Fixing only what was reported would have bought another red. `as_chunks::<2>()` confirmed on MSRV by compiling against 1.88.0, not by reading release notes. Now green at both ends: clippy + 364 tests on 1.98.0, build + tests on 1.88.0.
+**Two things found and deliberately not fixed:** a UTF-8 file *with* a BOM is served as text with `U+FEFF` inside the envelope body and nothing handles BOMs in either direction (I-015 residual 2); and the decision index in `LOGBOOK.md` carries **two identical D-038 rows** — pre-existing, left alone rather than silently edited.
 
-**State changes:** version `0.1.2`; 364 tests; new modules `chapr-endpoint/src/sniff.rs` and `chapr-coord/src/endpoint_token.rs`; new `e2e` CI job (3 legs); new `product` decision theme; `LOGBOOK.md` + `logbook/` tracked. Docs corrected where they described the old behaviour: `security.md` (the control plane authenticates now, with the two remaining limits stated plainly), `architecture.md` (read limits + auth), `deployment-guide.md` (TLS and auth as explicit wizard steps), README, the MCPB manifest, and the coord config template.
-
-**Open questions:** (1) **`cargo fmt` is still not in CI** — 365 files drift from rustfmt, so adding it means reformatting the tree. Mechanical, but a separate commit and jok's call. (2) **1.4 covers 2 of its 5 named scenarios**: the lease-leak suite needs a fault-injecting proxy that does not exist in the repo, and kill-mid-write/journal-recovery and the Office `~$F` refusal have no example at all. (3) **The e2e job has now run twice, and what it proved is narrower than green.** Actions accepts the YAML, and the macOS leg reached the auth-restart step — so share setup, coordinator startup and **both smoke suites passed on macOS**, the first end-to-end validation there (I-012). Still unproven after two runs: **everything Windows-specific** — `New-SmbShare`, the coordinator over UNC, and the mandatory-lock check, which is the whole point of that leg — plus the auth-restart step and the self-test on any leg. (4) **D-D′ is the gate on Track B** and needs jok + Kristian, not code.
-
-**Next session start from:** **the CI run at `d4db4de`** (pushed; two earlier runs are already analysed above). Both 1.98 lints are fixed and verified against CI's exact toolchain, so `check` should be green on all three OSes; `e2e` then runs for the first time with the `sed` fix in place. **The one thing still entirely unproven is the Windows leg past clippy** — `New-SmbShare`, the coordinator over UNC, and the mandatory-lock check, which is the only automated evidence for invariant 3 this project would have. If it breaks there, that is real and not a one-line fix.
-
-Then, in order: **jok's two carried-over items** — the ssh-agent decision (recommendation: leave the passphrase human-gated, and treat "jok pushes" as policy rather than a defect) and nothing else outstanding on the blocker now that its diagnosis is corrected above. Then **phase 1's leftovers** in open question (2) — the fault proxy, the kill-mid-write and Office-lock examples, and the `cargo fmt` reformat call. Then the **D-D′ conversation** before anything in Track B gets designed.
-
+**Next session start from:** **a code review of the solution as it now stands** — phase 1's edits plus this session's safeguard, reviewed as one body of work rather than as two changes. Worth pointing it at the read path specifically: `sniff.rs`'s thresholds have never been exercised against anything but chosen fixtures, `binary_guard`'s new shape is one session old, and the `NON_UTF8_TEXT` diagnostic's admin-page rendering is still **unexercised** — steps 4 and 5 of that plan's verification need the real deployment and could not be run here. **Then phase 2 of the 0.2→0.5 roadmap** (`specs/chaperone-roadmap-0.2-to-0.5.md`, local). Carry into it: **the question for Kristian** — does the extraction pipeline write explicit UTF-8? Python's `open(p,'w')` with no `encoding=` resolves to cp1252 on a Danish-locale box, and if any mirror is written that way then every mirror with a Danish character in it is refused, which is the pilot's main workload failing on its main content. That answer sets I-015's real severity and nothing in code can settle it.
 ---
 
 ## Known Issues
@@ -391,6 +387,7 @@ Then, in order: **jok's two carried-over items** — the ssh-agent decision (rec
 | [I-011](logbook/ISSUES.md#i-011) | Release + CI workflows had never executed on GitHub. | LOW | 2026-08-19 | **PARTLY RESOLVED** 2026-08-20 |
 | [I-013](logbook/ISSUES.md#i-013) | Nothing verifies the docs' numeric claims against the code, so they drift silently. | LOW | 2026-08-21 | OPEN |
 | [I-014](logbook/ISSUES.md#i-014) | Storage units mixed decimal and binary; three doc comments stated the wrong constant. | LOW | 2026-08-24 | **FIXED** 2026-08-24 (prevention open, see I-013) |
+| [I-015](logbook/ISSUES.md#i-015) | Binary guard refused non-UTF-8 *text* and told the agent to report it as a suspicious binary. | ~~MED~~ LOW | 2026-08-21 | **MOSTLY RESOLVED** 2026-08-25 (capability deferred to E-028, D-039) |
 
 ᵇ **I-004 was audited 2026-08-21 and stays OPEN, scope widened.** Its original two
 claims were genuinely fixed on 2026-08-14, but §Status went stale again within a week
@@ -415,6 +412,7 @@ Resolved and moved out: I-001, I-006, I-008, I-010, **I-012** → `logbook/ISSUE
 | ID | Task | Priority | Est. Sessions | Status |
 |----|------|----------|---------------|--------|
 | E-015 | Enforced control-plane auth (pluggable): `negotiate` (on-prem) / **generic OIDC** validator + `TokenSource` (cloud/hybrid) | MED | 2–3 | DEFERRED |
+| E-028 | **File-extraction MCP for Chaperone** — separate deployable: documents and legacy-encoded text → UTF-8 mirrors Chaperone can serve | MED | large | TODO |
 | E-020 | SQLite backend-registry table + admin API (runtime-mutable routing) | LOW | 1–2 | TODO |
 | E-021 | Relax `VersionToken` to backend-opaque (BLAKE3 for synth, ETag for cloud) | LOW | 1 | TODO |
 | V3-cloud | Cloud backends S3 → Azure → Graph (conditional-PUT / lease / ETag adapters + cloud-event watchers) | LOW | large | TODO |

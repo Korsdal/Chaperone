@@ -22,6 +22,19 @@ members = [
 # Shared package metadata. Every crate inherits these with `x.workspace = true`
 # so version/edition/license are defined once and cannot drift between binaries.
 [workspace.package]
+# 0.1.3 set by jok 2026-08-25, correcting phase 1's binary read guardrail: it
+# refused every non-UTF-8 *text* file and told the agent to report it to the user
+# as a suspicious binary (I-015). The refusal stays — Chaperone coordinates files
+# and does not convert encodings (D-039) — but it now names the encoding, says
+# plainly that nothing is wrong, and files a NON_UTF8_TEXT diagnostic for whoever
+# administers the share. Plus the guidance that stops an agent copying a refused
+# file's bytes into a new one and reproducing the problem there.
+#
+# A patch bump again, on the same reasoning as 0.1.2 and worth restating because it
+# is the rule: **it stays 0.1.x until it is tested and true.** This release is a
+# correction to the previous one, which is the least a patch number can mean, and
+# nothing here has met a customer yet.
+#
 # 0.1.2 set by jok 2026-08-21, carrying phase 1 of the 0.2 plan: the binary read
 # guardrail, TLS on by default, and an authenticated control channel.
 #
@@ -33,7 +46,7 @@ members = [
 # Human owns version bumps (see README) — nothing automated touches this line, and
 # the release workflow refuses a tag that disagrees with it, so the bump is the
 # decision and the tag only records it.
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 # 1.88.0 is the highest rust-version declared anywhere in the LOCKED dependency
 # graph: darling 0.23 and time 0.3.55 require it, with the icu_* 2.2 crates just

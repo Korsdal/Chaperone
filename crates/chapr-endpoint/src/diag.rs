@@ -81,17 +81,48 @@ impl Diagnostics {
     /// these are rare — an unreachable coord classifies as local-only, so the one
     /// case that would block does not reach the network at all.
     pub async fn report(&self, coord: &CoordClient, principal: &Principal, e: &ChaprError) {
-        let Some(mut report) = classify(e) else {
+        let Some(report) = classify(e) else {
             return;
         };
+        // An unreachable coordinator cannot be told that it is unreachable.
+        let local_only = matches!(e, ChaprError::CoordUnreachable);
+        self.deliver(coord, principal, report, local_only).await;
+    }
+
+    /// Record a condition that is not a [`ChaprError`] at all.
+    ///
+    /// [`classify`] is the right door for anything the error enum can express, and
+    /// most callers want it. This one exists for findings the endpoint makes
+    /// *while succeeding*: `chapr_read` refusing a text file for being in a legacy
+    /// encoding is not an error — the read worked, the file is intact, and the
+    /// caller is told so — but it is exactly the kind of environment fact this
+    /// module was built to make discoverable, and it is invisible to `classify`
+    /// because it never becomes a `ChaprError` (see `server::NotAnalysable`, which
+    /// is deliberately outside coord's wire contract).
+    pub async fn record(
+        &self,
+        coord: &CoordClient,
+        principal: &Principal,
+        report: DiagnosticReport,
+    ) {
+        self.deliver(coord, principal, report, false).await;
+    }
+
+    /// Stamp identity onto a report and put it in both sinks.
+    async fn deliver(
+        &self,
+        coord: &CoordClient,
+        principal: &Principal,
+        mut report: DiagnosticReport,
+        local_only: bool,
+    ) {
         report.principal = principal.clone();
         report.host = self.host.clone();
 
         // Local first: it is the sink that still works when the other does not.
         self.append_local(&report);
 
-        // An unreachable coordinator cannot be told that it is unreachable.
-        if matches!(e, ChaprError::CoordUnreachable) {
+        if local_only {
             return;
         }
         if let Err(err) = coord.report_diagnostic(&report).await {
