@@ -14,6 +14,101 @@
 
 ---
 
+<a id="d-043"></a>
+### D-043 — Track B and D-D′ close: mirror coordination is re-deferred with a named trigger — 2026-09-07
+
+**Problem:** D-D′ — *"should D-028's line move?"* — was the project's only open **architectural**
+gate, and the previous roadmap's largest remaining investment depended on the answer. **Track B, the
+document gap**, ran to Branch A (items 3.1–3.3, 5.1; ~3–4 sessions) and Branch B (3.4, 4.1–4.4, 6.1;
+~8–10 sessions), the latter coordinating the text mirrors a plugin produces. D-040's direction makes
+that incoherent: coordinating regenerable output produced outside Chaperone means reversing D-028 to
+take ownership of a plugin's artifacts. But leaving the gate *open* was its own cost — it made
+roughly a dozen roadmap items read as planned when they were not, which is exactly how the previous
+roadmap's item 3.5 came to be silently deleted.
+
+**Options:** **(a)** Close outright — D-D′ resolves to "the line holds", full stop. **(b)** Re-defer
+with a named trigger — closed as not-on-the-path, with what would reopen it written down.
+**(c)** Leave open, preserving optionality.
+
+**Chosen (jok): (b), re-defer with a named trigger.** The line holds — **extraction and its output
+both belong to the plugin** — so Branch B (3.4, 4.1–4.4, 6.1) is off the path and D-D′ stops being a
+gate. It is recorded as re-deferred rather than deleted, because the question is a legitimate one
+that a customer can reopen, and a roadmap that quietly loses items is the failure mode this project
+has already committed once.
+
+**The named triggers — any one of these reopens D-D′:**
+1. **A customer asks for coordinated mirrors** — specifically, wants a mirror's provenance, version
+   history or conflict handling rather than just its bytes.
+2. **The plugin's extraction proves unreliable in a way coordination would fix** — e.g. mirrors going
+   stale against their sources with nobody noticing, which is a linkage problem and squarely Track
+   B's original argument.
+3. **A second plugin starts writing mirrors to the same share**, at which point "the plugin owns its
+   output" stops identifying a single owner.
+
+**What this does *not* close.** **5.1, chunked reads, survives the closure as an open question of its
+own** — it serves an already-extracted mirror in bounded ranges, which is a read-path capability
+rather than extraction, and the previous roadmap rated it the highest user-visible value in the plan.
+It is deliberately *not* decided here. **D-A** — mirrors beside the source for ACL reasons — becomes
+guidance the plugin may follow rather than a Chaperone fork, and stays inside D-020 where it lives.
+E-028 remains booked and remains somebody else's deployable (D-039).
+
+**Consequence to accept plainly:** this forecloses, for now, the one capability a hyperscaler cannot
+cheaply copy. D-037 kept linkage on the board precisely because it is un-commoditisable, and if the
+document workflow turns out to be where users feel value daily, this ordering is right for the
+product's identity and wrong for its adoption. Trigger 1 exists to catch that.
+
+**Made by:** jok (the disposition and the form) / Claude (the analysis and the triggers) |
+**Review date:** with D-037's 2027-02-21 review, or on any trigger above | **Status:** CURRENT
+
+<a id="d-040"></a>
+### D-040 — Chaperone is a coordination primitive: correctness, then accountability, then deployment — 2026-08-28
+
+*Decided 2026-08-28; recorded 2026-09-07, on jok's instruction, from his own wording in
+`specs/chaperone-roadmap-2808.md` §1 and Current State. The delay is itself worth noting — the
+direction governed a week of work before it had an entry.*
+
+**Problem:** A validation pass against the codebase (25 claims checked; 7 of 27 remembered answers
+contradicted by the code) produced nine drafted issues and three genuinely unbooked items. The
+obvious response was to slot them into the existing roadmap. jok refused that framing: *"it's not the
+most important thing that we follow the roadmap already in place with these new issues, but that we
+decide again — where are we heading with this product?"*
+
+**Decided (jok).**
+
+1. **Chaperone is a coordination primitive. It is not an extraction tool.** Extraction belongs to
+   plugins, and the collaborator's tender pipeline already does it. Confirms **D-039**; holds
+   **D-028**'s line. (Disposition of the work that depended on the opposite: **D-043**.)
+2. **Priority order: correctness core → accountability → deployment.** Deployment already took its
+   large step in **D-032** (the executable is the installer, the wizard, verification in the binary),
+   so it slides rather than leads.
+3. **Design for several customers, not this one.** Generalise now.
+4. **Make the audit claim true**, rather than lowering it to fit. (Scope of that claim: **D-042**.)
+5. **The audience is the agent, and the person whose files it writes.**
+
+**Why point 5 changed the ranking, and it is jok's correction of Claude's framing.** Chaperone is
+Apache-2.0: nobody signs an invoice, and per **D-033** the business sits in deployment, fileserver
+knowledge and support rather than in withholding source. So the audit trail is **not a sales
+artefact**, and the GRC/procurement framing a security review naturally reaches for is off-target.
+What the trail is for is making it *reasonable for someone to let agents write to their shared drive
+at all*. "A user is responsible for their agents" is a claim made to that user's own organisation,
+and it has to be true for their sake. That is why accountability ranks **second** rather than last.
+
+**Which promise this identifies as weakest.** Chaperone promises **correctness** (no lost updates),
+**accountability** (the audit trail as a primary deliverable), and **agent usability** (refusals that
+teach). The validation pass found correctness nearly finished and provable, usability healthy after
+I-015 and D-039 — and **accountability the one leg that does not match its billing**: no chain, no
+append-only enforcement, no verifier, retention specified but never implemented, and a session
+identity that is a process id. Hence the ordering: finish what is nearly true, then make true what is
+claimed.
+
+**Where this is weakest, recorded rather than hidden:** it rests on one conversation, not on customer
+evidence. The strongest input — how often contention and conflicts actually happen — is unmeasured,
+and the pilot's coord database would answer it and is not in this repo. Until then "correctness
+first" is reasoning about risk, not about observed pain.
+
+**Made by:** jok (the direction, and the reframing of point 5) / Claude (the validation pass and the
+analysis it rests on) | **Review date:** with D-037's 2027-02-21 review | **Status:** CURRENT
+
 <a id="d-039"></a>
 ### D-039 — Chaperone coordinates; it does not extract or transcode. That is an add-on, not a missing feature — 2026-08-25
 

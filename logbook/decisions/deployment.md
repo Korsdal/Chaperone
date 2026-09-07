@@ -10,6 +10,56 @@
 
 ---
 
+<a id="d-042"></a>
+### D-042 — What the audit trail claims: an amendment scoping D-024, not a reversal of it — 2026-09-07
+
+**Problem:** **D-040(4) says "make the audit claim true."** Before building the machinery that would
+make it true, the claim itself has to be stated precisely — otherwise the work delivers something
+stronger-sounding than it is. Three findings set the stakes, none of them previously booked:
+
+1. **No integrity at all today.** `audit_log` is an ordinary table in coord's read-write SQLite file
+   (`db.rs:83-98`); "append-only" is a property of the code that touches it and nothing more. A local
+   administrator can edit or delete rows and leave no trace. There is no chain, no enforcement and no
+   verifier.
+2. **Writing is easier than reading, which is backwards for an accountability record.** `POST /audit`
+   takes `kind`, `path`, `session_id` and `detail` **verbatim from any authenticated caller**
+   (`http.rs:729-747`), while *reading* the trail requires `AdminAuth` (`http.rs:754-758`).
+3. **The principal is asserted, not verified** (D-024's own accepted limitation), and a per-deployment
+   shared secret admits any endpoint holding it, which may then name any principal.
+
+**The tension.** D-024 priced the trail at *"accountability, not court-grade non-repudiation"*, and
+**that same framing justified deferring E-015, choosing `trusted-header`, and shipping unsigned
+bundles (I-003)**. If "make the claim true" is read as raising D-024's bar, all three reopen at once.
+
+**Options:** **(a)** An amendment that *scopes* D-024 — states precisely what a chain does and does
+not claim, D-024 otherwise standing. **(b)** A reversal — treat the audit claim as a commitment that
+pulls E-015 and bundle signing in with it. **(c)** Leave D-024 alone and build the chain silently.
+
+**Chosen (jok): (a), an amendment scoping D-024. D-024 stands.**
+
+**What the chain will and will not claim, stated so nobody has to infer it:**
+- **It claims tamper-evidence about *records*.** Given the chain, rows cannot be altered or removed
+  after the fact without detection. That is a real and useful property: it makes "the trail says what
+  it said yesterday" checkable.
+- **It does not claim proof about *people*.** The principal in a row is **asserted** by an endpoint
+  that authenticated with a per-deployment secret. A chain over an asserted identity proves the
+  record was not edited; it does not prove who acted. **Binding identity to a verified subject is
+  E-015**, which stays deferred and stays pluggable (D-037(3)).
+- **Therefore: not non-repudiation, and the documentation must keep saying so.** The audience is the
+  customer's own organisation (D-040(5)), for whom "these records have not been tampered with" is
+  worth having; it is not evidence for a dispute with a third party.
+
+**Consequences.** E-015 stays deferred — this amendment deliberately does not reopen it, and it must
+not be cited as a reason to. I-003's unsigned bundles are likewise untouched. Two things do become
+in-scope because they are cheap and inside the scoped claim: **aligning write authorisation with read
+authorisation** on `POST /audit`, and **validating `kind`/`path` server-side** rather than trusting
+the caller's strings. The chain must be **coord-derived, never caller-supplied** — D-006's standing
+rule for `version_log.prev_hash`, which already demonstrates the pattern in this schema.
+
+**Made by:** jok (the posture, and that it scopes rather than reverses) / Claude (the three findings
+and the claim/limit wording) | **Review date:** when E-015 is built, which is what would let the
+claim about people change | **Status:** CURRENT
+
 <a id="d-035"></a>
 ### D-035 — The endpoint is delivered as an MCP server, not as a Claude Desktop extension — 2026-08-19
 
@@ -81,6 +131,11 @@
 5. **Verification ships in the binary too — `chapr-endpoint self-test`.** The live smoke suites in `examples/` cover more, and can be run nowhere that matters: they need `cargo`, and a sales laptop has an extension and nothing else. The self-test reuses the lib's own `ops`/`read`/`write` paths and reports PASS/FAIL/**SKIP**, where a check that could not run is never a pass — the mapped-drive branch (E-022) is still unconfirmed against a real server, and a green line for a check that did not execute would bury that. Gated on one explicit `args().nth(1)` comparison rather than a `clap` parser, because Claude Desktop launches this binary with no arguments and expects MCP on stdio; nothing may reinterpret the no-argument case.
 
 **Consequence worth carrying forward.** Two of these three defects were invisible to every test we had because they live in *what the software tells a human*, not in what it computes. The handover is now a returned `String` with a test asserting the bind address never appears in it as a URL — the class of guard that could not exist while the function only called `println!`.
+
+**Made by:** jok (all three defects found by using the installer as a customer would) / Claude (the
+fixes) | **Review date:** N/A | **Status:** CURRENT *(trailer added 2026-09-07: the entry never
+carried one, per the footnote flagged on 2026-08-21. CURRENT by inspection — D-040 confirms it, on
+the grounds that deployment "already took its large step in D-032".)*
 
 <a id="d-031"></a>
 ### D-031 — Admin authority: a token enforces, a role follows; auth changes as a dual-mode cutover — 2026-08-12

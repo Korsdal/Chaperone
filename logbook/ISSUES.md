@@ -169,6 +169,27 @@ Tests 364 → 381 (this entry said 378; the commit body and a re-measure both sa
 **Still unanswered, and it is the question that set the severity:** per D-028 the primary read path is the extraction pipeline's text mirrors, and Python's `open(p,'w')` with no `encoding=` resolves to cp1252 on a Danish-locale Windows box (PEP 686 changes this only in 3.15). If any mirror is written that way, every mirror containing a Danish character is refused — the pilot's main workload failing on its main content. The refusal now says so accurately and files a diagnostic naming the producing step, which is the best a coordinator can do about it, **but somebody still has to ask Kristian.**
 
 ---
+**2026-09-07 — the sibling axis, and a reversal of one of this issue's own choices (jok's call).**
+I-015 fixed the *severity* axis: a text file in a code page is no longer described as a suspicious
+binary. Phase A of the 2808 roadmap fixed the **content** axis on the arm this issue left alone — the
+`RefusalKind::UnknownBinary` advice branch, which still ended *"an unrecognised binary on the share is
+worth their attention."*
+
+**This reverses a deliberate decision made here on 2026-08-25**, and the superseded argument is worth
+keeping because it is a good one: *"for bytes that really are not text, 'worth their attention' is
+honest and stays — it is only wrong about a text file in a code page."* True on the severity axis.
+What it misses is that **reaching that arm establishes nothing**: it means only that no magic number
+matched and the bytes did not classify as text. Chaperone has not determined the file is malformed,
+misplaced or suspicious — so attaching a judgement, plus an instruction to escalate, asserts more
+than the classifier knows. Every sibling arm (`Document`, `Archive`, `Image`, `Database`) reports a
+fact and stops; this one now does too, naming what `chapr_stat` and `chapr_list` can still do.
+
+Recorded here rather than as a new decision, on jok's call: this scopes I-015's own reasoning rather
+than settling anything new, and refusal wording is what this issue owns. The 08-25 argument is
+preserved verbatim in the test that used to assert the opposite
+(`unrecognised_binary_is_refused_with_generic_advice`), so the next reader meets both sides at the
+point of change.
+
 
 ## Resolved
 

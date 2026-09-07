@@ -10,6 +10,48 @@
 
 ---
 
+<a id="d-041"></a>
+### D-041 — Coord gets migration machinery: plain versioned SQL, and none of D-003's rejected abstractions — 2026-09-07
+
+**Problem:** **This is the one decision in the persistence area where no record existed in either
+direction**, and the gap was load-bearing. `db.rs` contains **zero** `ALTER TABLE`: the schema is
+created if absent and never changed. **D-003 asserted that persisting leases "establishes the
+migration/pool layer E-003/E-004 build on" — that layer was never built**, and the claim went
+unchallenged for seven weeks while being *cited as a constraint* in D-037(3) and in I-002's third
+residual. So a non-existent capability was doing argumentative work.
+
+It stopped being deferrable for a specific reason: **D-040 ranks accountability second**, and the
+accountability work (an audit hash chain, and retention for `audit_log`/`version_log`) is the first
+work in this project's history that **must change an existing table at a live installation**. There
+is already a customer install with data in it.
+
+**Options:** **(a)** Plain versioned SQL applied in order, `sqlx::migrate!`-style. **(b)** Commit to
+migrations but leave the mechanism until the work starts. **(c)** No machinery — hand-write schema
+changes per site.
+
+**Chosen (jok): (a).** Versioned SQL files, applied in order, recorded in a table so a partially
+migrated database is detectable rather than guessed at.
+
+**And explicitly none of the abstractions D-003 already rejected**, because a migration system is the
+natural place for all three to creep back in:
+- **No storage trait.** D-003 called this "the over-abstraction the notes explicitly warn against",
+  with one engine and ~20 users. Still true.
+- **No compile-time `DATABASE_URL`.** D-003 deliberately chose **runtime** `sqlx::query` over
+  `query!` so there is no live database at compile time. `sqlx::migrate!` embeds files at build time
+  without needing a database, which is compatible — but the `query!` macros are not, and adopting one
+  must not smuggle in the other.
+- **No ORM.**
+
+**Consequences.** Unblocks the chain and retention work (roadmap C3/C4), which are why this is being
+decided now rather than when someone reaches for it. The existing install needs a baseline migration
+that matches the schema `db.rs` creates today, or the first migration run against it will either fail
+or claim work it did not do — **that baseline is the risky part of this item, not the mechanism**.
+Also closes the D-003 claim honestly: the migration layer is now decided rather than assumed, and
+D-003's sentence should be read as intent, not as history.
+
+**Made by:** jok (the call, and the constraint that D-003's minimalism binds) / Claude (the analysis
+and the finding that the claimed layer never existed) | **Review date:** N/A | **Status:** CURRENT
+
 <a id="d-030"></a>
 ### D-030 — Subagent fan-out: serialize intra-session rather than merge sidecars; resolve drive letters rather than require them; diagnostics separate from audit — 2026-08-12
 **Trigger:** verifying `main.rs:38` while scoping D-028 — `session_id = format!("sess-{}", std::process::id())`. The SessionId is **per endpoint process**, so every subagent in one Claude Desktop session shares one MCP server, one session, **one lease identity**. The pilot's central workflow (`the verification stage`, described in its own skill as "a large fan-out" of parallel subagents) is therefore *intra*-session — exactly where leases contribute nothing.

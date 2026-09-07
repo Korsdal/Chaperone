@@ -110,4 +110,4 @@ That left two problems pulling in opposite directions. **The memory was single-l
 **Problem:** The architecture spec shipped with provisional working names (`FMCP`, `fs.*` namespace, reverse-DNS identifiers) that had to be replaced before the first commit.
 **Options:** A: keep `FMCP`/`fs.*` — free now, costly to rename across spec + tool surface + audit event names later | B: pick the real name up front.
 **Chosen:** B — **Chaperone**, tool namespace `chapr.<method>`. Rename is cheap before any code exists.
-**Made by:** project team | **Review date:** N/A
+**Made by:** project team | **Review date:** N/A | **Status:** CURRENT *(trailer added 2026-09-07: the entry never carried one, per the footnote flagged on 2026-08-21. CURRENT by inspection — the naming has held through every subsequent decision.)*
