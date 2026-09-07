@@ -250,16 +250,16 @@ elsewhere to run coord by hand.
 **Environment:** a Linux toolchain exists in WSL, building with an isolated
 `CARGO_TARGET_DIR=$HOME/chapr-target` so the Windows `target/` is never clobbered.
 
-**What's in flight:** **Phase A is pushed** (`655c2f6`→`043db2f`, in sync). The
-decision work that followed it — D-040…D-043 and the Q20/Q21 housekeeping — is
-committed locally and **not yet pushed**. `CLAUDE.md` and the concept spec are
-gitignored and ride nothing, so **invariant 6's correction lives only on this
-laptop**, which is the same shape of debt D-026 recorded in the first place.
-`0.1.3` still stands — **no version change**; neither Phase A nor a decision entry
-proves anything new. Also in flight, unchanged: the open questions in
-`specs/chaperone-roadmap-2808.md` §6 — **now 17, not 21**, since Q2, Q7, Q17, Q20
-and Q21 closed today, while **Q1 (5.1 chunked reads), Q4, Q6 and Q12 still gate
-work**.
+**What's in flight: nothing in code.** All three of today's commits are pushed
+(`655c2f6`→`cf25082`, in sync, tree clean) and `0.1.3` stands — **no version
+change**; neither Phase A nor a decision entry proves anything new. **The one
+thing that did not travel:** `CLAUDE.md` and the concept spec are gitignored, so
+**invariant 6's correction lives only on this laptop** — the same shape of debt
+D-026 recorded in the first place, and a third data point for Q20.
+
+What *is* in flight is a decision set: `specs/chaperone-roadmap-2808.md` §6 is
+**down to 17 questions from 21** (Q2, Q7, Q17, Q20, Q21 closed today), and **Q1
+(does 5.1 chunked reads survive on its merits), Q4, Q6 and Q12 still gate work**.
 
 **The push also started the run that answers B0.** `ci.yml` triggers on push to
 `main` and its matrix includes `e2e (windows-latest, smb)` — the `New-SmbShare`
@@ -503,7 +503,7 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 
 **Then Q6, and start with its factual half:** read `rmcp` and the MCP spec for a per-connection or host-supplied identifier before treating "accept per-process and say so" as the answer. D-042 makes this sharper, not softer — the chain it scopes is tamper-evidence over rows whose `session_id` is currently `sess-{pid}`, so **Phase C can deliver a verifiable record that still cannot say which agent acted.** Nobody has read the SDK for this yet.
 
-**Also unpushed:** this session's second commit (D-040…D-043 and the housekeeping). **Carried forward, still unanswered:** does the extraction pipeline write explicit UTF-8? And `CLAUDE.md` + the concept spec are gitignored, so **invariant 6's correction exists only on this laptop** — a third data point for Q20, which was left open today.
+**Carried forward, still unanswered:** does the extraction pipeline write explicit UTF-8? And `CLAUDE.md` + the concept spec are gitignored, so **invariant 6's correction exists only on this laptop** — a third data point for Q20, left open today.
 ---
 
 ## Known Issues
