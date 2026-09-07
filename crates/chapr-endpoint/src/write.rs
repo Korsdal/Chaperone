@@ -18,9 +18,13 @@
 //! after the handle is dropped, so hoisting it here is behaviour-identical and
 //! keeps the scaffolding uniform across backends.
 //!
-//! Fail-closed (concept §10): if coord is unreachable at the journal step,
-//! `write_cas` returns before any bytes are written and the handle drops closed
-//! — no journal entry, no write. Reads degrade-open; writes do not.
+//! Fail-closed (concept §10): an unreachable coord refuses the write before any
+//! bytes are written. The first coord call on the path is `assert_read` here in
+//! `write`, two calls ahead of the journal — `put_blob` and then `journal_open`
+//! in `write_cas_core` — so a coordinator that is down is refused before the
+//! exclusive open is even attempted, not at the journal step as this note used
+//! to say. Whichever of the three fails, no bytes are written and the handle
+//! drops closed. Reads degrade-open; writes do not.
 
 use crate::backend::{Backend, WriteCasArgs, WriteCtx};
 use crate::canon::canonicalize;

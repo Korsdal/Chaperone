@@ -51,14 +51,15 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 /// Override per endpoint with `CHAPR_MAX_INLINE_BYTES`. Genuinely huge files need
 /// `ReadContent::Ref` (defined in the proto, not yet produced anywhere).
 ///
-/// **Raised from 512 KiB to 1 MiB for the tender workload.** The working set is not
-/// the source PDFs — those are extracted to a text mirror before a model sees them
-/// (D-028) — it is one extracted document per read. 512 KiB is roughly 300 pages of
-/// text, which a large tender's main document plausibly exceeds, and a limit that
-/// clears most documents and refuses a few is the worst kind: it fails
-/// intermittently and looks like a Chaperone fault rather than a size problem.
-/// 1 MiB clears essentially any single tender document while still refusing
-/// something pathological.
+/// **Raised from 512 KiB to 1 MiB for the tender workload**, and the reason is
+/// worth keeping: the working set is not the source PDFs — those are extracted to
+/// a text mirror before a model sees them (D-028) — it is one extracted document
+/// per read. The old 512 KiB was roughly 300 pages of text, which a large tender's
+/// main document plausibly exceeded, and a limit that clears most documents while
+/// refusing a few is the worst kind: it fails intermittently and looks like a
+/// Chaperone fault rather than a size problem. The current 1 MiB clears
+/// essentially any single tender document while still refusing something
+/// pathological.
 pub const DEFAULT_MAX_INLINE_BYTES: usize = 1024 * 1024;
 
 /// The largest rendered body a model can realistically pass back through
@@ -554,7 +555,9 @@ writes a .restored-{timestamp} copy for comparison; set in_place=true to overwri
 
     #[tool(description = "Move/rename a file on the shared drive. Requires src_base_version (from \
 a prior read of the source); if the destination already exists, pass dst_base_version too (the \
-move overwrites it via compare-and-swap). The file's version history moves with it.")]
+move overwrites it via compare-and-swap). The file's version history follows it to the new name; \
+the audit trail keeps recording under the name each change was made to, so a file's full \
+governance history may span both names.")]
     async fn chapr_move(
         &self,
         Parameters(MoveArgs {
@@ -887,12 +890,19 @@ fn tool_error(e: ChaprError) -> CallToolResult {
              agent. Ask them to close it, then try again."
             .to_string(),
         // The one case where the change DID land. Saying "failed" here is the
-        // most damaging thing the tool could do: the caller rewrites and then
-        // conflicts against its own committed bytes.
-        ChaprError::CommittedButUnrecorded { .. } => "\n\nIMPORTANT: the file WAS written \
-             successfully. Only Chaperone's own bookkeeping entry failed. Do NOT write it \
-             again — a repeat write would collide with the bytes you just committed. Mention \
-             to the person that the history entry for this change may be missing."
+        // most damaging thing the tool could do: the caller repeats the operation
+        // and then collides with its own committed state.
+        //
+        // Verb-neutral on purpose. Every mutating verb reaches this arm — `write`,
+        // `create`, `delete` and (since the move tail was fixed) `move` — so the
+        // old "the file WAS written / Do NOT write it again" wording named the
+        // wrong action for three of the four.
+        ChaprError::CommittedButUnrecorded { .. } => "\n\nIMPORTANT: the change DID land on \
+             the share. Only Chaperone's own bookkeeping entry failed. Do NOT repeat the \
+             operation — the share already holds the result, and repeating it would collide \
+             with what you just committed. Re-read the file named above before writing to it \
+             again. Mention to the person that the history entry for this change may be \
+             missing."
             .to_string(),
         ChaprError::CoordUnreachable => "\n\nNOTHING WAS CHANGED. The coordination service \
              cannot be reached, and Chaperone deliberately refuses writes rather than risk \
@@ -1132,9 +1142,15 @@ impl NotAnalysable {
                  person which file it is and ask what they need extracted from it."
             }
             None => {
+                // Reports a fact and stops, like every sibling arm. It used to add
+                // "an unrecognised binary on the share is worth their attention",
+                // which attaches a judgement — and an instruction to escalate — to
+                // a classification this tool never established: reaching here means
+                // only that no magic number matched. A file type Chaperone does not
+                // know is not evidence of anything being wrong.
                 "What you can do: use chapr_stat for its size and version, and chapr_list to \
-                 look for a readable derived file alongside it. Tell the person what you \
-                 found — an unrecognised binary on the share is worth their attention."
+                 look for a readable derived file alongside it. Tell the person this file is \
+                 not in a format Chaperone recognises, and what you found next to it."
             }
         };
 
@@ -1884,6 +1900,179 @@ mod tests {
         assert_eq!(sidecars.len(), 1, "the loser's bytes should be parked: {sidecars:?}");
     }
 
+    /// Two writers race a file while the coordinator is down. Both must refuse,
+    /// nothing may land, and no sidecar may appear.
+    ///
+    /// This existed only as a throwaway probe, run once by hand and reverted —
+    /// which meant the project's fail-closed claim ("coord unreachable + write →
+    /// refuse") had **no coord-unreachable write test of any arity**, contended or
+    /// not. A claim about the write path that nothing exercises is the one kind
+    /// this repo cannot afford to leave as prose.
+    ///
+    /// The shape mirrors the real sequence rather than a shortcut: the read
+    /// happens while coord is up (so the caller holds a legitimate
+    /// `base_version`), then the writes go to a server whose coordinator has gone
+    /// away. Fabricating the version instead would test the stale-version path,
+    /// which is a different refusal.
+    #[tokio::test]
+    async fn two_concurrent_writes_with_coord_down_both_refuse_and_nothing_lands() {
+        let coord = permissive_coord().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("tender.md");
+        std::fs::write(&file, b"the version everyone read\n").unwrap();
+        let uri = file.to_str().unwrap().to_string();
+
+        // Read with a live coordinator to obtain a real version token.
+        let up = server_for(coord.uri());
+        let read_out = tool_text(
+            &up.chapr_read(Parameters(ReadArgs { uri: uri.clone(), allow_binary: false }))
+                .await
+                .unwrap(),
+        );
+        let version = envelope_version(&read_out);
+
+        // Now the coordinator is gone. Port 1 is unroutable on purpose — the same
+        // trick `restore_against_stub` uses in `backend.rs`.
+        let down = server_for("http://127.0.0.1:1".to_string());
+        let mut handles = Vec::new();
+        for who in ["A", "B"] {
+            let (srv, uri, version) = (down.clone(), uri.clone(), version.clone());
+            handles.push(tokio::spawn(async move {
+                srv.chapr_write(Parameters(WriteArgs {
+                    uri,
+                    content: format!("rewritten by {who}\n"),
+                    encoding: ContentEncoding::Utf8,
+                    base_version: version,
+                    force_reason: None,
+                }))
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap().expect("the MCP call itself must succeed"));
+        }
+
+        // Fail-closed means BOTH refuse. There is no winner to pick.
+        for r in &results {
+            assert_eq!(r.is_error, Some(true), "a write must not proceed without coord");
+            let text = tool_text(r);
+            assert!(
+                text.contains("NOTHING WAS CHANGED"),
+                "the caller must be told plainly that nothing landed: {text}"
+            );
+            assert!(
+                text.contains("IT support") || text.contains("coordinator"),
+                "and pointed at the actual remedy rather than a retry: {text}"
+            );
+        }
+
+        // The share is untouched, and no conflict sidecar was invented for a
+        // write that never happened.
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"the version everyone read\n",
+            "fail-closed must mean the bytes are exactly as they were"
+        );
+        let strays: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "tender.md")
+            .collect();
+        assert!(strays.is_empty(), "no sidecar or temp file may appear: {strays:?}");
+    }
+
+    /// Two agents create the same new path at once: exactly one wins, and the
+    /// loser is told the file already exists.
+    ///
+    /// Also a promoted probe. It was run because the creation path was *suspected*
+    /// of being unguarded — it is not: `create_new` carries the exclusivity, so
+    /// the guarantee comes from the filesystem rather than from the lease. Worth
+    /// pinning precisely because the mechanism is not the obvious one, and a
+    /// refactor that reached for an "exists? then write" shape would pass every
+    /// other test in this file.
+    #[tokio::test]
+    async fn two_concurrent_creates_on_one_path_yield_exactly_one_winner() {
+        let coord = permissive_coord().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("summary.md");
+        let uri = file.to_str().unwrap().to_string();
+
+        let srv = server_for(coord.uri());
+        let mut handles = Vec::new();
+        for who in ["A", "B"] {
+            let (srv, uri) = (srv.clone(), uri.clone());
+            handles.push(tokio::spawn(async move {
+                srv.chapr_create(Parameters(CreateArgs {
+                    uri,
+                    content: format!("first draft by {who}\n"),
+                    encoding: ContentEncoding::Utf8,
+                }))
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap().expect("the MCP call itself must succeed"));
+        }
+
+        let winners = results.iter().filter(|r| r.is_error != Some(true)).count();
+        let losers: Vec<String> = results
+            .iter()
+            .filter(|r| r.is_error == Some(true))
+            .map(tool_text)
+            .collect();
+        assert_eq!(winners, 1, "exactly one create may succeed: {results:?}");
+        assert_eq!(losers.len(), 1);
+        assert!(
+            losers[0].to_lowercase().contains("already exists"),
+            "the loser must learn the file exists, not that something broke: {}",
+            losers[0]
+        );
+
+        // One winner's content, whole — never an interleaving of both.
+        let on_disk = String::from_utf8(std::fs::read(&file).unwrap()).unwrap();
+        assert!(
+            on_disk == "first draft by A\n" || on_disk == "first draft by B\n",
+            "the file must hold exactly one author's draft, got {on_disk:?}"
+        );
+    }
+
+    /// Report BLAKE3's measured throughput instead of asserting it in a comment.
+    ///
+    /// The reviewer's worry was that hashing a large tender on every read and
+    /// write would dominate the write path. It does not, and this test says so
+    /// with a number: the cost that matters is the two share reads and the
+    /// pre-image upload, not the CPU. Kept honest by measuring rather than
+    /// claiming — `version.rs` documents "multi-GB/s" and nothing checked it.
+    ///
+    /// Deliberately not a performance gate. The bound is absurdly generous so a
+    /// loaded CI runner cannot make it flake; what it catches is a catastrophic
+    /// regression, such as someone reintroducing a per-byte allocation.
+    #[test]
+    fn hashing_is_not_the_write_path_bottleneck() {
+        let bytes = vec![0xABu8; 8 * 1024 * 1024]; // 8 MiB
+        let started = std::time::Instant::now();
+        let token = VersionToken::hash(&bytes);
+        let elapsed = started.elapsed();
+
+        let mib_per_s = 8.0 / elapsed.as_secs_f64();
+        println!(
+            "BLAKE3 over 8 MiB in {elapsed:?} — {mib_per_s:.0} MiB/s; \
+             a 50 MB tender ≈ {:.0} ms",
+            50.0 / mib_per_s * 1000.0
+        );
+
+        // Determinism at a size the fixtures never reach: the same bytes must
+        // produce the same token, which is invariant 2's whole basis.
+        assert_eq!(token, VersionToken::hash(&bytes));
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "8 MiB took {elapsed:?} — that is not a slow runner, that is a regression"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_stale_write_is_refused_and_disk_is_untouched() {
         let coord = permissive_coord().await;
@@ -1952,8 +2141,8 @@ mod tests {
             ContentBlock::Text(t) => t.text.clone(),
             other => panic!("expected text content, got {other:?}"),
         };
-        assert!(text.contains("WAS written"), "must state the write landed");
-        assert!(text.contains("Do NOT write it again"));
+        assert!(text.contains("DID land"), "must state the change landed");
+        assert!(text.contains("Do NOT repeat the operation"));
         assert!(
             !text.contains("NOTHING WAS CHANGED"),
             "must not carry the untouched-file wording"
@@ -2276,7 +2465,7 @@ mod tests {
     #[test]
     fn the_default_cap_clears_a_large_tender_document() {
         // The pilot's working set is one extracted document per read. 512 KiB was
-        // roughly 300 pages of text, which a large tender's main document exceeds —
+        // roughly 300 pages of text, which a large tender's main document exceeded —
         // and a limit that clears most documents while refusing a few fails
         // intermittently and looks like a Chaperone fault.
         let six_hundred_kb = vec![b'a'; 600 * 1024];
@@ -2442,9 +2631,25 @@ mod tests {
                 .unwrap(),
         );
         assert!(msg.contains("a format Chaperone does not recognise"), "{msg}");
-        // For bytes that really are not text, "worth their attention" is honest
-        // and stays — it is only wrong about a text file in a code page.
-        assert!(msg.contains("worth their attention"));
+
+        // This arm reports facts and stops, like every sibling.
+        //
+        // It previously asserted the opposite, and the reasoning is kept because
+        // it was deliberate rather than careless: "for bytes that really are not
+        // text, 'worth their attention' is honest and stays — it is only wrong
+        // about a text file in a code page." True on the severity axis, which is
+        // what I-015 was about. Superseded on the content axis: reaching this arm
+        // means only that no magic number matched and the bytes did not classify
+        // as text, which is not evidence that anything is wrong — so telling the
+        // model to escalate attaches a judgement the tool never established.
+        assert!(
+            !msg.contains("worth their attention"),
+            "no escalation on a classification the tool has not established: {msg}"
+        );
+        assert!(
+            msg.contains("chapr_stat") && msg.contains("chapr_list"),
+            "must still name what the model *can* do: {msg}"
+        );
     }
 
     /// The message an agent sees is deliberately short on technical detail; the

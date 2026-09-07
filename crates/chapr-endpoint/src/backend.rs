@@ -364,7 +364,11 @@ fn write_cas_core<P: FsPrimitives>(
     // `restore` already ordered it this way; `write` was the outlier.
     rt.block_on(coord.put_blob(current.clone()))?;
 
-    // Step 8: journal intent (fail-closed if coord is unreachable — no write).
+    // Step 8: journal intent. Also fail-closed — but this is not where
+    // fail-closed *starts*: `assert_read` (in `write`) and `put_blob` (step 7)
+    // both talk to coord first, so an unreachable coordinator has already
+    // refused the write by the time control reaches here. Nothing is written on
+    // any of the three failures.
     // Gated: only for non-atomic backends.
     if !atomic_writes {
         rt.block_on(coord.journal_open(&OpenJournalRequest {
@@ -701,10 +705,19 @@ fn move_cas_core<P: FsPrimitives>(
     prims.rename(src.as_str(), dst.as_str(), overwrite).map_err(|e| map_os_err(dst, e))?;
 
     // Then migrate coord state atomically to match.
+    //
+    // The rename above ALREADY HAPPENED, so a failure here is not a failed move:
+    // the file is at `dst` and only coord's bookkeeping is behind. D-013 accepted
+    // exactly this window ("a failure there leaves coord stale-but-recoverable");
+    // what it did not accept is telling the caller the opposite of what happened.
+    // Propagating the raw error did precisely that — a `CoordUnreachable` rendered
+    // as "NOTHING WAS CHANGED. …Chaperone deliberately refuses writes" *after* a
+    // successful rename. So this takes the committed-but-unrecorded shape that
+    // `create`, `delete`, `restore` and `write` already use for their tails.
     rt.block_on(coord.move_paths(&MovePathsRequest {
         src: src.clone(),
         dst: dst.clone(),
-        version: src_now,
+        version: src_now.clone(),
         size,
         overwrite,
         principal: principal.clone(),
@@ -713,7 +726,14 @@ fn move_cas_core<P: FsPrimitives>(
         // as dst's new head, so without this the snapshot above is named by
         // nothing and GC reclaims the only copy of what the overwrite replaced.
         dst_pre_image,
-    }))?;
+    }))
+    .map_err(|e| ChaprError::CommittedButUnrecorded {
+        // `dst` is where the file actually is now, so it is the path the caller
+        // must re-read. Naming `src` would send it back to a path that is gone.
+        path: dst.clone(),
+        version: src_now,
+        message: format!("the file was renamed from {src} to {dst}, but {e}"),
+    })?;
 
     Ok(MoveReceipt)
 }

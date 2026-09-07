@@ -292,9 +292,17 @@ pub struct HistoryResponse {
     pub entries: Vec<HistoryEntry>,
 }
 
-/// `chapr.restore(uri, version, mode)`. Runs the full contended-write path, so
-/// a restore is itself versioned and audited and cannot clobber a concurrent
-/// writer. `mode` defaults to `Copy` (concept §6.5).
+/// `chapr.restore(uri, version, mode)`. Takes the lease and the exclusive open,
+/// snapshots the current bytes, and is itself versioned and audited — so a
+/// restore can be undone. It performs **no CAS**: a restore is a deliberate
+/// overwrite (D-012, D-027), so a version committed between the `chapr.history`
+/// call and the restore is overwritten without a conflict, recoverable only
+/// through the snapshot. `mode` defaults to `Copy` (concept §6.5).
+///
+/// (Concept §6.5 and §12 describe this as running "the full write path", which
+/// would imply a CAS. Spec and code disagree here and the disagreement is open,
+/// not settled — see the roadmap's restore question. This doc describes the
+/// code.)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreRequest {
     pub uri: String,

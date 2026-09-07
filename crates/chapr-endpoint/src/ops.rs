@@ -285,7 +285,18 @@ pub async fn restore(
         }
         RestoreMode::InPlace => {
             // The full contended path: lease, exclusive open, snapshot current,
-            // write the old bytes. Cannot clobber a concurrent writer.
+            // write the old bytes.
+            //
+            // What that does and does not protect, stated exactly, because the
+            // comment here used to claim it "cannot clobber a concurrent writer"
+            // — narrowly true and broadly false. The lease plus the exclusive
+            // handle do exclude a write that is *in flight* right now. They do
+            // not make this a compare-and-swap: a restore performs no CAS by
+            // design (D-012, D-027 — "a restore is a deliberate overwrite"), so
+            // a version committed and closed between the caller's
+            // `chapr_history` and this call is overwritten with no conflict and
+            // no sidecar. The pre-image snapshot below is what makes that
+            // recoverable rather than lost.
             let lease = leases
                 .acquire(&AcquireLeaseRequest {
                     principal: principal.clone(),

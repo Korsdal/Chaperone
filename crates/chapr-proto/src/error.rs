@@ -187,18 +187,26 @@ pub enum ChaprError {
     InvalidPath { raw: String, reason: String },
 
     // ---- Committed-but-unrecorded ----------------------------------------
-    /// The bytes reached the share (write committed, handle closed) but coord
-    /// could not record it afterwards — the version-log or audit append failed.
-    /// The file's content **is** the new version; history and audit are missing
-    /// this entry, and no read receipt was recorded either.
+    /// The mutation reached the share (committed, handle closed) but coord could
+    /// not record it afterwards — the version-log or audit append failed. The
+    /// share **is** the current state; history and audit are missing this entry,
+    /// and no read receipt was recorded either.
     ///
     /// Distinct from [`Self::Internal`] on purpose: the caller must not retry
-    /// the write (that would conflict against its own committed bytes) and must
+    /// the operation (that would act against its own committed state) and must
     /// re-read before writing again. Reporting a bare failure here would tell
     /// the caller the opposite of what happened.
+    ///
+    /// **Not write-only.** `create`, `delete`, `restore` and `move` all reach for
+    /// this variant for their post-mutation tails, so the wording stays
+    /// verb-neutral: it once said "write to {path} committed on disk", which was
+    /// already false for a delete and for a move (the renamed file is at `path`,
+    /// nothing was written there). `version` names the version involved — the new
+    /// head for a write or create, the pre-image for a delete, the source's
+    /// version for a move — not necessarily what the path now hashes to.
     #[error(
-        "write to {path} committed on disk as {version}, but recording it failed: {message}; \
-         the content is live — re-read the file before writing again"
+        "the change to {path} completed on the share ({version}), but recording it failed: \
+         {message}; the share holds the result — re-read before writing again"
     )]
     CommittedButUnrecorded {
         path: CanonicalPath,
