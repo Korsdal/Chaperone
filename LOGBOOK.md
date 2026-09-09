@@ -5,7 +5,7 @@ logbook:
   version: "1.0"
   created: "2026-07-21"
   last_updated: "2026-09-09"
-  last_updated_by: "Claude"
+  last_updated_by: "Claude (W1 + W2, cowork spec)"
 
 state:
   phase: "implementation"
@@ -296,22 +296,27 @@ here; **job logs are not** (403), so step conclusions are the available evidence
 A YAML parser (`js-yaml` under node) validates the workflows locally, which is how
 run #15's invalid `ci.yml` should have been caught before the push.
 
-**What's next:**
-1. **The rig walkthrough, for both workstreams** — the one honest gap. W1 has
-   never met an SMB share; W2's `install_service` / `remove_service` / SCM paths
-   have **never executed**, because every walkthrough ran `--no-service`
-   unelevated. One elevated run on `CHAPR-FS` closes the second. Rebuild the
-   endpoint bundle *without* defaults and revert the `clean-share` checkpoint
-   first.
-2. **jok's happy-path-test skill**, for driving the MCP from the user side once
-   the whole spec is verified. That is the natural close on this spec.
-3. **C0** — now blocking move provenance (2.4) **and** the coord update path, not
-   only Phase C.
-4. **I-016 needs jok's semantics call** before B4; **B7**'s three scenarios need a
-   fault-injecting proxy that does not exist.
-5. **Owed and cheap:** run the `traceparent` measurement; answer whether
-   uninstalling an MCPB clears stored `user_config` — if it does not,
-   "uninstall and reinstall" is not a recovery path we can offer.
+**What's next — jok's order, and (3) depends on (2):**
+1. **Verify the new installation and setup on the rig.** The whole of the next
+   session, checklist at **`specs/rig-verification-0910.md`**. Elevated, because
+   W2's service paths have never run; coord upgraded **before** the endpoint,
+   because that rule gets its first real exercise here. No new engineering — a
+   failing step is a code fix, not a checklist edit. Close with **jok's
+   happy-path-test skill**, which is the intended end of this spec.
+2. **C0** — unblocked the moment (1) passes. Decision already written (**D-041**):
+   plain versioned SQL, none of D-003's rejected abstractions. It now blocks two
+   things, not one: move provenance in history (2.4) and (3) below.
+3. **The coord update path.** Deliberately last: `db::migrate` is
+   `CREATE TABLE IF NOT EXISTS` only, so an update needing a column silently does
+   nothing. Cannot be built on that, hence C0 first. Interim path is documented in
+   `docs/deployment-guide.md` — uninstall, replace, setup against the same data
+   directory.
+
+**Not blocking any of the above, and still jok's:** **Q11**/I-016 before B4,
+**Q4** before C3/C4, **Q1**. **B7**'s three scenarios still need a fault-injecting
+proxy that does not exist. **Owed and independent:** the `traceparent`
+measurement (`docs/measuring-session-identity.md`), and whether uninstalling an
+MCPB clears stored `user_config`.
 
 Deferred engineering (E-015, E-020, E-021, E-024b, E-028, V3-cloud) →
 `logbook/BACKLOG.md`. Note **E-021 ↔ V3-cloud is still circular as written** and
@@ -417,7 +422,7 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 >
 > `/logbook end`: **move the entry below into its month file first**, then write
 > the new one here. Threshold: 10000; the section sits just inside it as of
-> 2026-09-09 at 6974 bytes, re-measured after W2's entry.
+> 2026-09-09 at 9038 bytes, re-measured at session end.
 > **Take the ~9 KB ceiling on a single entry literally**: it is the real limit,
 > and prose that feels essential while writing is usually already in a decision
 > body or a commit message. Headroom is thin by design — the entry here is
@@ -448,9 +453,15 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 
 **State changes:** coord subcommands **3 → 6** (`handover`, `status`, `uninstall`); new modules `lifecycle.rs` and `setup_ui.rs`; `setup::run` returns `Applied`; coord's **service** route count unchanged at 32 (the wizard's two routes live on a temporary listener, not the service router). `docs/deployment-guide.md` updated. **D-048** written. No version change — `0.1.4` stands.
 
-**Open questions:** unchanged at 13. Nothing in W2 needed a new one. Still jok's: **Q4**, **Q11** (I-016, gates B4), **Q1**. Small and still unanswered from W1: does uninstalling an MCPB clear stored `user_config`?
+**Open questions:** **13**, and re-derived rather than carried — the roadmap lists **21** (`grep '^\*\*Q[0-9]*\.'`) and the entries record 8 closed (Q2, Q7, Q17, Q20, Q21, then Q6, Q12, then Q13). Worth noting because two intermediate figures had drifted by one in opposite directions and cancelled, so the number was right by accident: I-013's exact shape. Nothing in W2 needed a new one. Still jok's: **Q4**, **Q11** (I-016, gates B4), **Q1**. Small and still unanswered from W1: does uninstalling an MCPB clear stored `user_config`?
 
-**Next session start from:** **the rig walkthrough — it is the honest gap and it now covers both workstreams.** Nothing in W1 or W2 has met a real share or a real service install: W1 is unit tests + wiremock + a live local coordinator, W2 is real processes but `--no-service` and an unelevated shell, so `install_service`, `remove_service` and the SCM paths in `lifecycle.rs` have **never executed**. That needs an elevated run on `CHAPR-FS`. The plan's verification section has the steps; rebuild the endpoint bundle **without** defaults first and revert the `clean-share` checkpoint. **jok has a happy-path-test skill** for driving the MCP from the user side, to run once the whole spec is done — that is the natural close. **Then C0**, which now blocks move provenance (2.4) *and* the coord update path. **I-016 still needs jok's semantics call** before B4.
+**Next session start from:** **`specs/rig-verification-0910.md`, top to bottom. Verifying the new installation and setup on the rig IS the whole session** — no new engineering, and if a step fails the fix goes in the code, not in that file. jok's order for the three sessions after this one: **(1) this verification → (2) C0 → (3) the coord update path**, where (3) depends on (2) and (2) is unblocked the moment (1) passes.
+
+Everything v0.1.4 contains is code-complete and **unverified against real infrastructure**: W1 has never touched an SMB share, and W2's `install_service` / `remove_service` / SCM branches have **never executed** because every walkthrough ran `--no-service` unelevated. So run it **elevated**, and start with the ordering rule, because tomorrow is its first real exercise: the coord on `\\CHAPR-FS\chaprtest\_setup\` is the **B3 build (09-09 12:30)** and predates W1, so a new endpoint against it makes a **forced write report `CommittedButUnrecorded`** — `event: "write_forced"` is a value that coordinator cannot deserialise. Worth confirming once before upgrading, since it is the argument for the rule. Two prerequisites before anything else: `cargo build --release --workspace`, and **revert the rig's `clean-share` checkpoint** or last week's 23 open conflicts drown every listing.
+
+**Where the reasoning lives**, so nothing has to be reconstructed: **D-047** (W1 — Q13 closed as (a), the mkdir guard, refusal auditing) and **D-046** (B3's move journal) in `logbook/decisions/architecture.md`; **D-048** (W2 — browser wizard, uninstall keeps data, no update before C0) in `logbook/decisions/deployment.md`; the findings that produced all of it in `specs/cowork-findings-0909.md`, whose STATUS block maps each one to what shipped; the task board in `specs/chaperone-todo-2808.md`; operator-facing docs in `docs/deployment-guide.md` (Step 1 and Operations). The implementation plan is at `~/.claude/plans/zazzy-wandering-glade.md` — **outside the repo**, which is another Q20 data point.
+
+**Close with jok's happy-path-test skill**, which drives the MCP from the user side; it is the intended end of this spec, and its findings feed whatever follows. **Still jok's calls, unchanged and not blocking tomorrow:** **Q11**/I-016 before B4, **Q4** before C3/C4, **Q1**. **Owed and independent:** the `traceparent` measurement (`docs/measuring-session-identity.md`), and whether uninstalling an MCPB clears stored `user_config` — if it does not, "uninstall and reinstall" is not a recovery path we can offer. **Ten commits are unpushed and `v0.1.4` has no tag**; both are jok's.
 
 
 
