@@ -299,3 +299,63 @@ turned out to be required — see (2)), and no version implication acted on. Tim
 **Made by:** jok (all five calls, and the commercial assessment they rest on) / Claude (roadmap
 review, consequence analysis, and two corrected overreaches on E-015) | **Review date:** 2027-02-21
 **Status:** CURRENT
+
+
+---
+
+**AMENDMENT 2026-09-08 (jok) — the criterion is *classical fileserver semantics*, not
+geography. The line does not move; the test for what falls inside it gets sharper.**
+
+**Trigger:** a demo tenant became available carrying a **VM fileserver hosted in
+Azure**. The immediate question was whether pointing Chaperone at it is scope creep
+against (1). It is not, and working out *why* produced a better statement of the
+boundary than "on-prem" was.
+
+**The problem with "on-prem".** It names a **location**, and location is not what
+this product depends on. What Chaperone's correctness core actually requires is a
+set of **filesystem semantics**: a mandatory lock (`FILE_SHARE_NONE` excluding every
+other opener — invariant 3), ACLs that survive a write, and a rename that preserves
+file identity rather than creating a new object. Those are properties of the
+*server*, not of the building it sits in.
+
+**So the criterion is:** Chaperone is for **classical fileservers, and for agent
+collaboration on them** — anything presenting SMB/POSIX filesystem semantics,
+wherever it is hosted. A Windows Server VM in someone else's datacentre has all
+three properties and is **inside** the line. An object store has none of them and
+stays **outside** it.
+
+**What this changes:** nothing about the decision, and specifically **V3-cloud stays
+OUT** — jok reaffirmed this explicitly in the same conversation. S3, Azure Blob and
+Graph are cloud-*native* object stores with a different consistency model, no
+mandatory locking, and no identity-preserving rename; E-021's backend-opaque
+`VersionToken` fork exists precisely because they cannot be served by the same core.
+The distinction that matters is **IaaS versus PaaS**, or more precisely
+*cloud-hosted fileserver* versus *cloud-native object store* — the first is a
+deployment detail, the second is a different product.
+
+**What it improves:** the **2027-02-21 review question**. "Did a hyperscaler
+commoditise cloud agent collaboration?" is nearly unfalsifiable and answers the
+wrong thing. Under this criterion the question becomes: **"has anyone built agent
+coordination for classical fileserver semantics?"** — narrower, checkable, and
+actually the thing that would invalidate the bet.
+
+**A consequence for E-015, worth recording because (3) above rests on it.** (3)
+argues OIDC is *"testable today while Negotiate needs an AD domain that does not
+exist."* A domain can now exist — the Azure VM is domain-joinable, and it is also
+the first environment with **real network latency**, which the local rig (a
+zero-RTT Hyper-V internal switch) and CI (a loopback share) both lack. So E-015
+stops being blocked on *environment* and becomes blocked only on *priority*. The
+pluggable choice is unaffected: the NAS-with-local-accounts-and-no-realm case that
+justified it is unchanged, and (3)'s conclusion stands.
+
+**Division of test environments, settled with this (jok):** the **local Hyper-V rig**
+covers rapid development, the installation process, and file-integrity — at zero
+latency, in a workgroup with no realm. The **Azure VM** covers the **auth path**
+(Kerberos / Negotiate / OIDC) and timing under real network conditions. Neither
+replaces the other, and neither is a cloud *backend*.
+
+**Made by:** jok (the criterion, and the reaffirmation that V3-cloud stays out) /
+Claude (the IaaS-versus-PaaS distinction and the two corrections that produced it —
+an initial reading assumed Azure Files, the PaaS service, and drew two conclusions
+that a VM fileserver does not support) | **Review date:** unchanged, 2027-02-21
+**Status:** CURRENT — amends D-037, supersedes nothing

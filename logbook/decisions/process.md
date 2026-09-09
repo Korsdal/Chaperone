@@ -10,6 +10,77 @@
 
 ---
 
+<a id="d-045"></a>
+### D-045 — Three test environments with separate jobs, and a self-test whose exit code stops lying — 2026-09-08
+
+**Trigger:** **Q12** — *"is a `New-SmbShare` on a GitHub runner enough to unblock I-007, or does it
+wait for the customer's Windows Server 2022?"* — plus jok's own framing that the absence of a real
+test environment *"will keep blocking development of Chaperone."*
+
+**Problem:** every correctness question this project has asked for two months has ended in "unproven
+against a real server." B0 was gated on it, I-007 was gated on B0, E-022 had carried a live `HIGH`
+row since August for one branch nobody could exercise, and three of B7's scenarios have no home at
+all. A per-question workaround was never going to clear that; the environment was the missing thing.
+
+**Decision (1) — Q12: the CI leg clears it. Phase B proceeds.** The evidence, gathered this session:
+CI's share is a genuine `New-SmbShare` reached over UNC (`\\COMPUTERNAME\chaprci`), i.e. through the
+SMB **server driver**, not a local NTFS path; and `mandatory_lock_check` is `#[cfg(windows)]`, so on
+that leg it compiles in and can only PASS or FAIL, never skip. The step exited 0, so it passed. With
+the 2026-08-14 pilot separately measuring real Windows Server 2022, the honest reading is **the pilot
+is the evidence and CI is the regression guard**. I-007's method was in any case already settled
+empirically by D-027, so it never rested on CI alone.
+
+**Decision (2) — three environments, three jobs, none replacing another.**
+
+| Environment | Covers | Cannot cover |
+|---|---|---|
+| **CI** (GitHub runner, loopback share) | every push, three OSes, regression | remote server, real latency, a Kerberos realm |
+| **Local Hyper-V rig** (`CHAPR-FS`, Server 2022) | rapid development, install process, **file integrity**, kill-mid-write, mapped drives | identity — it is a workgroup with **no realm** |
+| **Azure VM fileserver** (demo tenant) | the **auth path** — Kerberos / Negotiate / OIDC — and **timing under real network latency** | nothing yet; it is the most faithful of the three |
+
+The rig's isolation is deliberate and structural: an **Internal** Hyper-V switch with no physical NIC
+bound and **no default gateway on either side**, on `192.168.221.0/24` (chosen not to collide with
+the corporate `172.16.43.0/24` or Hyper-V's NAT `172.19.176.0/20`). The share lives on **`D:`** and
+the coordinator's database, blobs and audit trail on **`C:`**, mirroring the customer pilot. That
+separation is not cosmetic: it converts **I-009**'s mitigation from behavioural (*"agents do not
+generate aliased paths"*) into structural, because there is no relative traversal from `D:\` to
+`C:\` for `..\..\chapr-coord\coord.db` to exploit.
+
+**Decision (3) — B8: an UNVERIFIED check exits non-zero.** `Report::finish()` returned `failed` only,
+so a run in which almost nothing executed still exited 0. The module **printed** D-032's
+SKIP-is-not-PASS rule and then returned an exit code contradicting it — and an exit code is the only
+part of that output a script reads. `Outcome::Skip` therefore splits in two:
+
+- **`Unverified`** — applies here, did not run (no `CHAPR_ROOT`, folder not on a mapped drive).
+  **Counts toward the exit code.** An operator must not read *"we did not look"* as *"it is fine."*
+- **`NotApplicable`** — cannot apply to this backend or platform (the mandatory-lock probe against
+  advisory POSIX locks; drive letters on a platform that has none). **Does not count**, because it is
+  a correct outcome rather than a gap.
+
+Collapsing the two would either fail every POSIX deployment for a meaningless check, or let a real
+Windows gap pass silently. **Demonstrated the same session:** identical infrastructure, one
+environment variable different — `CHAPR_SELFTEST_DIR` as UNC gave `8 passed, 1 unverified` → **exit
+1**; as `Z:\` gave `9 passed` → **exit 0**. Before B8 both were 0.
+
+**Consequence, accepted deliberately:** B8 would have turned CI's Windows e2e leg red, because it
+points the self-test at a UNC path. **Fixing CI rather than softening B8** — `net use Z:` and point
+`CHAPR_SELFTEST_DIR` there — was jok's call, and it makes CI *verify* E-022's branch on every run
+instead of skipping it. That change is committed but **proves out only on the next push**; the POSIX
+legs' `N/A` classification was cross-checked in WSL (clippy clean, 172 tests) rather than assumed.
+
+**Rejected:** (a) **a Docker/WSL Samba rig** — faster to iterate, but Samba is not Windows Server and
+could not settle mandatory-lock questions, making it a functional-loop rig rather than an invariant-3
+one; (b) **waiting for the customer's server** for I-007 — it would have blocked Phase B on an
+environment nobody controls, for a method D-027 had already proven; (c) **an escape hatch flag on
+B8** (`--allow-unverified`) — it reintroduces exactly the loophole being closed, and the self-test is
+what a *customer* runs.
+
+**Made by:** jok (Q12, the three-environment split, fix-CI-not-B8, the `C:`/`D:` separation) / Claude
+(the CI-run evidence, the Unverified/NotApplicable split, the isolation design) | **Review date:** N/A
+**Status:** CURRENT
+
+---
+
 <a id="d-038"></a>
 ### D-038 — Project memory is published: `LOGBOOK.md` and `logbook/` become tracked, with customer identifiers scrubbed — 2026-08-21
 

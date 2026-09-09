@@ -10,6 +10,67 @@
 
 ---
 
+<a id="d-044"></a>
+### D-044 — Session identity is per endpoint *run*, not per conversation: MCP does not offer the alternative — 2026-09-08
+
+**Problem:** **Q6**, which gated all of Phase C. `main.rs:76` mints
+`SessionId::new_unchecked(format!("sess-{}", std::process::id()))` once at startup and threads it
+through every lease, write, audit row and read receipt. The roadmap flagged this as "per-process, and
+say so" but recorded that **nobody had read the SDK** to find out whether something better was
+available. Phase C's value depends on the answer: a hash chain over rows that cannot say *which agent
+acted* is tamper-evidence without attribution.
+
+**The factual half, settled by reading `rmcp` 2.2.0 rather than by judgement.** MCP offers a stdio
+server **nothing** that identifies a conversation:
+
+- **`transport/io.rs`** — the stdio transport — contains **zero** session references. One process,
+  one connection, one lifetime.
+- **`rmcp::SessionId`** exists but is the wrong thing entirely:
+  `transport/common/server_side_http.rs:14-18` defines it as `Arc<str>` filled by
+  `uuid::Uuid::new_v4()` — minted **by the server**, for the `Mcp-Session-Id` header, on the
+  streamable-HTTP and unix-socket transports only. It is not client-supplied, not conversation-scoped,
+  and not reachable from stdio.
+- **`Meta`** (`model/meta.rs:230-243`) reserves exactly eight `_meta` keys: `progressToken`, four
+  `io.modelcontextprotocol/*` (protocolVersion, clientInfo, clientCapabilities, logLevel), and W3C
+  Trace Context's `traceparent` / `tracestate` / `baggage` (SEP-414). **None is a conversation id.**
+- **`clientInfo`** names the *application* (Claude Desktop, and a version), not the conversation.
+
+**And it is worse than "per-process" suggests.** Claude Desktop starts the MCP server **once** and
+multiplexes every conversation over it, so one `sess-{pid}` spans the whole application run until
+restart — not one conversation, and not one task.
+
+**Decision (jok):** **accept per-run as the ceiling, and rename the concept so it stops
+overclaiming.** `sess-{pid}` is not laziness; it is the most a stdio MCP server is given. What was
+wrong is the *name*: "session" invites a reader of the audit trail to believe a row identifies a
+conversation. Audit output and docs must say **endpoint run**.
+
+**Also decided: probe `traceparent` empirically before treating this as final.** It is the only
+reserved, standardised per-request correlation field in the protocol, and whether Claude Desktop
+populates it — and whether it varies per conversation — is an **empirical question nobody has
+tested**. Cost is small: tool handlers currently take only `Parameters<T>`, so it needs
+`RequestContext<RoleServer>` added to one handler and a log line. If it carries a per-conversation
+value, C1 gets a real correlator later without re-architecting; if not, the limit is proven rather
+than assumed.
+
+**Rejected:** (a) **an agent-declared `session_hint` tool argument** — it would give real
+per-conversation grouping, but it is caller-supplied and therefore forgeable, the same class as
+`CHAPR_PRINCIPAL`, which **Q18 is considering removing for exactly that reason**. It cuts against
+D-042, whose whole point is that the trail must not rest on what the caller asserts about itself.
+(b) **Change nothing** — cheapest, but leaves the overclaiming name in the schema and in every audit
+row, which is the failure mode Phase A existed to fix.
+
+**Consequence for Phase C, stated plainly because D-042 depends on it:** C1 can make the identifier
+*honest*, not *finer-grained*. **Phase C will deliver a verifiable record that still cannot say which
+agent acted** — only which endpoint run did. D-042 already scoped the audit claim; this is the
+concrete limit that scoping has to describe.
+
+**Made by:** jok (accept per-run, rename, probe first) / Claude (the SDK reading, and the finding
+that Desktop multiplexes conversations over one process) | **Review date:** on the `traceparent`
+probe's result
+**Status:** CURRENT
+
+---
+
 <a id="d-041"></a>
 ### D-041 — Coord gets migration machinery: plain versioned SQL, and none of D-003's rejected abstractions — 2026-09-07
 

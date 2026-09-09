@@ -4,7 +4,7 @@ logbook:
   type: engineering-logbook
   version: "1.0"
   created: "2026-07-21"
-  last_updated: "2026-09-07"
+  last_updated: "2026-09-08"
   last_updated_by: "Claude"
 
 state:
@@ -58,12 +58,13 @@ sections:
     child_doc_pattern: "logbook/BACKLOG.md"
     ask_before_split: true
 
-active_sessions: []
+active_sessions: ["Claude: 2026-09-09"]
 child_docs:
   - "logbook/decisions/architecture.md"
   - "logbook/decisions/deployment.md"
   - "logbook/decisions/process.md"
   - "logbook/decisions/product.md"
+  - "logbook/logs/2026-09.md"
   - "logbook/logs/2026-08.md"
   - "logbook/logs/2026-07.md"
   - "logbook/ISSUES.md"
@@ -125,13 +126,14 @@ Three properties that make it useful vs. a file that gets abandoned:
 
 | Document | Holds |
 |---|---|
-| `logbook/decisions/architecture.md` | 21 decision bodies — data model, protocol, read/write path, backends, invariants, coord internals |
+| `logbook/decisions/architecture.md` | 22 decision bodies — data model, protocol, read/write path, backends, invariants, coord internals |
 | `logbook/decisions/deployment.md` | 12 decision bodies — installer, service, packaging, releases, auth, admin authority, hosting |
-| `logbook/decisions/process.md` | 5 decision bodies — naming, licensing, repo posture, publication, agent/plugin behaviour |
+| `logbook/decisions/process.md` | 6 decision bodies — naming, licensing, repo posture, publication, agent/plugin behaviour |
 | `logbook/decisions/product.md` | 4 decision bodies — product scope, positioning, market boundaries (new 2026-08-21, D-037) |
+| `logbook/logs/2026-09.md` | 1 session entry (09-07) |
 | `logbook/logs/2026-08.md` | 9 session entries (08-03 … 08-28) |
 | `logbook/logs/2026-07.md` | 18 session entries (07-21 … 07-22) |
-| `logbook/ISSUES.md` | all 15 issues in full, live and resolved |
+| `logbook/ISSUES.md` | all 16 issues in full, live and resolved |
 | `logbook/BACKLOG.md` | live backlog + Delivered appendix (27 rows) + removed duplicates |
 | `logbook/state-history.md` | narrative displaced from Current State, newest first |
 
@@ -144,228 +146,158 @@ Three properties that make it useful vs. a file that gets abandoned:
 > Superseded narrative → `logbook/state-history.md`.
 
 **Phase:** implementation — v1 complete, installed at a customer, pilot-tested on
-real hardware (2026-08-14), **phase 1 of the 0.2 plan delivered (2026-08-21)**,
-**corrected (2026-08-25, I-015)**, and **Phase A "Truth" of the 2808 roadmap
-delivered (2026-09-07)**. Multi-backend (SMB + POSIX); Windows, Linux **and
-macOS** now all run the test suite in CI.
+real hardware (2026-08-14), phase 1 of the 0.2 plan delivered (2026-08-21) and
+corrected (2026-08-25), **Phase A "Truth" delivered (2026-09-07)**, and
+**Phase B's correctness core opened and its first three items landed
+(2026-09-08)**. Multi-backend (SMB + POSIX); Windows, Linux and macOS all run the
+suite in CI.
 
-**Version `0.1.3`** (set by jok 2026-08-25), tagged `v0.1.3`. A *patch* bump again,
-correcting phase 1's read guardrail: **it stays 0.1.x until it is tested and true**
-— the minor number is a claim about proven-ness, not a changelog of effort.
-Versioning is a human responsibility; never fill in a bump.
+**Version `0.1.3`** (set by jok 2026-08-25), tagged `v0.1.3`. **No bump this
+session** — it stays 0.1.x until it is tested and true; the minor number is a claim
+about proven-ness, not a changelog of effort. Versioning is a human
+responsibility; never fill in a bump.
 
-**Status:** three crates build clean; **384** tests pass (was 381); clippy
-`-D warnings` clean. **29** coord routes + the **11-tool** MCP surface (unchanged
-— neither phase 1 nor Phase A added tools), plus the six-tab token-gated admin
-page. MSRV **1.88.0**. *Every number here measured this session, not carried
-over.* `cargo fmt` still drifts (389 files) and remains jok's call.
+**Status:** three crates build clean; **396** tests pass (was 384); clippy
+`-D warnings` clean on Windows **and** in WSL. **29** coord routes + the **11-tool**
+MCP surface (unchanged), plus the six-tab token-gated admin page. MSRV **1.88.0**.
+`cargo fmt` still drifts (**214** files in `chapr-endpoint` alone) and remains
+jok's call — see the incident note in the session entry.
 
-**Phase A landed 2026-09-07 — what it changed is what the system SAYS, not what
-it does.** Serve-versus-refuse and every write outcome are unchanged; seven
-statements that were false are not. The one with teeth: `chapr_move` renamed the
-file and then, if coord was unreachable, told the agent *"NOTHING WAS CHANGED"* —
-now a `CommittedButUnrecorded` naming `dst`, the shape the other verbs already
-used. That variant's own message (*"write to {path} committed on disk"*) was
-also already false for `delete` and `restore`, which reuse it, and is now
-verb-neutral. **Invariant 6 is finally correct in `CLAUDE.md` and the concept
-spec** — D-026's own entry had booked that as a debt it could not pay while both
-files were gitignored.
+**There is now a local test rig, and it is the session's most reusable output.**
+A Hyper-V VM **`CHAPR-FS`** (Windows Server 2022) on an **Internal** switch:
+no physical NIC bound, **no default gateway on either side**, `192.168.221.0/24`
+(chosen not to collide with corp `172.16.43.0/24` or Hyper-V's NAT
+`172.19.176.0/20`). Reachable only from this workstation. **Share on `D:`,
+coordinator's db/blobs/audit on `C:`** — jok's correction, mirroring the pilot, and
+it converts **I-009**'s mitigation from behavioural to structural because there is
+no `..\..` path from `D:\` to `C:\`. Auth is a stored credential
+(`cmdkey /add:CHAPR-FS`), because the VM is a workgroup member with **no Kerberos
+realm** — which is itself one of the postures the product must handle.
 
-**New standing convention (jok, 2026-09-07): three-section changelogs.** *What
-was the problem / what was changed / what was deferred*, ≤6 lines each, a table
-where rows share a shape — `.github/pull_request_template.md` and `CHANGELOG.md`.
-The reasoning is the load-bearing part and it generalises beyond repo files:
-walls of text get approved unread, and an approval that did not really happen is
-what produces the drift I-004 keeps re-filing. **I-013 proposed detecting that
-drift; this attacks its cause.** It now governs how work is handed to jok
-generally, not just what goes in the repo.
+**Three test environments, three jobs, none replacing another (D-045).**
+**CI** — every push, three OSes, regression; loopback share, no realm, no latency.
+**Local rig** — rapid development, install process, file integrity, kill-mid-write,
+mapped drives; zero RTT, no realm. **Azure VM fileserver** (demo tenant, available,
+not yet used) — the **auth path** (Kerberos/Negotiate/OIDC) and **timing under real
+network latency**, which nothing else covers. **E-015 is therefore no longer blocked
+on environment, only on priority.**
 
-**Read-path refusals now come in two kinds, and this is the shape to know
-(D-039, I-015).** A **container** — PDF, Office, image, archive — is refused by
-magic bytes with advice naming what to read instead. **Text in an encoding other
-than UTF-8** is *also* refused, but as a different thing entirely: the message
-names the encoding, says plainly that nothing is wrong with the file or the drive,
-and gives the human remedy, while a `NON_UTF8_TEXT` warning carries the structural
-evidence to coord's diagnostics for whoever administers the share. Chaperone
-coordinates files; it does not convert encodings or extract text (that is E-028).
-The classifier behind the split **chooses a message, never an outcome** — both arms
-refuse — and `instructions()` warns agents not to author text as base64 or to
-answer a refused read by copying its bytes elsewhere.
+**What Phase B closed, and what it cost.** **I-007 is RESOLVED** — the last
+invariant-4 violation. The rename runs through the handle held since the source's
+CAS (`SetFileInformationByHandle(FileRenameInfo)` + `DELETE` in the access mask, the
+method D-027 settled empirically); the bug was a single `drop`. **The two-path
+`FsPrimitives::rename` was deleted**, with `winfs::move_file` and `posixfs::rename`,
+because it can only be reached by closing the handle first — renaming is now a
+method on the *held file*, so the safe order is the only expressible one.
+**`move_cas_core` went from zero tests to six**, plus five Win32 tests, and the
+`DELETE` addition is **mutation-checked**.
 
-**What phase 1 changed, in one line each:**
-- **1.3** `chapr_read` refuses binary containers (16 formats, magic bytes, never
-  extension) with advice naming what to read instead. Base64 is now **opt-in on
-  read** (`allow_binary`) — a behaviour change for any caller that relied on the
-  old default. *It also refused every non-UTF-8 **text** file as "an unrecognised
-  binary format" — see I-015, fixed 2026-08-25.*
-- **1.2** TLS on by default in the shipped template; plaintext warns at every
-  start; a missing cert and a scheme/TLS mismatch are both refused with a usable
-  message.
-- **1.1** The control channel **authenticates**: `shared-secret` requires a
-  per-deployment token *plus* the principal header. The wizard's default. Nine
-  routes that carried no guard at all are closed.
-- **1.5 / 1.4** macOS in CI; a new `e2e` job stands up a coordinator and drives the
-  real smoke suites + the shipped self-test, with the Windows leg on a **real SMB
-  share**.
+**B8: the self-test's exit code no longer contradicts its own output.**
+`Report::finish()` returned `failed` only, so a run that verified almost nothing
+exited 0 while *printing* D-032's SKIP-is-not-PASS rule. `Skip` split into
+**`Unverified`** (applies here, did not run → **counts**) and **`NotApplicable`**
+(cannot apply to this backend → does not). Demonstrated on identical
+infrastructure: `CHAPR_SELFTEST_DIR` as UNC → `8 passed, 1 unverified`, **exit 1**;
+as `Z:\` → `9 passed`, **exit 0**.
 
-**The honest limits of 1.1, because the docs must keep saying so:** the token proves
-*this is one of our endpoints*, not *this is that user* — an endpoint holding the
-secret can still name any principal, and the blob store applies no ACL check to an
-authenticated caller. One secret per deployment, so revoking one laptop means
-rotating for all of them. Binding identity to a verified subject is E-015.
+**E-022 is fully verified and its live `HIGH` row is retired.** `Z:\` resolved to
+`\\CHAPR-FS\chaprtest\` through the real `WNetGetUniversalNameW` against a real
+server — the first execution of that branch outside a fake table, and the whole
+write path was then exercised through the letter. Covered permanently by an opt-in
+`#[ignore]`d test (`CHAPR_TEST_MAPPED_DRIVE`) and by CI, which now maps a drive.
 
-**⚠️ The e2e job has run, and what it proved is narrower than "green."** Actions
-accepts the YAML; the **macOS** leg reached the auth-restart step, so share setup,
-coordinator startup and both smoke suites passed there — the first end-to-end
-validation on macOS (I-012). Still unproven after two runs: **everything
-Windows-specific** — `New-SmbShare`, the coordinator over UNC, and the
-**mandatory-lock check, which is the only automated evidence for invariant 3 this
-project would have** — plus the auth-restart step and the self-test on any leg.
-Treat 1.4 as *2 of 5 scenarios covered*, and the SMB rig as **written, not
-working**: that is **B0** in the 2808 roadmap, and it gates the correctness phase.
+**Invariant 3 is now measured off-box.** `exclusive open is honoured by the server`
+passed against a **remote** Windows Server 2022, not only the 2026-08-14 pilot and
+CI's loopback share. B0's Windows e2e leg is green (run #14, `cf25082`) — all five
+scenarios, and its lock check is `#[cfg(windows)]` so it cannot have skipped.
 
-**Project memory is now public (this session, jok's call).** `LOGBOOK.md` and
-`logbook/` are **tracked**, reversing D-033's exclusion of them. Customer
-identifiers were scrubbed first: the deployable repo, the collaborator's plugin, its
-scripts and its folder names are described by role, not named. Contributors listed
-in `NOTICE` stay named. **Write for that audience from here on** — candid about
-engineering, never about a customer's internals. `CLAUDE.md` stays untracked. This
-also retires the "only copy on one laptop" risk that had been open since 2026-08-14.
+**⚠ Three changes are committed as of 2026-09-09 and still unproven; they land
+on the next push.** B8's new exit-code semantics across all five CI legs; the
+`net use Z:` step; and whether the POSIX legs correctly report **`N/A`** rather
+than going red. WSL says they compile and pass — but only Actions can say the
+workflow itself is right. **Read that run before anything else.**
 
-**On-prem is the product (D-037).** Cloud is deferred on a *market judgment*, not an
-architectural exclusion — review **2027-02-21**. V3-cloud and E-021 stay booked and
-invariant 2 stays provisional, which is the price paid for keeping the option open.
+*This paragraph said "committed" on 2026-09-08 and it was false.* The whole of
+that session — B1, B2, B8, E-022's verification, every logbook and decision
+entry — sat **uncommitted in the working tree** until 2026-09-09, and CI's
+newest run was still **#14 on `cf25082`**. Nothing was lost, but for a day the
+project's newest correctness work existed in exactly one place with no copy
+anywhere. It is now three commits, verified at **396 tests, 0 failed, clippy
+`-D warnings` clean** before committing — re-measured, not carried over.
+**The habit this costs: `git status` belongs in the session-end protocol, beside
+the logbook write.**
+
+**I-016 is the open finding, and it has teeth (B4 / Q11).** An **overwrite-move**
+runs `DELETE FROM version_log / journal / conflicts WHERE path = src`. Open
+conflicts become **orphaned** — every reader needs the row, nothing scans for stray
+sidecars, so the loser's bytes survive as a file no query can reach and no
+`resolve_conflict` can name. And because `gc.rs` derives retention **solely** from
+`version_log`, the source's history blobs fall out of every retention set and are
+**permanently reclaimed**. *"src is consumed"* is true of the name, not of the
+content that just moved to `dst`. **Not fixed — it needs jok's semantics call.**
+
+**Q6 is settled and the answer is a limit, not a feature (D-044).** MCP gives a
+stdio server **nothing** that identifies a conversation — `transport/io.rs` has zero
+session references, `rmcp::SessionId` is a server-minted UUID for an HTTP header,
+and `Meta`'s eight reserved keys contain no conversation id. Desktop multiplexes
+every conversation over one process, so `sess-{pid}` spans an application run.
+Accepted as the ceiling; the concept gets **renamed** to stop overclaiming, and
+`traceparent` (SEP-414) gets an empirical probe before this is called final.
+**Consequence: Phase C can deliver a verifiable record that still cannot say which
+agent acted** — only which endpoint run did.
+
+**D-037 amended 2026-09-08 (jok): the criterion is classical fileserver
+semantics, not geography.** What Chaperone depends on is a mandatory lock, ACLs
+that survive, and an identity-preserving rename — properties of the *server*, not
+its location. A cloud-**hosted** Windows fileserver is inside the line; a
+cloud-**native** object store is outside it. **V3-cloud stays OUT**, reaffirmed.
+The line does not move; the 2027-02-21 review question gets better: *"has anyone
+built agent coordination for classical fileserver semantics?"*
+
+**Read-path refusals still come in two kinds (D-039, I-015)** — a *container* (PDF,
+Office, image, archive) refused by magic bytes with advice naming what to read
+instead, and *non-UTF-8 text* refused as a different thing, naming the encoding and
+the human remedy while a `NON_UTF8_TEXT` warning carries evidence to diagnostics.
+Chaperone coordinates files; it does not convert encodings or extract text (E-028).
+The classifier chooses **a message, never an outcome**.
 
 **Before touching the write path,** read the behaviour notes in
 `logbook/state-history.md` (2026-08-05): SQLite runs in **WAL** (10 s busy timeout);
 coord `PUT /blobs` is bounded at **256 MiB**, which is also the largest file
-Chaperone can write at all, because a write snapshots the pre-image; `put_blob` runs
-**before** `journal_open`.
+Chaperone can write at all; `put_blob` runs **before** `journal_open`.
 
 **Known and accepted (not a bug):** after setup hardens the data directory, an
 **unelevated** `chapr-coord serve --config <that file>` cannot read its own config.
-The real deployment runs as a service account with access; hand-write a config
-elsewhere to run coord by hand.
+The real deployment runs as a service account with access.
 
 **Environment:** a Linux toolchain exists in WSL, building with an isolated
 `CARGO_TARGET_DIR=$HOME/chapr-target` so the Windows `target/` is never clobbered.
-
-**What's in flight: nothing in code.** All three of today's commits are pushed
-(`655c2f6`→`cf25082`, in sync, tree clean) and `0.1.3` stands — **no version
-change**; neither Phase A nor a decision entry proves anything new. **The one
-thing that did not travel:** `CLAUDE.md` and the concept spec are gitignored, so
-**invariant 6's correction lives only on this laptop** — the same shape of debt
-D-026 recorded in the first place, and a third data point for Q20.
-
-What *is* in flight is a decision set: `specs/chaperone-roadmap-2808.md` §6 is
-**down to 17 questions from 21** (Q2, Q7, Q17, Q20, Q21 closed today), and **Q1
-(does 5.1 chunked reads survive on its merits), Q4, Q6 and Q12 still gate work**.
-
-**The push also started the run that answers B0.** `ci.yml` triggers on push to
-`main` and its matrix includes `e2e (windows-latest, smb)` — the `New-SmbShare`
-leg with the mandatory-lock self-test, which is the only automated evidence for
-invariant 3 this project would have. **Read that run's result before planning
-Phase B**; it is also half of Q12's answer.
-
-**Repo-state finding, worth knowing once and then forgetting (2026-09-07).** The
-branch was `ahead 3, behind 1` because the 08-25 commit existed **twice**:
-`655c2f6` was pushed at 16:19, then amended locally at 16:24 as `67f613b` and
-never pushed, so the local and public 08-25 commits were divergent twins with the
-same message and parent. The only content difference was four lines of this file
-— the 08-25 entry's "Open questions" — and all of it had already been carried
-into `logbook/logs/2026-08.md` by the 08-28 session's move. Resolved by rebasing
-this session's two commits onto `origin/main` and dropping the twin; the rebase
-conflicted in exactly that region, which is itself the evidence it was the right
-call. Nothing lost, no force-push, `67f613b` still in the reflog. **The lesson
-that generalises: an amend after a push does not announce itself** — `git status`
-said "ahead", not "diverged", and only a hash comparison showed why.
-
-**Blocker — DIAGNOSIS CORRECTED 2026-08-21, it was wrong for five weeks.** This
-was recorded as *"the on-disk key is rejected (`Permission denied (publickey)`)"*.
-**The key is not rejected.** `~/.ssh/id_ed25519` is **passphrase-protected**, no
-ssh-agent is running, and Claude's Bash context is non-interactive — so it cannot
-supply the passphrase, offers no usable key, and GitHub answers
-`Permission denied (publickey)`, which *looks* like a bad key and is not. Proven by
-`ssh-keygen -y -f ~/.ssh/id_ed25519` returning "incorrect passphrase supplied".
-
-Two consequences. It is **fixable** — Windows' `ssh-agent` service (currently
-`Disabled`) plus `git config --global core.sshCommand` pointed at
-`C:\Windows\System32\OpenSSH\ssh.exe`, because git from bash otherwise resolves
-`ssh` to Git's MSYS build, which cannot see the Windows agent. And it is arguably
-**not worth fixing**: a passphrase only a human can supply is why an unattended
-process cannot push to the public repo, which for a project whose framing is
-accountability is a feature. **jok pushes** stays the working policy; it just is not
-a defect.
-
-*(Separately: jok's own `git push` failed once this session with
-`kex_exchange_identification: Connection closed by remote host`. Unrelated — that is
-GitHub's transient SSH throttle, not a key or network problem, and a retry
-succeeded. Two failures with opposite causes, easy to conflate, and this entry
-previously did.)*
-
-**Direction, settled 2026-08-28 (jok) — read this before the list below.**
-Chaperone is a **coordination primitive, not an extraction tool**: extraction
-belongs to plugins, and the collaborator's tender pipeline already does it
-(confirms D-039, holds D-028's line). Priority order is **correctness core →
-accountability → deployment**, deployment having already taken its large step in
-D-032. **Generalise now** — several customers, not this one. **Make the audit claim
-true** rather than lowering it to fit. And the design audience is **the agent, and
-the person whose files it writes**: Apache-2.0 means nobody signs an invoice, so
-the audit trail is not a sales artefact — it is what makes it reasonable to let
-agents write to a shared drive at all. Full reasoning and the 21 open questions in
-`specs/chaperone-roadmap-2808.md` (local), which **supersedes**
-`specs/chaperone-roadmap-0.2-to-0.5.md`.
-
-**Consequence:** the old roadmap's largest remaining investment, **Track B (the
-document gap)**, is off the path, and **D-D′ resolves to "the line holds"** — both
-to be closed *with reasoning*, not left looking planned.
+**jok pushes** — the SSH key is passphrase-protected *by design*, not broken. But
+**`api.github.com` is readable unauthenticated for a public repo**, so CI results
+*are* reachable from here; last session recorded them as unknowable and that was an
+untested assumption.
 
 **What's next:**
-1. **B0 — read the Windows e2e leg's status, then get it green.** Promoted to
-   first because it is now the only thing blocking the correctness phase, it is
-   the sole automated evidence for invariant 3 this project would ever have, and
-   **it cannot be advanced from this laptop** (no `gh`; the key is passphrase-
-   protected by design). See the CI warning above.
-2. **Answer the four gating questions** in 2808 §6 — **Q1/Q2** (Track B and D-D′
-   disposition), **Q6** (where a per-conversation session id comes from; Phase C's
-   value depends on it), **Q4** (chain immutability versus erasure), **Q12** (does a
-   GitHub-runner SMB share clear I-007's bar, or does it need the customer's server).
-3. ~~**Phase A, "Truth"**~~ — **DONE 2026-09-07.** All seven items, plus two
-   the roadmap's list got wrong: `server.rs:2278`'s 512 KiB was already accurate
-   (false positive), and the Q17 fix **overrode a deliberate 08-25 choice** to keep
-   "worth their attention" for genuinely-binary bytes. The superseded argument is
-   preserved in the test rather than deleted — jok may want that as a decision.
-4. **Phase B, verb parity** — I-007 (the method is settled: `DELETE` in
-   `winfs::open_existing`'s mask + `SetFileInformationByHandle(FileRenameInfo)`,
-   per D-027), journalling the move window so D-013's "stale-but-recoverable" is
-   true, auditing the overwrite discard, restore spec-versus-code (Q13 — Phase A
-   deliberately did **not** pre-empt it; the code now describes itself accurately
-   and still disagrees with concept §6.5), tests for `move_cas_core` (it has
-   none), and 1.4's three uncovered scenarios.
-5. **Phase C, accountability** — session identity, audit write-path authorisation,
-   migration machinery, chain + verifier, retention, privacy doc.
-6. **Phase D, deployment** — 2.2 supply chain, 2.3 decision records (now cheap),
-   2.1 purge, E-022's mapped-drive branch via Kristian, I-011's first real tag.
-7. ~~**Decision entries to write**~~ — **DONE 2026-09-07.** All four written:
-   **D-040** the direction, **D-041** migrations, **D-042** the audit posture
-   (scoping D-024, not reversing it), **D-043** Track B / D-D′ re-deferred with
-   named triggers. The Q17 override went to **I-015** instead of its own entry,
-   on jok's call — it scopes I-015's own reasoning rather than settling anything
-   new. Q20/Q21 housekeeping cleared with them: `D-038` deduped, `D-009` recorded
-   as never issued, `Status` trailers on D-001/D-032, the `ᵃ` footnote withdrawn
-   as **false** (it claimed 16 entries lacked a trailer; they all had one), index
-   reordered, and the **30-day STALE rule applied for the first time** — six rows
-   flagged (I-002 48d, I-003 47d, I-004 35d, I-005 33d, I-007 and I-009 32d), five
-   of them genuinely OPEN.
-   **Still outstanding here:** **E-022 holds a live `HIGH` row while marked DONE
-   (one branch unverified)** — the one Q21 item not closed, because it needs a
-   real mapped drive rather than a bookkeeping fix.
+1. **Push, then read the CI run** — the three unproven changes above. Red on the
+   POSIX legs means the `N/A` classification is wrong; red on Windows means the
+   `net use` step is.
+2. **Phase B continues** — **B3** (journal the move window, so D-013's
+   "stale-but-recoverable" becomes true; Q10) or **B6** (the verb-uniformity sweep
+   the previous roadmap never asked for: `create` alone skips the `~$F` preflight,
+   `restore(copy)` takes no lease or path lock, `delete`/`move` return `Conflict`
+   with `sidecar_path` pointing at the file itself and create **no** sidecar).
+3. **I-016 needs jok's semantics call** before B4 can be built.
+4. **Cheap and unanswered:** does Claude Desktop populate `traceparent`? One
+   `RequestContext` parameter and a log line, and the rig can answer it.
+5. **Phase C** stays gated on Q4; **Phase D** is the cheapest phase and partly
+   delivered.
 
-Deferred engineering (E-015, E-020, E-021, E-022, E-024b, E-028, V3-cloud) →
-`logbook/BACKLOG.md`. Note **E-021 ↔ V3-cloud is circular as written** and E-022 is
-missing from this line's predecessor while holding a live `HIGH` row.
+Deferred engineering (E-015, E-020, E-021, E-024b, E-028, V3-cloud) →
+`logbook/BACKLOG.md`. **E-022 is no longer on that list.** Note **E-021 ↔ V3-cloud
+is still circular as written** and wants untangling.
 
 ---
+
 
 ## Active Sessions
 
@@ -382,9 +314,10 @@ missing from this line's predecessor while holding a live `HIGH` row.
 > **Index only** — one row per decision, most recent first. Bodies are in
 > `logbook/decisions/<theme>.md`; click an ID to jump to its entry.
 > **Threshold raised 8000 → 12000 by jok, 2026-09-07** (reasoning in the YAML).
-> The section is at **~8.3 KB across 42 rows**, so there is room for roughly 23
-> more decisions before this needs another call. Re-measure rather than trusting
-> that number; it has gone stale three times, which is I-013's whole point.
+> The section is at **8791 bytes across 44 rows** — re-measured 2026-09-08, not
+> carried over — so there is room for roughly 22 more decisions before this needs
+> another call. Re-measure rather than trusting that number; it has gone stale
+> three times, which is I-013's whole point.
 >
 > The split this preamble used to promise — *"per-theme index tables"* — was
 > **examined and dropped**: four tables of the same 42 rows inside this file is
@@ -395,19 +328,21 @@ missing from this line's predecessor while holding a live `HIGH` row.
 > `sections.decision_log.themes` in the YAML), then add one row here.
 > Never delete a row — mark `SUPERSEDED-BY-D-NNN` or `INVALIDATED`.
 >
-> **`D-009` was never issued.** D-001…D-008, D-010…D-043; nothing was deleted or
+> **`D-009` was never issued.** D-001…D-008, D-010…D-045; nothing was deleted or
 > retracted, so stop looking for it. (Recorded 2026-09-07 with the D-038 dedupe —
 > see that session's entry.)
 
 | ID | Decision | Date | Theme | Status |
 |----|----------|------|-------|--------|
+| [D-045](logbook/decisions/process.md#d-045) | Three test environments with separate jobs; an UNVERIFIED self-test check exits non-zero | 2026-09-08 | process | CURRENT |
+| [D-044](logbook/decisions/architecture.md#d-044) | Session identity is per endpoint *run*, not per conversation — MCP offers no alternative | 2026-09-08 | architecture | CURRENT |
 | [D-043](logbook/decisions/product.md#d-043) | Track B and D-D′ close: mirror coordination re-deferred with a named trigger | 2026-09-07 | product | CURRENT |
 | [D-042](logbook/decisions/deployment.md#d-042) | What the audit trail claims: an amendment scoping D-024, not a reversal | 2026-09-07 | deployment | CURRENT |
 | [D-041](logbook/decisions/architecture.md#d-041) | Coord gets migration machinery: plain versioned SQL, none of D-003's rejected abstractions | 2026-09-07 | architecture | CURRENT |
 | [D-040](logbook/decisions/product.md#d-040) | Chaperone is a coordination primitive: correctness → accountability → deployment | 2026-08-28 | product | CURRENT |
 | [D-039](logbook/decisions/product.md#d-039) | Chaperone coordinates; it does not extract or transcode. That is an add-on (E-028), not a missing feature | 2026-08-25 | product | CURRENT |
 | [D-038](logbook/decisions/process.md#d-038) | Project memory is published: `LOGBOOK.md` and `logbook/` become tracked, customer identifiers scrubbed | 2026-08-21 | process | CURRENT |
-| [D-037](logbook/decisions/product.md#d-037) | On-prem is the product; cloud stays deferred on a market judgment, not an architectural exclusion | 2026-08-21 | product | CURRENT (review 2027-02-21) |
+| [D-037](logbook/decisions/product.md#d-037) | On-prem is the product; cloud stays deferred on a market judgment, not an architectural exclusion · **AMENDED 2026-09-08:** the criterion is classical **fileserver semantics**, not geography | 2026-08-21 | product | CURRENT (review 2027-02-21) |
 | [D-036](logbook/decisions/process.md#d-036) | Project memory splits by theme under `logbook/`; the root file becomes an index | 2026-08-21 | process | CURRENT |
 | [D-035](logbook/decisions/deployment.md#d-035) | The endpoint is delivered as an MCP server, not as a Claude Desktop extension | 2026-08-19 | deployment | CURRENT |
 | [D-034](logbook/decisions/deployment.md#d-034) | Releases are CI-built artifacts on a tag, not committed binaries | 2026-08-19 | deployment | CURRENT |
@@ -466,51 +401,52 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 
 | Month | Entries |
 |---|---|
+| `logbook/logs/2026-09.md` | 1 — 2026-09-07 |
 | `logbook/logs/2026-08.md` | 9 — 2026-08-28, 08-25, 08-21b, 08-21, 08-19/20, 08-14, 08-06, 08-05, 08-03 |
 | `logbook/logs/2026-07.md` | 18 — 2026-07-22 (a–c), 2026-07-21 (base, b–o) |
 
-### Session 2026-09-07 — jok / Claude
-**Type:** engineering (Phase A, "Truth") + process
-**Focus:** discovery after a 10-day break, then Phase A — everything the code said about itself that was false. One new convention came out of it, and it was jok's rather than the plan's.
+### Session 2026-09-08 — jok / Claude
+**Type:** engineering (Phase B: B0 verified, B1, B2, B8) + infrastructure (first local test rig)
+**Focus:** the four gating questions, then the correctness core, then the thing that had been blocking every "is it really true?" question for two months — a real fileserver we control.
 
 **Worked on:**
-- [x] **Discovery against the docs, re-measured rather than read.** `0.1.3`, 11 tools, 29 routes, 381 tests all hold — the first session in a while where §Status was accurate on every checkable number. Both holes were in the *record*: the 08-28 entry was never committed, and the 09-02 session (talk-prep history hunt, `specs/hunt-spec-encoding-thread*.md`) has no entry. **jok's calls:** 09-02 stays unlogged, Q20 stays open.
-- [x] **A1, the one that mattered.** `chapr_move` renames and then calls `move_paths`; a failure there propagated raw, so an unreachable coordinator rendered *"NOTHING WAS CHANGED … Chaperone deliberately refuses writes"* **after a rename that had succeeded**. It now takes `CommittedButUnrecorded` naming `dst` — the shape `create`, `delete`, `restore` and `write` already used for their tails. No proto change. D-013's ordering is untouched: it accepted a stale coordinator, never a misleading answer.
-- [x] **The variant's own message was wrong too, and more widely than booked.** `"write to {path} committed on disk"` was already false for `delete` and `restore`, which reuse it. Now verb-neutral, and the tool-guidance arm with it (`"the file WAS written / Do NOT write it again"` named the wrong action for three of the four verbs).
-- [x] **A2–A5.** Fail-closed documented where it starts (`assert_read`), not two coord calls later; restore's *"cannot clobber a concurrent writer"* replaced with what it really guarantees, in the code **and** in the description a model reads; move stops implying the audit trail follows a rename; the Q17 escalation gone; 512 KiB made historical; `CLAUDE.md`'s SSPI/Kerberos claim deleted. **Invariant 6 corrected for D-026** in `CLAUDE.md` and the concept spec — a debt D-026's own entry recorded as unpayable while those files were gitignored.
-- [x] **A6, better than planned.** All three 08-28 probes became **unit tests**, not the two smoke examples the plan assumed — the `wiremock` + real-POSIX harness in `server::tests` covers coord-down writes and concurrent creates, so they run on **every** CI leg, not only e2e. The coord-down test is **mutation-checked** (pointed at a live coord it went red on the right assertion). Until today the fail-closed claim had **no** coord-unreachable write test of any arity.
-- [x] **A7 — jok's addition, and the most reusable thing here.** Three-section changelogs: **problem / changed / deferred**, ≤6 lines each. New `.github/pull_request_template.md` and `CHANGELOG.md`. jok's reasoning, which is the part to keep: *"it is there to solve the human meatsleeve approving — where you draft up walls-of-text, and I approve without reading and checking."* An approval that did not really happen is what produces the drift I-004 keeps re-filing, so **I-013 proposed detecting that drift and this attacks its cause.** Now a standing rule for handing work to jok, not only for repo files — and this entry was cut twice to obey it.
+- [x] **B0 answered in ten minutes, after a session recorded it as unanswerable from this laptop.** `gh` is absent and the SSH key is passphrase-protected, but **`api.github.com` is readable unauthenticated for a public repo** — so run #14 (`cf25082`) was there all along. `e2e (windows-latest, smb)`: every step success, including the three that had never executed. The mandatory-lock check cannot have passed vacuously — `mandatory_lock_check` is `#[cfg(windows)]`, so on that leg it compiles in and can only PASS or FAIL. **The lesson generalises: "unreachable from here" was an assumption nobody had tested.**
+- [x] **Q6 settled by reading the SDK, which nobody had done.** MCP gives a stdio server **nothing** that identifies a conversation: `transport/io.rs` has zero session references; `rmcp::SessionId` is a server-minted UUID for the `Mcp-Session-Id` header on HTTP transports only; `Meta`'s eight reserved keys contain no conversation id. Worse than "per-process" implies — Desktop multiplexes *every* conversation over one process. **D-044:** accept per-**run**, rename so it stops overclaiming, and probe `traceparent` (SEP-414) empirically before calling it final.
+- [x] **Q12 settled → B1, I-007 closed.** The rename now runs **through the handle held since the source's CAS** — `SetFileInformationByHandle(FileRenameInfo)` plus `DELETE` in the access mask, exactly as D-027 predicted. The bug was one `drop`. **`FsPrimitives::rename(src,dst)` was deleted entirely** along with `winfs::move_file` and `posixfs::rename`: a two-path rename is only reachable by closing the handle first, so leaving it available invites reintroducing this. **Mutation-checked** — removing `DELETE` fails four of five new `winfs` tests with `ERROR_ACCESS_DENIED`.
+- [x] **B2 — `move_cas_core` had zero tests, now six**, driving the real core against the real POSIX backend and real files with only coord mocked. Plus five Win32 tests covering the `FILE_RENAME_INFO` buffer, whose alignment I initially hand-waved (`Vec<u8>` is 1-aligned; the struct holds a `HANDLE`) and then made provable with `Vec<u64>`.
+- [x] **B8 — the self-test's exit code stops contradicting its own output.** `Report::finish()` returned `failed` only, so a run that verified almost nothing exited 0 while *printing* D-032's SKIP-is-not-PASS rule. `Skip` splits into **`Unverified`** (applies, did not run → counts) and **`NotApplicable`** (cannot apply here → does not). **Demonstrated on identical infrastructure:** one env var different gave exit 1 versus exit 0.
+- [x] **The rig exists.** Hyper-V VM `CHAPR-FS` (Server 2022) on an **Internal** switch — no physical NIC, no default gateway either side, `192.168.221.0/24` chosen not to collide with corp or Hyper-V's NAT. **jok's correction mid-build, and it was right:** share on **`D:`**, coordinator's db/blobs/audit on **`C:`**, mirroring the pilot — which also converts **I-009**'s mitigation from behavioural to structural, since there is no `..\..` path from `D:\` to `C:\`.
+- [x] **E-022 closed for real.** `Z:\` → `\\CHAPR-FS\chaprtest\` through the real `WNetGetUniversalNameW` against a real server — the first execution of that branch outside a fake table, and the thing its live `HIGH` row had waited for since August. Covered permanently by an opt-in `#[ignore]`d test and by CI, which now maps a drive.
 
-**Two corrections to the roadmap's own Phase A list.** `server.rs:2278`'s 512 KiB was already past-tense and accurate — a false positive. And the Q17 fix **overrode a deliberate 08-25 choice**: a test asserted *"worth their attention"* should **stay** for genuinely-binary bytes. True on the severity axis I-015 addressed, superseded on the content axis — reaching that arm means only that no magic number matched. Old argument preserved in the test; **recorded on I-015, not as its own decision (jok's call).**
+**Verified against the rig, not asserted:** `smoke_parts` 14/14 — including *move: source gone* / *move: dest has v2*, i.e. **B1's rename executing against real SMB**. `smoke_pilot` 11/11 after a first-run blip (below). Self-test **9 passed / exit 0** via `Z:`, **8 passed / 1 unverified / exit 1** via UNC. `exclusive open is honoured by the server` **passed against a remote Server 2022** — invariant 3 measured off-box for the first time.
 
-**Then, after the push, the four owed decision entries (jok's call to take these next), written from ratifications given this session rather than invented.** Bodies carry the reasoning; this is the index to them: **D-040** the direction (`product`) · **D-041** migrations — plain versioned SQL, none of D-003's three rejected abstractions (`architecture`) · **D-042** the audit posture, *scoping* D-024 rather than reversing it (`deployment`) · **D-043** Track B and D-D′ closed, re-deferred with three named triggers (`product`).
+**Two findings only a real server produced.** A **transient sharing violation** on the first 512 KiB write to a fresh share, then 15 consecutive passes — almost certainly Defender scanning new files, a cause `mandatory_lock_check`'s own error text already names. **Chaperone failed closed with the pre-image intact**, which is the correct direction now *observed*. And name resolution silently fell through to **mDNS/IPv6 link-local** (`CHAPR-FS.local`) because a `hosts` entry I gave jok had backtick escapes that did not survive copy-paste — my error, and a reminder that resolution order matters where the customer has no DNS for the fileserver.
 
-**Three points from that work, kept here because they change later plans.** **D-041:** D-003's claimed *"migration/pool layer"* **was never built** — `db.rs` has zero `ALTER TABLE` — yet was cited as a constraint for seven weeks; the risk when it lands is the **baseline** migration for the live install, not the mechanism. **D-042** deliberately does *not* reopen E-015 or I-003. **D-043** forecloses the one capability a hyperscaler cannot cheaply copy — hence the triggers, and hence **5.1 surviving as Q1**.
+**I-016, found by reviewing jok's admin-panel screenshot rather than by reading code with a hypothesis.** An **overwrite-move** runs `DELETE FROM version_log / journal / conflicts WHERE path = src`. Two consequences, both traced: open conflicts become **orphaned** — every reader needs the row, nothing scans for stray sidecars, so the loser's bytes survive as a file no query can reach and no `resolve_conflict` can name; and because `gc.rs` derives retention **solely** from `version_log`, the source's history blobs fall out of every retention set and are **permanently reclaimed**. *"src is consumed"* is true of the name, not of the content that just moved to `dst`. This is **B4 / Q11** with a mechanism attached — filed, deliberately not fixed, because it needs a semantics call.
 
-**Q20/Q21 housekeeping, where one item was itself a false claim.** `D-038` deduped, index reordered, `D-009` recorded as never issued, `Status` trailers on D-001/D-032. But the **`ᵃ` footnote marking 16 entries as lacking a trailer was false** — all 16 had one. Withdrawn. **The 30-day STALE rule ran for the first time in the project's history**, hence six flags at once.
+**D-037 amended (jok), line unmoved.** A demo tenant appeared carrying a **VM fileserver hosted in Azure**, which forced the question of whether that is scope creep. It is not — and the reason produced a better boundary than "on-prem" was: the criterion is **classical fileserver semantics** (mandatory lock, surviving ACLs, identity-preserving rename), which is about the *server*, not its location. A Windows VM in a cloud datacentre is inside the line; an object store is outside it. **V3-cloud stays OUT**, reaffirmed explicitly. It also improves the 2027-02-21 review question from the near-unfalsifiable *"did cloud get commoditised?"* to *"has anyone built agent coordination for classical fileserver semantics?"*. **Two corrections of mine are recorded in the amendment**, because I first read "Azure fs" as Azure Files (PaaS) and drew two conclusions a VM fileserver does not support.
 
-**Decision Log threshold raised 8000 → 12000 (jok), instead of splitting the index.** The four new rows breached it, and the split promised here since 08-21 — per-theme index tables — was examined and **dropped**: four tables of the same 42 rows is *larger*, and moving the index into the theme files would make a cold `/logbook start` open four documents to learn what has been decided. The index is already the compressed form D-036 created, and 8000 predated knowing its steady-state size. Reasoning sits in the YAML so the next reader does not read it as a moved goalpost.
+**Test environments now split three ways (D-045):** CI = every push, three OSes, regression. **Local rig** = rapid development, install process, file integrity — at zero latency, in a workgroup with **no Kerberos realm**, which is exactly why `net view` answered `System error 5` today. **Azure VM** = the auth path (Kerberos/Negotiate/OIDC) **and timing under real latency** — the first environment where lease renewal, retry budgets and the 256 MiB pre-image upload are exercised at non-zero RTT. **E-015 stops being blocked on environment and becomes blocked only on priority.**
 
-**Verified:** 381 → **384** tests, 0 failed; clippy `-D warnings` clean; BLAKE3 measured at **3406 MiB/s** (a 50 MB tender ≈ 15 ms), now a reported number rather than a comment asserting one. `cargo fmt` still drifts (389 files) — jok's call.
+**Verified:** **396** tests (from 384), 0 failed; clippy `-D warnings` clean on Windows **and** in WSL, the latter because the POSIX `N/A` classification is `#[cfg(not(windows))]` and nothing I ran on Windows compiled it.
 
-**State changes:** **no version change** — `0.1.3` stands; neither Phase A nor a decision entry proves anything new. Decision Log **D-039 → D-043**, threshold 8000 → 12000. §Status tests 381 → 384, provenance re-dated. `ISSUES.md` gains the I-015 amendment plus its **378 → 381** fix; six rows gained STALE flags. **Five stale counts corrected in this file's own tables** (7→9, 14→15, 26→27, 20→21, 11→12, 2→4) — all measured, all the I-004 pattern, all found while writing this entry. Nothing added to the Backlog.
+**State changes:** I-007 **RESOLVED**; E-022 **DONE, fully verified** (`HIGH` row retired); **I-016** filed; **D-044**, **D-045** written and **D-037 amended**; `logbook/logs/2026-09.md` created. Tests 384 → 396. **No version change** — `0.1.3` stands; versioning is jok's.
 
-**Two of my own numbers, corrected here because this entry is the record.** "Eight issues breach STALE" was wrong — **six by age, five genuinely OPEN** (I-011 and I-015 are 19 and 17 days). And the roadmap's "four false `restore(in_place)` comments" is **two** code sites plus the spec.
+**One thing I got wrong, recorded because the fix is a habit not a patch:** `cargo fmt -p chapr-endpoint -- <one file>` reformatted the **whole crate**, touching 19 files I had never edited — against the standing rule that fmt drift is jok's call. Reverted; the 5 files I did edit still carry formatting inside them, and the crate's other 214 drifted files are untouched.
 
-**Open questions:** **17 now, not 21** — Q2, Q7, Q17, Q20 and Q21 closed today. Still gating: **Q1** (does 5.1 chunked reads survive on its own merits — the one piece D-043 deliberately left open), **Q6** (per-conversation session id), **Q4** (chain versus erasure), **Q12** (is a GitHub-runner SMB share enough for I-007). Q6 remains the one to answer before building any Phase C machinery, and **its factual half is answerable rather than a judgement call**: whether MCP or `rmcp` exposes a per-connection identifier can be established by reading the SDK, and nobody has looked yet.
+**Open questions:** **15 now** — Q6 and Q12 closed. Still gating: **Q1** (does 5.1 chunked reads survive on its merits), **Q4** (chain versus erasure), and now **Q11** with I-016 attached, which is sharper than when it was hypothetical. Unanswered and cheap: does Claude Desktop populate `traceparent`?
 
-**Next session start from:** **B0 — read the result of the CI run this session's push triggered.** `ci.yml` fires on push to `main` and its matrix includes `e2e (windows-latest, smb)`, so the answer that was "unknowable from this laptop" all session now exists in Actions. It gates the whole correctness phase and is the only automated evidence for invariant 3 this project would have. **Green →** Phase B opens with **I-007** (`SetFileInformationByHandle(FileRenameInfo)` plus `DELETE` in `winfs::open_existing`'s access mask — the method D-027 already settled empirically) and tests for `move_cas_core`, which still has none; that run also answers half of **Q12**. **Red →** fixing it *is* the next session.
+**Next session start from:** **push, and read the CI run it triggers** — three changes land unproven there: B8's new exit-code semantics on all five legs, the `net use Z:` step, and whether the POSIX legs correctly report `N/A` rather than going red. WSL says they compile and pass; only Actions can say the workflow is right. **Green →** Phase B continues with **B3** (journal the move window, Q10) or **B6** (the verb-uniformity sweep the previous roadmap never asked for). **Then I-016 needs jok's semantics call** before B4 can be built. The rig is ready and reproducible: start `chapr-coord` on `CHAPR-FS`, `cmdkey` is stored, `Z:` maps on demand, and there is a `clean-share` checkpoint to revert to — **do revert it**, because 23 open conflicts accumulated across four smoke runs and nothing reaps them, correctly.
 
-**Then Q6, and start with its factual half:** read `rmcp` and the MCP spec for a per-connection or host-supplied identifier before treating "accept per-process and say so" as the answer. D-042 makes this sharper, not softer — the chain it scopes is tamper-evidence over rows whose `session_id` is currently `sess-{pid}`, so **Phase C can deliver a verifiable record that still cannot say which agent acted.** Nobody has read the SDK for this yet.
-
-**Carried forward, still unanswered:** does the extraction pipeline write explicit UTF-8? And `CLAUDE.md` + the concept spec are gitignored, so **invariant 6's correction exists only on this laptop** — a third data point for Q20, left open today.
 ---
+
 
 ## Known Issues
 
 > **Live issues only** — full narrative for every issue, live and resolved, is in
 > `logbook/ISSUES.md`. Staleness rule: open > 30 days is flagged STALE at session
-> start. Threshold: 5000 chars; the section is at **2577** (2026-09-07).
+> start. Threshold: 5000 chars; the section is at **3419** — measured 2026-09-08,
+> not carried over.
 >
 > **The rule was applied for the first time on 2026-09-07** — it had been in the
 > protocol since the split and never actually run, which is why six rows acquired
@@ -527,7 +463,8 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 | [I-003](logbook/ISSUES.md#i-003) | MCPB bundle signing non-functional in `@anthropic-ai/mcpb` 2.1.2. | LOW | 2026-07-22 | OPEN · **STALE 47d** |
 | [I-004](logbook/ISSUES.md#i-004) | `CLAUDE.md` **Status** drifts from reality, and is auto-loaded before the logbook can correct it. | ~~LOW~~ MED | 2026-08-03 | OPEN (recurring) · **STALE 35d** |
 | [I-005](logbook/ISSUES.md#i-005) | **Delivering a large PDF's content to a model is unsolved** — now *refused* rather than silently unanalysable (1.3). | ~~HIGH~~ MED | 2026-08-05 | OPEN · **STALE 33d** (failure mode fixed, capability not) |
-| [I-007](logbook/ISSUES.md#i-007) | **`move_cas_core` violates invariant 4** — version-check and mutation are not under one handle. | MED | 2026-08-06 | OPEN · **STALE 32d** |
+| [I-016](logbook/ISSUES.md#i-016) | An overwrite-move silently discards the source's open conflicts **and** its recoverable history. | MED | 2026-09-08 | OPEN (B4 / Q11) |
+| [I-007](logbook/ISSUES.md#i-007) | **`move_cas_core` violates invariant 4** — version-check and mutation are not under one handle. | MED | 2026-08-06 | **RESOLVED** 2026-09-08 (B1+B2) |
 | [I-009](logbook/ISSUES.md#i-009) | Path aliasing: `normalize` resolves neither `.` nor `..`, breaking invariant 5. | LOW | 2026-08-06 | OPEN · **STALE 32d** |
 | [I-011](logbook/ISSUES.md#i-011) | Release + CI workflows had never executed on GitHub. | LOW | 2026-08-19 | **PARTLY RESOLVED** 2026-08-20 |
 | [I-013](logbook/ISSUES.md#i-013) | Nothing verifies the docs' numeric claims against the code, so they drift silently. | LOW | 2026-08-21 | OPEN |
@@ -562,7 +499,7 @@ Resolved and moved out: I-001, I-006, I-008, I-010, **I-012** → `logbook/ISSUE
 | E-021 | Relax `VersionToken` to backend-opaque (BLAKE3 for synth, ETag for cloud) | LOW | 1 | TODO |
 | V3-cloud | Cloud backends S3 → Azure → Graph (conditional-PUT / lease / ETag adapters + cloud-event watchers) | LOW | large | TODO |
 | E-024b | Coord dashboard / admin UI | LOW | large | DEFERRED |
-| E-022 | Drive-letter → UNC canonicalisation (+ DFS, now droppable) | HIGH | 1 | DONE (one branch unverified) |
+| E-022 | Drive-letter → UNC canonicalisation (+ DFS, now droppable) | ~~HIGH~~ — | 1 | **DONE, fully verified 2026-09-08** |
 
 ---
 

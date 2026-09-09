@@ -14,6 +14,59 @@
 
 ## Live
 
+<a id="i-016"></a>
+### I-016 — An overwrite-move silently discards the source's open conflicts **and** its recoverable history.
+**Severity:** MED | **Since:** 2026-09-08 | **Status:** OPEN — needs a semantics call (B4 / Q11)
+
+Found by reviewing the admin panel's **Open conflicts** tab against the local rig, which is worth
+noting on its own: the finding came from looking at real output, not from reading code with a
+hypothesis. The panel showed a plain move having correctly re-keyed a conflict (`smoke_a_moved.txt`
+paired with the historical sidecar name `smoke_a.conflict-…`); following *why* that worked led to the
+branch where it does not.
+
+**`mv.rs:47-55`, the `overwrite` arm:**
+
+```sql
+DELETE FROM version_log WHERE path = ?1   -- ?1 = src
+DELETE FROM journal     WHERE path = ?1
+DELETE FROM conflicts   WHERE base_path = ?1
+```
+
+The comment reads *"Destination keeps its own history/journal/conflicts; src is consumed."* The plain
+move re-keys all three onto `dst`; the overwrite branch throws the source's away. Two consequences,
+both traced through the code rather than inferred:
+
+**1. Orphaned conflicts.** Every reader of `conflicts` keys on `base_path`, `conflict_id` or
+`sidecar_path` (`conflict.rs:82,96,110,164`, `watch.rs:124`) — all require the row to exist — and
+**nothing scans the share for orphaned sidecar files.** So the losing party's bytes remain on disk as
+a file no query can reach and no `chapr.resolve_conflict` can name, because the `conflict_id` is
+gone. The bytes survive; the pending human decision disappears. Against the standing rule *"register
+it, surface on next touch"*, it can no longer surface.
+
+**2. Destroyed history.** `gc.rs` derives its retention set **solely** from `version_log` — last-N per
+path (`gc.rs:94-96`), recent-by-timestamp (`:109`), plus in-flight journal pre-images (`:122`). Delete
+a path's rows and its blobs fall out of every set and are reclaimed on the next pass. This is
+therefore not de-indexing: **the source file's recoverable history is permanently destroyed.**
+
+**Why it is not simply a bug.** *"src is consumed"* is true of the **name**, but its history and its
+pending decisions describe **content that just moved to `dst`**. Merging two histories onto one path
+raises a real question the plain-move branch never faces — which entry becomes the head? That is
+exactly **Q11** (*"May a move destroy recoverable history?"*) and **B4** (*"audit the overwrite
+discard, settle §12's append-only status"*). The roadmap posed the question; this supplies the
+mechanism and shows the current answer is **yes, silently**.
+
+**Reachability:** requires an overwrite-move of a file that has an open conflict or history worth
+keeping — narrow, but entirely plausible: an agent tidying up by moving a corrected file over the
+original is the obvious path to it. The **destination** is protected (its pre-image is snapshotted and
+`dst_base_version` is required); it is the **source** that loses.
+
+**Not fixed deliberately.** The fix is a semantics decision, not a patch — jok's call under B4.
+Options as they stand: (a) migrate src's conflicts and history onto dst as the plain branch does, and
+settle head precedence; (b) refuse an overwrite-move while src has open conflicts, the way the `~$F`
+pre-flight refuses; (c) keep the discard but make it an audited, recorded event rather than a silent
+`DELETE`. **(c) is the minimum** — an append-only claim (§12) and an unlogged `DELETE` cannot both be
+true.
+
 <a id="i-002"></a>
 ### I-002 — endpoint↔coord channel unauthenticated.
 **Severity:** ~~MED~~ LOW | **Since:** 2026-07-21 | **Status:** **MOSTLY RESOLVED** 2026-08-21 (roadmap item 1.1)
@@ -67,12 +120,45 @@ Dev boundary in place (`X-Chapr-Principal`, D-016); **TLS transport** available 
 **Severity:** ~~HIGH~~ MED | **Since:** 2026-08-05 | **Status:** OPEN
 
 **Verified by reading the tree:** `read.rs` returns `ReadContent::Inline{bytes}` on every path, `server.rs` always wraps in `ContentBlock::text`, and there is **no** MIME, extraction, `Image` or `Resource` handling anywhere. A non-UTF-8 file comes back base64 — byte-exact and safe to round-trip, but a compressed PDF is not analysable in that form **at any size**, so this is not a cap problem and raising `CHAPR_MAX_INLINE_BYTES` does not fix it. It never worked: pre-2026-08-05 a PDF returned `from_utf8_lossy` mojibake, which is worse than refusal because a model may confabulate content and report it as read from the tender. **Why it matters:** the project's own framing is "agents read large materials (PDFs, tenders, proposals)" — this is the pilot's central workflow. **Three options:** `ContentBlock::Resource(EmbeddedResource)` with `mimeType: application/pdf` (available in rmcp 2.2 today — variants verified `Text`/`Image`/`Audio`/`Resource`/`ResourceLink`; host-side support in Claude Desktop needs testing) · make `ReadContent::Ref` real (defined in proto, produced nowhere) · declare PDF reading out of scope and coordinate only the derived artifacts. Needs a human decision. Unassigned. **DOWNGRADED HIGH→MED 2026-08-12 (D-028):** it is not a pilot blocker, because the workflow does not go through `chapr_read` at all. Kristian's `the tender-pipeline plugin` plugin extracts every PDF/xlsx/docx to a `extracted-text\` text mirror in stage 1 (the extraction script, page markers preserved) and stages 2–5 read only those derived artifacts — exactly the read-heavy/write-small workload CLAUDE.md describes. **Correcting this session's earlier claim** that raising `CHAPR_MAX_INLINE_BYTES` cannot help: true of a compressed PDF, but irrelevant once the PDF is never read through Chaperone. The residual, genuinely open work is smaller: a 200-page tender's extracted `.txt` runs 0.5–1 MB against a 512 KiB default cap (`server.rs:46`), so the cap and the `writable_inline` threshold need a pilot-realistic setting. The three original options (`EmbeddedResource` / real `ReadContent::Ref` / out of scope) remain the answer for direct binary reading, which is now a **capability question, not a pilot dependency**.
-
 <a id="i-007"></a>
 ### I-007 — **`move_cas_core` violates invariant 4** — version-check and mutation are not under one handle.
-**Severity:** MED | **Since:** 2026-08-06 | **Status:** OPEN
+**Severity:** MED | **Since:** 2026-08-06 | **Status:** **RESOLVED** 2026-09-08 (Phase B, B1+B2)
+
+**Resolution.** The rename now runs **through the handle held since the source's CAS**, so nothing
+can change the verified bytes between check and mutation. `LockedFile` gained `rename_to(dst,
+replace)`; on Windows it is `SetFileInformationByHandle(FileRenameInfo)` with `DELETE` added to
+`winfs::open_existing`'s access mask, exactly as D-027 established empirically. On POSIX `rename(2)`
+never needed the fd closed, and `flock` is held on the open file description, so it survives the
+rename. **`sfile` is no longer dropped before the rename** — that `drop` was the bug, in one line.
+
+**`FsPrimitives::rename(src, dst)` was removed entirely**, along with `winfs::move_file` and
+`posixfs::rename`, and a comment on the seam says why: a two-path rename can only be reached by
+closing the handle first, so leaving it available invites reintroducing this. Renaming is now a
+method on the *held file*, which makes the safe order the only expressible one.
+
+**Verified, not asserted.** Mutation-checked — removing `DELETE` from the access mask fails four of
+the five new `winfs` tests with `ERROR_ACCESS_DENIED` (5), so the fix is load-bearing rather than
+incidental. `the_exclusive_lock_survives_the_rename` proves the actual invariant-4 property: a second
+exclusive open is still refused at the *new* name, and succeeds only once the holder drops.
+**Exercised against a real remote Windows Server 2022** the same day (`smoke_parts`: *move: source
+gone*, *move: dest has v2*), not only on local NTFS — which is precisely the "unproven on real SMB"
+condition this issue was deferred on.
+
+**B2 closed with it:** `move_cas_core` had **zero** tests and now has six, driving the real generic
+core against the real POSIX backend and real files with only coord mocked — happy path, stale source
+version, missing `dst_base_version`, stale destination version, overwrite, and coord failing *after*
+the rename (A1's regression, at the core rather than the tool layer).
+
+**A platform difference found while writing them, worth keeping:** `fs4` is `LockFileEx` on Windows,
+which is **mandatory**, so `std::fs::read` of a still-locked file fails with `ERROR_LOCK_VIOLATION`
+(33). The first version of `rename_guards_non_overwrite` read the destination before dropping the
+holder and failed — and the failure was *evidence for* the property being tested: the lock followed
+the file through the rename.
+
+**Original entry, kept verbatim:**
 
 Both handles are dropped before `prims.rename` (`backend.rs`), so the move verb does hash-then-reopen-to-mutate with only the advisory dual lease covering the gap. **D-027 narrowed but did not close it:** `put_blob` moved under the held handle, cutting the window from a ≤256 MiB round-trip to two syscalls. **Empirically settled (D-027):** `MoveFileExW` cannot hold the handle (ERROR_SHARING_VIOLATION 32), but `SetFileInformationByHandle(FileRenameInfo)` **succeeds** while holding an exclusive `share=NONE`+`DELETE` handle — so the invariant *is* achievable; the fix is to add `DELETE` to `winfs::open_existing`'s access mask (currently `GENERIC_READ\|GENERIC_WRITE`) and rename through the handle. **Deferred solely on schedule risk: proven on local NTFS, unproven on real SMB.** Not reachable Chaperone-to-Chaperone (the all-or-none `{src,dst}` lease excludes other sessions); the exposed case is a non-Chaperone writer that opens, writes and closes inside the window — its bytes are destroyed by the rename with no snapshot and no conflict. POSIX is simpler: `rename(2)` does not require closing, so the handle can simply be held. **Test harness now exists** (the `FsPrimitives` stub added in D-027) — `move_cas_core` still has zero tests.
+
 
 <a id="i-009"></a>
 ### I-009 — Path aliasing: `normalize` resolves neither `.` nor `..`, breaking invariant 5.
