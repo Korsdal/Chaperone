@@ -46,8 +46,8 @@ use crate::winfs::{create_new_file, ExclusiveFile};
 use chapr_proto::{
     BackendDescriptor, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest,
     ClearMoveJournalRequest, HistoryQuery, LeaseId, MovePathsRequest, OpenJournalRequest,
-    OpenMoveJournalRequest, PreImage, Principal, ReadReceipt, RegisterConflictRequest, SessionId,
-    VersionToken, WriteMode,
+    OpenMoveJournalRequest, PreImage, Principal, ReadReceipt, RegisterConflictRequest,
+    RestoreBase, SessionId, VersionToken, WriteMode,
 };
 use chrono::{DateTime, Utc};
 use std::io;
@@ -113,6 +113,7 @@ pub struct WriteCtx<'a> {
 
 /// What a successful atomic-core write reports back so the **tool layer** can do
 /// the uniform post-close scaffolding (version log + audit).
+#[derive(Debug)]
 pub struct CommitReceipt {
     pub from_version: Option<VersionToken>, // None for create
     pub to_version: Option<VersionToken>,   // None for delete
@@ -124,10 +125,15 @@ pub struct CommitReceipt {
     pub from_size: Option<u64>,
 }
 
-/// A move reports nothing to the tool layer: its version-log entry + audit are
-/// emitted coord-side by `move_paths` (D-013).
+/// A move reports back the version that landed at the destination. Its
+/// version-log entry and audit are still emitted coord-side by `move_paths`
+/// (D-013); this exists so the caller does not have to read the destination just
+/// to obtain a version it already CAS-verified at the source.
 #[derive(Debug)]
-pub struct MoveReceipt;
+pub struct MoveReceipt {
+    /// The source's CAS-verified version, unchanged by the rename.
+    pub version: VersionToken,
+}
 
 /// Args for the contended §7 write (`write_cas`).
 pub struct WriteCasArgs {
@@ -151,6 +157,10 @@ pub struct RestoreInPlaceArgs {
     pub lease_id: LeaseId,
     pub bytes: Vec<u8>,
     pub version: VersionToken,
+    /// What the caller observed at the target. Restore performed no CAS at all
+    /// — "a deliberate overwrite" — which made it the one verb able to destroy
+    /// content the agent had never read. Now it must say what it saw.
+    pub base: RestoreBase,
 }
 
 /// Args for a move/rename (`move_cas`).
@@ -205,6 +215,20 @@ pub trait FsPrimitives: Send + Sync {
     /// Create a brand-new file (fails if it exists) — sidecar / restore-copy /
     /// create. Uniquely named, so no lock is needed.
     fn create_new(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
+    /// Does this path exist at all, as a file or a directory?
+    ///
+    /// Deliberately not a stat: the two callers ask a yes/no question — is the
+    /// parent there ([`create_err`]), and does the target still exist (the
+    /// restore CAS) — and a metadata struct they would discard invites branching
+    /// on fields nobody checked.
+    fn exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+    /// Create one directory. Non-recursive: a missing parent is an error, which
+    /// the core turns into [`ChaprError::ParentMissing`].
+    fn create_dir(&self, path: &str) -> io::Result<()> {
+        std::fs::create_dir(path)
+    }
 }
 
 // There is deliberately **no** `rename(src, dst)` on this seam. A rename that
@@ -272,6 +296,16 @@ pub trait Backend: FileSource + Send + Sync {
     /// Atomic dual-lease rename with CAS on both sides. Coord state is migrated
     /// server-side (`move_paths`), so nothing is returned for the tool layer.
     fn move_cas(&self, ctx: &WriteCtx, args: &MoveCasArgs) -> Result<MoveReceipt, ChaprError>;
+    /// Create one directory (`chapr.mkdir`).
+    ///
+    /// Not part of the §7 write core and deliberately outside it: a directory has
+    /// no content, so there is no version to compare, no pre-image to snapshot
+    /// and nothing a journal could recover. Routing it through the write path
+    /// would mean inventing all three.
+    ///
+    /// The near-name guard lives one layer up in [`crate::ops::mkdir`], where the
+    /// listing it needs is already available.
+    fn mkdir(&self, path: &CanonicalPath) -> Result<(), ChaprError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,10 +429,13 @@ fn write_cas_core<P: FsPrimitives>(
         let (last_writer, when) = last_writer_of(rt, coord, path, principal);
         drop(file); // release the exclusive handle
         return Err(ChaprError::Conflict {
+            base_path: path.clone(),
             current_version: v_now,
             last_writer,
             when,
-            sidecar_path: sidecar,
+            // The one verb with losing bytes to park. `write` is why the field
+            // exists; the other three raise sites leave it `None`.
+            sidecar_path: Some(sidecar),
         });
     }
 
@@ -486,9 +523,17 @@ fn create_core<P: FsPrimitives>(
             ),
         });
     }
+    // Office pre-flight, like every other mutating verb. `create` was the one
+    // exception, on the reasoning that `CREATE_NEW` cannot overwrite anything —
+    // true, and not the whole risk: Word and Excel hold `~$F` for a document that
+    // has never been saved, so creating `F.docx` underneath one collides the
+    // moment the person saves. "Humans always win" with a per-verb exception is
+    // the kind of rule that gets reintroduced by the next author (B6).
+    check_human_lock(grammar_for(prims.kind()), path)?;
+
     prims
         .create_new(path.as_str(), content)
-        .map_err(|e| map_os_err(path, e))?;
+        .map_err(|e| create_err(prims, path, e))?;
     // After the file exists: a failed snapshot must not leave a phantom create.
     // Best-effort — the bytes are on the share either way, and the tool layer's
     // version-log append is what makes the version visible.
@@ -532,10 +577,15 @@ fn delete_cas_core<P: FsPrimitives>(
         let (last_writer, when) = last_writer_of(rt, coord, path, principal);
         drop(file);
         return Err(ChaprError::Conflict {
+            base_path: path.clone(),
             current_version: v_now,
             last_writer,
             when,
-            sidecar_path: path.clone(),
+            // A delete has no losing content: nothing was submitted to park.
+            // This used to name the file itself as the "sidecar" so the message
+            // would read correctly, which told every caller a sidecar existed
+            // that never did (B6).
+            sidecar_path: None,
         });
     }
 
@@ -616,11 +666,84 @@ fn restore_in_place_core<P: FsPrimitives>(
     // outlives an Office crash, which is a case the rule exists to respect.
     check_human_lock(g, path)?;
 
+    // A soft-deleted target is a *state*, not an error.
+    //
+    // `open_existing` on a removed path answered `NotFound` naming the file —
+    // for a path whose history resolved and whose copy-restore worked, which is
+    // nonsense from the caller's side. And `chapr_delete` promises "recoverable
+    // via chapr_restore", a promise only technically kept while recovery landed
+    // at `F.restored-{ts}.ext` and needed a follow-up move (itself needing a
+    // read) to get the name back.
+    //
+    // So: absent target + a caller that said `absent` recreates the file at its
+    // original name. There is nothing to overwrite, nothing to snapshot and
+    // nothing to journal — the failure mode a journal exists for cannot happen
+    // when the pre-image is "no file".
+    if !prims.exists(path.as_str()) {
+        return match &args.base {
+            RestoreBase::Absent(_) => {
+                prims
+                    .create_new(path.as_str(), &args.bytes)
+                    .map_err(|e| create_err(prims, path, e))?;
+                Ok(CommitReceipt {
+                    from_size: None,
+                    from_version: None,
+                    to_version: Some(args.version.clone()),
+                    size: args.bytes.len() as u64,
+                })
+            }
+            // The caller believed a specific version was there. It is not, so it
+            // has been deleted or moved since — re-read rather than resurrect
+            // under an assumption that no longer holds.
+            RestoreBase::Version(seen) => {
+                let (last_writer, when) = last_writer_of(rt, coord, path, principal);
+                Err(ChaprError::Conflict {
+                    base_path: path.clone(),
+                    current_version: seen.clone(),
+                    last_writer,
+                    when,
+                    sidecar_path: None,
+                })
+            }
+        };
+    }
+
     let file = prims
         .open_existing(path.as_str())
         .map_err(|e| map_os_err(path, e))?;
     let current = file.read_all().map_err(|e| map_os_err(path, e))?;
     let v_prev = VersionToken::hash(&current);
+
+    // The CAS restore never had (Q13, resolved as concept §6.5 always described
+    // it). Under the exclusive handle, so the comparison and the overwrite share
+    // one handle exactly as `write` does (invariant 4).
+    let expected = match &args.base {
+        RestoreBase::Version(v) => v,
+        // A live file where the caller expected none: something was created
+        // there after they looked, and restoring would destroy it unseen.
+        RestoreBase::Absent(_) => {
+            let (last_writer, when) = last_writer_of(rt, coord, path, principal);
+            drop(file);
+            return Err(ChaprError::Conflict {
+                base_path: path.clone(),
+                current_version: v_prev,
+                last_writer,
+                when,
+                sidecar_path: None,
+            });
+        }
+    };
+    if v_prev != *expected {
+        let (last_writer, when) = last_writer_of(rt, coord, path, principal);
+        drop(file);
+        return Err(ChaprError::Conflict {
+            base_path: path.clone(),
+            current_version: v_prev,
+            last_writer,
+            when,
+            sidecar_path: None,
+        });
+    }
 
     rt.block_on(coord.put_blob(current.clone()))?; // snapshot what we're overwriting
     if !atomic_writes {
@@ -687,10 +810,12 @@ fn move_cas_core<P: FsPrimitives>(
         let (last_writer, when) = last_writer_of(rt, coord, src, principal);
         drop(sfile);
         return Err(ChaprError::Conflict {
+            base_path: src.clone(),
             current_version: src_now,
             last_writer,
             when,
-            sidecar_path: src.clone(),
+            // A move parks nothing: the caller submitted no content (B6).
+            sidecar_path: None,
         });
     }
     // `sfile` is deliberately NOT dropped here. It stays held until the rename
@@ -724,10 +849,11 @@ fn move_cas_core<P: FsPrimitives>(
             let (last_writer, when) = last_writer_of(rt, coord, dst, principal);
             drop(dfile);
             return Err(ChaprError::Conflict {
+                base_path: dst.clone(),
                 current_version: dst_now,
                 last_writer,
                 when,
-                sidecar_path: dst.clone(),
+                sidecar_path: None,
             });
         }
         // Snapshot what the rename is about to destroy. `dbytes` is exactly those
@@ -835,11 +961,31 @@ fn move_cas_core<P: FsPrimitives>(
         // `dst` is where the file actually is now, so it is the path the caller
         // must re-read. Naming `src` would send it back to a path that is gone.
         path: dst.clone(),
-        version: src_now,
+        version: src_now.clone(),
         message: format!("the file was renamed from {src} to {dst}, but {e}"),
     })?;
 
-    Ok(MoveReceipt)
+    Ok(MoveReceipt { version: src_now })
+}
+
+/// Create one directory, shared by both backends.
+///
+/// `std::fs::create_dir` on both, and that is not a shortcut: on Windows it calls
+/// `CreateDirectoryW` and accepts a UNC path, so the windows-rs treatment the
+/// write path needs — an exclusive handle with `FILE_SHARE_NONE` — has nothing to
+/// contribute here. A directory cannot be opened for exclusive content access
+/// because it has no content.
+///
+/// The two failures worth distinguishing are the two a caller can act on:
+/// a missing parent (fix by creating it, or by choosing a directory that exists)
+/// and an existing entry (use it).
+fn mkdir_core<P: FsPrimitives>(prims: &P, path: &CanonicalPath) -> Result<(), ChaprError> {
+    if prims.exists(path.as_str()) {
+        return Err(ChaprError::AlreadyExists { path: path.clone() });
+    }
+    prims
+        .create_dir(path.as_str())
+        .map_err(|e| create_err(prims, path, e))
 }
 
 /// Refuse the write if the backend's human/Office lock sibling is present
@@ -891,6 +1037,7 @@ impl FileSource for SmbBackend {
             let md = entry.metadata()?;
             out.push(RawDirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
+                entry_type: crate::read::entry_type_of(&md),
                 size: md.len(),
                 mtime: system_time_to_utc(md.modified()?),
             });
@@ -978,6 +1125,9 @@ impl Backend for SmbBackend {
     fn move_cas(&self, ctx: &WriteCtx, args: &MoveCasArgs) -> Result<MoveReceipt, ChaprError> {
         move_cas_core(self, ctx, args)
     }
+    fn mkdir(&self, path: &CanonicalPath) -> Result<(), ChaprError> {
+        mkdir_core(self, path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +1160,7 @@ impl FileSource for PosixBackend {
             let md = entry.metadata()?;
             out.push(RawDirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
+                entry_type: crate::read::entry_type_of(&md),
                 size: md.len(),
                 mtime: system_time_to_utc(md.modified()?),
             });
@@ -1096,6 +1247,9 @@ impl Backend for PosixBackend {
     fn move_cas(&self, ctx: &WriteCtx, args: &MoveCasArgs) -> Result<MoveReceipt, ChaprError> {
         move_cas_core(self, ctx, args)
     }
+    fn mkdir(&self, path: &CanonicalPath) -> Result<(), ChaprError> {
+        mkdir_core(self, path)
+    }
 }
 
 /// Best-effort winning-writer attribution for a CONFLICT (from the version log).
@@ -1116,6 +1270,68 @@ fn last_writer_of(
 /// POSIX advisory `flock` contention via `try_lock`) and Windows
 /// `ERROR_SHARING_VIOLATION` (32) both map to `SharingViolation`, so the read
 /// state machine's Live/retry path is consistent across backends.
+/// [`map_os_err`] for an operation that **creates** a path, which turns one OS
+/// answer into a different, truer one.
+///
+/// A create fails with `NotFound` when the *parent directory* is missing, and
+/// relabelling that with the child's path produced the least helpful message in
+/// the product: `not found: <the file you asked me to create>`. It contradicts
+/// the operation's own premise, and it points the reader at the one path they got
+/// right — observed sending a session into a filename-permutation loop.
+///
+/// So on `NotFound` only, ask the backend whether the parent exists and raise
+/// [`ChaprError::ParentMissing`] when it does not. One extra stat, on a failure
+/// path, to replace a lie with an address.
+fn create_err<P: FsPrimitives>(prims: &P, path: &CanonicalPath, e: io::Error) -> ChaprError {
+    if e.kind() == io::ErrorKind::NotFound {
+        if let Some(parent) = parent_of(prims.kind(), path) {
+            if !prims.exists(parent.as_str()) {
+                return ChaprError::ParentMissing {
+                    path: path.clone(),
+                    parent,
+                };
+            }
+        }
+    }
+    map_os_err(path, e)
+}
+
+/// The parent directory of a canonical path, or `None` when it has no parent
+/// inside the backend's namespace (a share root, or `/`).
+///
+/// Uses the backend's own separator rather than `std::path`: a UNC path handled
+/// by `std::path` on a POSIX host would not split, and the POSIX backend runs on
+/// the host where that matters.
+pub(crate) fn parent_of(kind: BackendKind, path: &CanonicalPath) -> Option<CanonicalPath> {
+    let sep = grammar_for(kind).sep();
+    let s = path.as_str();
+
+    // A UNC share root is a root. `\\server\share` has a separator in it, so
+    // naive truncation yields `\\server` — a path nothing can stat and not a
+    // directory the caller could create. The prefix has to be excluded from the
+    // walk, then the share name counted as the floor.
+    let unc = format!("{sep}{sep}");
+    if let Some(rest) = s.strip_prefix(&unc) {
+        let parts: Vec<&str> = rest.split(sep).collect();
+        // [server, share] is the root; a parent needs a component beyond it.
+        if parts.len() <= 2 {
+            return None;
+        }
+        return Some(CanonicalPath::new_unchecked(format!(
+            "{unc}{}",
+            parts[..parts.len() - 1].join(&sep.to_string())
+        )));
+    }
+
+    let cut = s.rfind(sep)?;
+    if cut == 0 {
+        // `/a` under POSIX: the parent is the filesystem root, which exists and
+        // is statable, unlike a UNC `\\server`.
+        return Some(CanonicalPath::new_unchecked(sep.to_string()));
+    }
+    Some(CanonicalPath::new_unchecked(s[..cut].to_string()))
+}
+
 pub(crate) fn map_os_err(path: &CanonicalPath, e: io::Error) -> ChaprError {
     match e.kind() {
         io::ErrorKind::NotFound => ChaprError::NotFound { path: path.clone() },
@@ -1257,6 +1473,9 @@ mod tests {
                     lease_id: LeaseId::new_unchecked("lease-1"),
                     bytes: b"an old version the agent wants back".to_vec(),
                     version: VersionToken::hash(b"an old version the agent wants back"),
+                    // This test is about the Office-lock preflight, which runs
+                    // before the CAS, so the base only has to be well-formed.
+                    base: RestoreBase::Version(VersionToken::hash(b"whatever is there")),
                 },
             ) {
                 Ok(_) => panic!("restore reported a commit against a stub that writes nothing"),
@@ -1286,6 +1505,45 @@ mod tests {
             );
             // And the human's bytes are still theirs.
             assert_eq!(std::fs::read(&doc).unwrap(), b"the human's work");
+        }
+
+        /// `chapr.create` was the last verb without the `~$F` pre-flight, on the
+        /// reasoning that `CREATE_NEW` cannot overwrite anything (B6a).
+        ///
+        /// True, and not the whole risk: Word and Excel hold `~$F` for a document
+        /// that has never been saved, so creating `F.docx` underneath one collides
+        /// the moment the person saves. "Humans always win" with a per-verb
+        /// exception is a rule the next author reintroduces.
+        ///
+        /// The stub's `create_new` is `unreachable!`, so if the pre-flight ever
+        /// stops firing this test does not merely fail — it panics inside the
+        /// backend, naming the write that should not have been attempted.
+        #[tokio::test]
+        async fn create_refuses_while_a_human_has_the_file_open() {
+            let dir = tempfile::tempdir().unwrap();
+            // The file itself does NOT exist: this is the unsaved-document case,
+            // where only the owner file is on disk.
+            std::fs::write(dir.path().join("~$new.xlsx"), b"lock").unwrap();
+            let target = dir.path().join("new.xlsx");
+            let path = CanonicalPath::new_unchecked(target.to_string_lossy().to_string());
+
+            let coord = CoordClient::new("http://127.0.0.1:1");
+            let principal = Principal::new_unchecked("CONTOSO\\agent");
+            let session_id = SessionId::new_unchecked("sess-create");
+            let rt = Handle::current();
+            let ctx = WriteCtx {
+                rt: &rt,
+                coord: &coord,
+                principal: &principal,
+                session_id: &session_id,
+            };
+            let err = create_core(&StubFs, &ctx, &path, b"the agent's file")
+                .expect_err("a human has this document open");
+            assert!(
+                matches!(err, ChaprError::OfficeLockPresent { .. }),
+                "expected OfficeLockPresent, got {err:?}"
+            );
+            assert!(!target.exists(), "nothing was created");
         }
 
         /// The mirror of the above: with no lock file the pre-flight lets the core
@@ -1655,6 +1913,237 @@ mod tests {
             assert!(
                 !calls.iter().any(|p| p == "/move"),
                 "a failed rename must not migrate coord state: {calls:?}"
+            );
+        }
+    }
+
+    /// The restore CAS (Q13, resolved as option (a)) — driven against the real
+    /// POSIX backend and real files, with only coord mocked.
+    ///
+    /// Restore was the one verb that performed **no** CAS: it reinstated old
+    /// bytes over whatever was there. In a product whose purpose is preventing
+    /// data loss, that let an agent destroy content it had never read. Each test
+    /// below is one row of the table in [`chapr_proto::RestoreBase`], and the
+    /// interesting half is the refusals.
+    mod restore_cas {
+        use super::*;
+        use chapr_proto::AbsentMarker;
+        use wiremock::matchers::{method as wmethod, path as wpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A coord that accepts the snapshot, journal and history calls a restore
+        /// makes. Nothing here decides an outcome — the CAS does.
+        async fn coord() -> MockServer {
+            let s = MockServer::start().await;
+            for p in ["/journal", "/journal/clear", "/history"] {
+                Mock::given(wmethod("POST"))
+                    .and(wpath(p))
+                    .respond_with(ResponseTemplate::new(204))
+                    .mount(&s)
+                    .await;
+            }
+            Mock::given(wmethod("PUT"))
+                .and(wpath("/blobs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": VersionToken::hash(b"ignored").as_str(),
+                    "size": 0, "deduplicated": false
+                })))
+                .mount(&s)
+                .await;
+            s
+        }
+
+        const OLD: &[u8] = b"the version being restored";
+
+        async fn run(
+            coord_uri: String,
+            path: &std::path::Path,
+            base: RestoreBase,
+        ) -> Result<CommitReceipt, ChaprError> {
+            let path = CanonicalPath::new_unchecked(path.to_string_lossy().to_string());
+            tokio::task::spawn_blocking(move || {
+                let client = CoordClient::new(coord_uri);
+                let principal = Principal::new_unchecked("CONTOSO\\tester");
+                let session_id = SessionId::new_unchecked("sess-restore");
+                let rt = Handle::current();
+                let ctx = WriteCtx {
+                    rt: &rt,
+                    coord: &client,
+                    principal: &principal,
+                    session_id: &session_id,
+                };
+                restore_in_place_core(
+                    &PosixBackend,
+                    false,
+                    &ctx,
+                    &RestoreInPlaceArgs {
+                        path,
+                        lease_id: LeaseId::new_unchecked("lease-restore"),
+                        bytes: OLD.to_vec(),
+                        version: VersionToken::hash(OLD),
+                        base,
+                    },
+                )
+            })
+            .await
+            .expect("join")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_live_file_at_the_version_the_caller_saw_is_overwritten() {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("f.txt");
+            std::fs::write(&f, b"current").unwrap();
+
+            let s = coord().await;
+            run(s.uri(), &f, RestoreBase::Version(VersionToken::hash(b"current")))
+                .await
+                .expect("the caller had read the current contents");
+            assert_eq!(std::fs::read(&f).unwrap(), OLD);
+        }
+
+        /// The bazooka this closes: the file moved on after the caller read it,
+        /// and restoring would destroy an edit nobody involved has seen.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_live_file_that_moved_on_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("f.txt");
+            std::fs::write(&f, b"someone else wrote this").unwrap();
+
+            let s = coord().await;
+            let err = run(s.uri(), &f, RestoreBase::Version(VersionToken::hash(b"what I read")))
+                .await
+                .expect_err("must not overwrite unseen content");
+            match err {
+                ChaprError::Conflict {
+                    base_path,
+                    sidecar_path,
+                    ..
+                } => {
+                    assert_eq!(base_path.as_str(), f.to_string_lossy());
+                    assert!(sidecar_path.is_none(), "a restore parks nothing");
+                }
+                other => panic!("expected Conflict, got {other:?}"),
+            }
+            assert_eq!(std::fs::read(&f).unwrap(), b"someone else wrote this");
+        }
+
+        /// The caller believed the path was empty. It is not — something was
+        /// created there — so restoring would silently replace a new file.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_file_where_the_caller_expected_none_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("f.txt");
+            std::fs::write(&f, b"created since you looked").unwrap();
+
+            let s = coord().await;
+            let err = run(s.uri(), &f, RestoreBase::Absent(AbsentMarker::Absent))
+                .await
+                .expect_err("must not overwrite a file the caller did not know about");
+            assert!(matches!(err, ChaprError::Conflict { .. }), "{err:?}");
+            assert_eq!(std::fs::read(&f).unwrap(), b"created since you looked");
+        }
+
+        /// The undelete. `chapr_delete` promises "recoverable via chapr_restore";
+        /// before this, in-place recovery answered `not found` and the copy
+        /// landed under a `.restored-{ts}` name needing a follow-up move.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_soft_deleted_file_comes_back_at_its_original_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("deleted.txt");
+            assert!(!f.exists());
+
+            let s = coord().await;
+            let receipt = run(s.uri(), &f, RestoreBase::Absent(AbsentMarker::Absent))
+                .await
+                .expect("recovering a deleted file is the point");
+            assert_eq!(std::fs::read(&f).unwrap(), OLD, "back at its own name");
+            assert_eq!(receipt.to_version, Some(VersionToken::hash(OLD)));
+            assert!(receipt.from_version.is_none(), "nothing was replaced");
+        }
+
+        /// The caller thought a specific version was there and it has gone.
+        /// Recreating under that assumption would be resurrecting a file whose
+        /// history the caller no longer understands.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_absent_file_the_caller_thought_was_present_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("gone.txt");
+
+            let s = coord().await;
+            let err = run(s.uri(), &f, RestoreBase::Version(VersionToken::hash(b"what I read")))
+                .await
+                .expect_err("the file the caller read is gone");
+            assert!(matches!(err, ChaprError::Conflict { .. }), "{err:?}");
+            assert!(!f.exists(), "and nothing was created");
+        }
+    }
+
+    /// A create whose parent is missing must name the parent (2.6).
+    mod parent_missing {
+        use super::*;
+
+        /// Forward slashes so `PosixBackend`'s grammar and the real filesystem
+        /// agree on both hosts — Windows accepts `/` in a path, and pairing the
+        /// POSIX grammar with `\` would make `parent_of` find no separator and
+        /// the test pass for the wrong reason.
+        fn posix_path(p: &std::path::Path) -> CanonicalPath {
+            CanonicalPath::new_unchecked(p.to_string_lossy().replace('\\', "/"))
+        }
+
+        #[test]
+        fn a_create_into_a_missing_directory_names_the_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("nosuchdir").join("f.txt");
+            let path = posix_path(&target);
+
+            let err = create_err(
+                &PosixBackend,
+                &path,
+                io::Error::from(io::ErrorKind::NotFound),
+            );
+            match err {
+                ChaprError::ParentMissing { parent, path: p } => {
+                    assert!(parent.as_str().ends_with("nosuchdir"), "{parent}");
+                    assert_eq!(p, path);
+                    // The remedy has to be in the message, or the caller retries
+                    // with a different file name — the loop this replaces.
+                    let msg = ChaprError::ParentMissing {
+                        parent: parent.clone(),
+                        path: p,
+                    }
+                    .to_string();
+                    assert!(msg.contains("chapr_mkdir"), "{msg}");
+                }
+                other => panic!("expected ParentMissing, got {other:?}"),
+            }
+        }
+
+        /// When the parent *does* exist, a `NotFound` means what it says and must
+        /// not be relabelled — otherwise the new branch hides a real answer.
+        #[test]
+        fn an_existing_parent_leaves_not_found_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("f.txt");
+            let path = posix_path(&target);
+            let err = create_err(
+                &PosixBackend,
+                &path,
+                io::Error::from(io::ErrorKind::NotFound),
+            );
+            assert!(matches!(err, ChaprError::NotFound { .. }), "{err:?}");
+        }
+
+        /// A share root has no parent to report, and asking for one must not
+        /// produce `\\server` — a path nothing can stat.
+        #[test]
+        fn a_share_root_has_no_parent() {
+            let root = CanonicalPath::new_unchecked("\\\\srv\\share".to_string());
+            assert!(parent_of(BackendKind::Smb, &root).is_none());
+            let file = CanonicalPath::new_unchecked("\\\\srv\\share\\f.md".to_string());
+            assert_eq!(
+                parent_of(BackendKind::Smb, &file).map(|p| p.as_str().to_string()),
+                Some("\\\\srv\\share".to_string())
             );
         }
     }

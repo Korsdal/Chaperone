@@ -55,6 +55,48 @@ pub fn set_coordinated_roots(roots: Vec<CanonicalPath>) -> Result<(), Vec<Canoni
     ROOTS.set(roots)
 }
 
+/// When this endpoint process started, and where its roots came from.
+///
+/// Both exist for one reason: **four distinct misconfigurations were
+/// byte-identical from the tool surface** — a typo'd root, a corrected root that
+/// had not been reloaded, a drive letter refused because of the second, and the
+/// extension removed. Separating them took most of a cowork session.
+///
+/// The boot time is what does the work. A user who edited config five minutes ago
+/// and sees an older boot time knows immediately that their fix has not been
+/// loaded, which no amount of naming the root can tell them. And it has to travel
+/// in a *refusal*, not a log line: the endpoint already logs its resolved roots at
+/// `info`, but that goes to stderr, where a host files it away out of sight.
+static BOOT: OnceLock<(chrono::DateTime<chrono::Utc>, String)> = OnceLock::new();
+
+/// Record when this process started and which setting the roots came from.
+/// Called once from `main`, beside [`set_coordinated_roots`].
+pub fn set_boot_identity(source: impl Into<String>) {
+    let _ = BOOT.set((chrono::Utc::now(), source.into()));
+}
+
+/// Boot time and root source, or `None` before `main` has recorded them (unit
+/// tests, and the window before start-up completes).
+pub fn boot_identity() -> Option<(chrono::DateTime<chrono::Utc>, &'static str)> {
+    BOOT.get().map(|(t, s)| (*t, s.as_str()))
+}
+
+/// The provenance clause appended to a confinement refusal: which setting the
+/// root came from, and when it was read.
+///
+/// Empty when boot identity was never recorded, so a unit test's message stays
+/// stable and no caller has to branch.
+pub fn root_provenance() -> String {
+    match boot_identity() {
+        Some((at, source)) => format!(
+            " (root read from {source} when this endpoint started, \
+             {}; if you changed it since, restart the extension)",
+            at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        None => String::new(),
+    }
+}
+
 /// The configured roots, or an empty slice when confinement is off.
 pub fn coordinated_roots() -> &'static [CanonicalPath] {
     ROOTS.get().map(|v| v.as_slice()).unwrap_or(&[])
@@ -116,15 +158,18 @@ pub fn canonicalize_in(
     }
 
     if !is_within_roots(&out, roots, grammar.sep()) {
-        return Err(invalid(format!(
-            "resolves to {out:?}, which is outside this endpoint's coordinated \
-             root(s): {}",
-            roots
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+        // The resolved path travels as a field, not interpolated with `{out:?}`.
+        // Debug-formatting a Windows path DOUBLES every backslash, while the
+        // roots printed raw through `as_str()` — so the one message a user relies
+        // on to compare the two showed `\\\\srv\\share` against `\\srv\share`
+        // and read as a bug in the resolver. Reported from a cowork session and
+        // withdrawn as unreproducible; it was deterministic, on every refusal.
+        return Err(ChaprError::OutsideRoot {
+            raw: raw.to_string(),
+            resolved: out,
+            roots: roots.iter().map(|r| r.as_str().to_string()).collect(),
+            provenance: root_provenance(),
+        });
     }
 
     Ok(CanonicalPath::new_unchecked(out))
@@ -337,9 +382,20 @@ mod tests {
             &roots,
         )
         .unwrap_err();
+        // Its own variant, not an `InvalidPath` with telling prose: the audit
+        // trail records this as `outside_root`, the one refusal that answers
+        // "did an agent probe outside the share", and deriving that from a
+        // message would break the moment the message is reworded.
         match err {
-            ChaprError::InvalidPath { reason, .. } => {
-                assert!(reason.contains("outside"), "wrong reason: {reason}")
+            ChaprError::OutsideRoot {
+                raw,
+                resolved,
+                roots: reported,
+                ..
+            } => {
+                assert_eq!(raw, "\\\\otherhost\\finance\\salaries.xlsx");
+                assert_eq!(resolved, "\\\\otherhost\\finance\\salaries.xlsx");
+                assert_eq!(reported, vec!["\\\\filesrv\\aicollab".to_string()]);
             }
             other => panic!("wrong error: {other:?}"),
         }

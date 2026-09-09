@@ -179,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (i, res) = h.await?;
         match res {
             Ok(()) => winners.push(i),
-            Err(ChaprError::Conflict { sidecar_path, .. }) => {
+            Err(ChaprError::Conflict { sidecar_path: Some(sidecar_path), .. }) => {
                 let parked = std::fs::read_to_string(sidecar_path.as_str())
                     .map(|s| s == format!("written-by-user{i}"))
                     .unwrap_or(false);
@@ -305,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         {
-            Err(ChaprError::Conflict { sidecar_path, .. }) => {
+            Err(ChaprError::Conflict { sidecar_path: Some(sidecar_path), .. }) => {
                 let ok = std::fs::read_to_string(sidecar_path.as_str())
                     .map(|s| s == format!("loser-{n}"))
                     .unwrap_or(false);

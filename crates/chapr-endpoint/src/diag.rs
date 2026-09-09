@@ -182,7 +182,12 @@ pub fn classify(e: &ChaprError) -> Option<DiagnosticReport> {
         E::NotFound { .. }
         | E::AlreadyExists { .. }
         | E::VersionNotFound { .. }
-        | E::ConflictNotFound { .. } => return None,
+        | E::ConflictNotFound { .. }
+        // A missing parent and a near-duplicate directory name are both answers
+        // to the caller, fully explained in the tool result. Neither indicates
+        // anything wrong with the share or the deployment.
+        | E::ParentMissing { .. }
+        | E::NearDuplicateName { .. } => return None,
         // Caller mistakes, already answered inline by the tool result.
         E::BaseVersionNotRecorded { .. }
         | E::BaseVersionRequired { .. }
@@ -232,8 +237,31 @@ pub fn classify(e: &ChaprError) -> Option<DiagnosticReport> {
                 "A path could not be used",
                 Severity::Error,
                 "Use a UNC path, or a full path on a mapped drive. If it names a drive letter, \
-                 check that mapping exists for this user. If it resolves outside the configured \
-                 coordinated root, either widen CHAPR_ROOT or work inside it.",
+                 check that mapping exists for this user.",
+            )
+        }
+        // Its own diagnostic, not folded into INVALID_PATH: a path outside the
+        // root is almost always a *configuration* fact rather than a bad path,
+        // and it is the one an administrator can act on. The facts carry what the
+        // agent was told, so the diagnostic and the refusal agree.
+        E::OutsideRoot {
+            raw,
+            resolved,
+            roots,
+            provenance,
+        } => {
+            facts.insert("raw".into(), raw.clone());
+            facts.insert("resolved".into(), resolved.clone());
+            facts.insert("roots".into(), roots.join(", "));
+            facts.insert("root_provenance".into(), provenance.clone());
+            (
+                "OUTSIDE_ROOT",
+                "A path resolved outside the coordinated root",
+                Severity::Warning,
+                "Either the caller asked for the wrong place, or CHAPR_ROOT is not what this \
+                 deployment intended. Compare the resolved path against the roots in the facts \
+                 — and check the recorded boot time: a root edited after the endpoint started \
+                 has not been loaded, which looks identical to a wrong one.",
             )
         }
 
@@ -494,7 +522,8 @@ mod tests {
             &CoordClient::new("http://127.0.0.1:1"),
             &Principal::new_unchecked("CONTOSO\\jsmith"),
             &ChaprError::Conflict {
-                sidecar_path: p(),
+                base_path: p(),
+                sidecar_path: Some(p()),
                 current_version: VersionToken::hash(b"v"),
                 last_writer: Principal::new_unchecked("CONTOSO\\other"),
                 when: chrono::Utc::now(),

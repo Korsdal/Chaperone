@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stale write → CONFLICT + sidecar parked (bytes never lost)
     let conflict = write(&coord, &leases, backend.clone(), &who, &sess, &a, b"v3-loser".to_vec(), v1.clone(), WriteMode::Cas).await;
     let sidecar_ok = match &conflict {
-        Err(chapr_proto::ChaprError::Conflict { sidecar_path, .. }) => {
+        Err(chapr_proto::ChaprError::Conflict { sidecar_path: Some(sidecar_path), .. }) => {
             std::fs::read_to_string(sidecar_path.as_str()).ok().as_deref() == Some("v3-loser")
         }
         _ => false,
@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check!("history has >=2 entries", hist.entries.len() >= 2);
 
     // restore v1 as a copy (no clobber)
-    let rest = ops::restore(&coord, &leases, backend.clone(), &who, &sess, &a, v1.clone(), RestoreMode::Copy).await?;
+    let rest = ops::restore(&coord, &leases, backend.clone(), &who, &sess, &a, v1.clone(), RestoreMode::Copy, None).await?;
     let restored_ok = rest.restored_path.as_ref().map(|p| std::fs::read_to_string(p.as_str()).ok().as_deref() == Some("v1")).unwrap_or(false);
     check!("restore copy contains v1", restored_ok);
     check!("restore left live file at v2", disk(&a).ok().as_deref() == Some("v2"));

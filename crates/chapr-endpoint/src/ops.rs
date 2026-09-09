@@ -22,8 +22,9 @@ use crate::lease_manager::LeaseManager;
 use crate::pathgrammar::grammar_for;
 use chapr_proto::{
     AcquireLeaseRequest, AppendVersionLogRequest, AuditKind, ChaprError, CreateResponse,
-    DeleteResponse, LeasePurpose, MoveResponse, PreImage, Principal, ReadReceipt,
-    RecordAuditRequest, RestoreMode, RestoreResponse, SessionId, VersionEvent, VersionToken,
+    DeleteResponse, LeasePurpose, MkdirResponse, MoveResponse, PreImage, Principal, ReadReceipt,
+    RecordAuditRequest, RestoreBase, RestoreMode, RestoreResponse, SessionId, VersionEvent,
+    VersionToken,
 };
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -116,6 +117,98 @@ pub async fn create(
     .await;
     let _ = leases.release(&lease.lease_id).await;
     resp
+}
+
+// ===========================================================================
+// mkdir — create one directory, guarded against near-duplicate names.
+// ===========================================================================
+
+/// `chapr.mkdir`. No lease, no journal, no version log: a directory has no
+/// content, so there is nothing to serialise against, recover, or version. It is
+/// audited (`DirCreate`) because *who added a folder, and did they override the
+/// guard* is a question worth being able to answer.
+pub async fn mkdir(
+    coord: &CoordClient,
+    backend: Arc<dyn Backend>,
+    principal: &Principal,
+    session_id: &SessionId,
+    raw_uri: &str,
+    confirm_new: bool,
+) -> Result<MkdirResponse, ChaprError> {
+    let grammar = grammar_for(backend.kind());
+    let path = canonicalize(raw_uri, grammar)?;
+
+    // The parent must exist. Checked here rather than left to the OS so the
+    // caller gets `ParentMissing` naming the parent, instead of the OS's
+    // `NotFound` naming the directory it asked for.
+    let parent = crate::backend::parent_of(backend.kind(), &path).ok_or_else(|| {
+        ChaprError::InvalidPath {
+            raw: raw_uri.to_string(),
+            reason: "a share root cannot be created".into(),
+        }
+    })?;
+
+    // The near-name guard. Listing the parent is what makes it deterministic:
+    // the comparison is against what is actually there, not against a model's
+    // memory of what it saw.
+    let siblings = match backend.as_file_source().list(&parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ChaprError::ParentMissing {
+                path: path.clone(),
+                parent,
+            })
+        }
+        Err(e) => return Err(crate::backend::map_os_err(&parent, e)),
+    };
+    let leaf = path.as_str().rsplit(grammar.sep()).next().unwrap_or_default();
+    let dir_names: Vec<&str> = siblings
+        .iter()
+        // Only directories. A file called `Reports` is not the mistake this
+        // guards against, and flagging it would refuse a legitimate folder for
+        // sharing a name with a document.
+        .filter(|e| e.entry_type == chapr_proto::EntryType::Dir)
+        .map(|e| e.name.as_str())
+        .collect();
+    let similar = crate::nearname::similar_names(leaf, dir_names);
+    if !similar.is_empty() && !confirm_new {
+        return Err(ChaprError::NearDuplicateName {
+            path: path.clone(),
+            similar,
+        });
+    }
+
+    backend.mkdir(&path)?;
+
+    // Best-effort, and after the fact: the directory exists either way, and
+    // failing the call because the trail could not be written would tell the
+    // caller its mkdir failed when it succeeded — the lie `CommittedButUnrecorded`
+    // exists to prevent, which is not worth introducing for a folder.
+    let detail = if similar.is_empty() {
+        "mkdir".to_string()
+    } else {
+        // The override is the part worth reading later.
+        format!("mkdir with confirm_new past similar: {}", similar.join(", "))
+    };
+    if let Err(e) = coord
+        .record_audit(&RecordAuditRequest {
+            principal: principal.clone(),
+            session_id: session_id.clone(),
+            path: path.clone(),
+            kind: AuditKind::DirCreate,
+            from_version: None,
+            to_version: None,
+            detail,
+        })
+        .await
+    {
+        tracing::warn!(path = %path, error = %e, "created directory but could not audit it");
+    }
+
+    Ok(MkdirResponse {
+        canonical_path: path,
+        similar_existing: similar,
+    })
 }
 
 // ===========================================================================
@@ -227,11 +320,27 @@ pub async fn restore(
     raw_uri: &str,
     version: VersionToken,
     mode: RestoreMode,
+    base: Option<RestoreBase>,
 ) -> Result<RestoreResponse, ChaprError> {
     let path = canonicalize(raw_uri, grammar_for(backend.kind()))?;
     // Fetch the old bytes from the history store first (fails fast if gone).
     let bytes = coord.get_blob(&version).await?;
     let size = bytes.len() as u64;
+
+    // `in_place` cannot proceed without knowing what the caller saw (Q13(a)).
+    //
+    // Refused here rather than defaulted, because every default is wrong: assume
+    // a version and the restore clobbers unseen content, assume absent and it
+    // refuses a legitimate overwrite. `Copy` needs no base — it writes a fresh,
+    // uniquely-named sibling and destroys nothing.
+    let base_seen = match (mode, base) {
+        (RestoreMode::InPlace, None) => {
+            return Err(ChaprError::BaseVersionRequired { path });
+        }
+        (RestoreMode::InPlace, Some(b)) => b,
+        // Ignored for Copy, and not worth a separate arg shape.
+        (RestoreMode::Copy, _) => RestoreBase::Absent(chapr_proto::AbsentMarker::Absent),
+    };
 
     match mode {
         RestoreMode::Copy => {
@@ -314,6 +423,7 @@ pub async fn restore(
                     lease_id: lease.lease_id.clone(),
                     bytes,
                     version: version.clone(),
+                    base: base_seen,
                 };
                 let receipt = tokio::task::spawn_blocking(move || {
                     let ctx = WriteCtx {
@@ -447,7 +557,9 @@ pub async fn mv(
     .map_err(join_err)?;
 
     let _ = leases.release(&lease.lease_id).await;
-    result.map(|_| MoveResponse {})
+    // Hand the destination's version back, so a caller can chain a CAS write
+    // without reading the file it just moved.
+    result.map(|r| MoveResponse { version: r.version })
 }
 
 // ---- helpers --------------------------------------------------------------

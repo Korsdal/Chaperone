@@ -23,9 +23,10 @@ use crate::CoordClient;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::sync::Arc;
 use chapr_proto::{
-    ChaprError, ConflictId, ConflictResolution, ConflictsQuery, DiagnosticReport, HistoryQuery,
-    Principal, ReadContent, ReadResponse, ResolveConflictControl, RestoreMode, SessionId,
-    Severity, VersionToken, WriteMode,
+    AuditKind, ChaprError, ConflictId, ConflictResolution, ConflictsQuery, DiagnosticReport,
+    HistoryQuery, Principal, ReadContent, ReadResponse, RecordAuditRequest,
+    ResolveConflictControl, RestoreBase, RestoreMode, SessionId, Severity, VersionToken,
+    WriteMode,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -266,6 +267,16 @@ pub struct DeleteArgs {
     pub base_version: String,
 }
 
+/// Arguments for `chapr_mkdir`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MkdirArgs {
+    pub uri: String,
+    /// Set only after a person has confirmed that a name resembling an existing
+    /// folder is intended. Recorded in the audit trail.
+    #[serde(default)]
+    pub confirm_new: bool,
+}
+
 /// Arguments for `chapr_restore`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestoreArgs {
@@ -276,6 +287,13 @@ pub struct RestoreArgs {
     /// overwrites the live file in place (goes through the full write path).
     #[serde(default)]
     pub in_place: bool,
+    /// REQUIRED when in_place is true: the state of the file as you last saw it.
+    /// Either the version string from chapr_stat or chapr_read, or the literal
+    /// "absent" if the file is soft-deleted and you are recovering it. An
+    /// in-place restore is refused if the file is not in that state, so it can
+    /// never overwrite contents you have not looked at. Not needed for a copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// Arguments for `chapr_move`.
@@ -355,6 +373,17 @@ bytes, never to read its contents."
                 // faults: the call worked and the file simply cannot be handed over.
                 if let Some(refusal) = binary_guard(&resp, allow_binary) {
                     self.report_encoding_finding(&uri, &refusal).await;
+                    // Audited here as well as in `tool_failure`, because a read
+                    // refusal never becomes a `ChaprError` — it is a designed
+                    // tool-level answer. It is still a decision Chaperone made
+                    // about a request, which is the test for being in the trail.
+                    let reason = match &refusal.kind {
+                        RefusalKind::Container(_) => "binary_container",
+                        RefusalKind::NonUtf8Text(_) => "non_utf8_text",
+                        RefusalKind::UnknownBinary => "unknown_binary",
+                    };
+                    self.audit_refusal("chapr_read", &uri, reason, &refusal.audit_summary())
+                        .await;
                     return Ok(CallToolResult::error(vec![ContentBlock::text(
                         refusal.message(&uri),
                     )]));
@@ -366,7 +395,7 @@ bytes, never to read its contents."
                     )])),
                 }
             }
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_read", &uri, e).await),
         }
     }
 
@@ -410,7 +439,7 @@ For a binary file, pass the base64 body chapr_read gave you and set encoding to 
                 "wrote {} — new version {}",
                 uri, resp.version
             ))])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_write", &uri, e).await),
         }
     }
 
@@ -424,7 +453,7 @@ and open-conflict counts).")]
             Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&resp.entries).unwrap_or_else(|_| "[]".into()),
             )])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_list", &uri, e).await),
         }
     }
 
@@ -438,12 +467,54 @@ version, journal state, and any held lease.")]
             Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&resp).unwrap_or_default(),
             )])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_stat", &uri, e).await),
+        }
+    }
+
+    #[tool(description = "Create a directory on the shared drive. The parent must already exist \
+— Chaperone never creates parent directories implicitly. If the name closely resembles a folder \
+that is already there (a typo, or different spacing), the call is REFUSED and names the \
+candidates: near-duplicate folders split a share permanently, because coordination is keyed by \
+exact path. Use the existing folder, or ask the person whether the new name is intended and pass \
+confirm_new=true only if they say yes.")]
+    async fn chapr_mkdir(
+        &self,
+        Parameters(MkdirArgs { uri, confirm_new }): Parameters<MkdirArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match ops::mkdir(
+            &self.coord,
+            self.backend.clone(),
+            &self.principal,
+            &self.session_id,
+            &uri,
+            confirm_new,
+        )
+        .await
+        {
+            Ok(resp) => {
+                let note = if resp.similar_existing.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " — created despite similar existing folders ({}); tell the person, so \
+                         they can merge them if this was not intended",
+                        resp.similar_existing.join(", ")
+                    )
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "created directory {}{note}",
+                    resp.canonical_path
+                ))]))
+            }
+            Err(e) => Ok(self.tool_failure("chapr_mkdir", &uri, e).await),
         }
     }
 
     #[tool(description = "Show the version history of a file: each version's hash, timestamp, \
-writer, size, and event (create/write/delete/restore).")]
+writer, size, and event. Events are create, write, write_forced (a write that deliberately \
+discarded a concurrent edit — treat that version's provenance with care), delete, restore, move, \
+recover, and baseline (content that existed before Chaperone first snapshotted it, or that a \
+person edited outside it).")]
     async fn chapr_history(
         &self,
         Parameters(UriArgs { uri }): Parameters<UriArgs>,
@@ -454,7 +525,7 @@ writer, size, and event (create/write/delete/restore).")]
             Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&resp.entries).unwrap_or_else(|_| "[]".into()),
             )])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_history", &uri, e).await),
         }
     }
 
@@ -484,7 +555,7 @@ base64 and set encoding to \"base64\".")]
                 "created {uri} — version {}",
                 resp.version
             ))])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_create", &uri, e).await),
         }
     }
 
@@ -512,18 +583,23 @@ from a prior read.")]
             Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "soft-deleted {uri} (recoverable via chapr_restore)"
             ))])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_delete", &uri, e).await),
         }
     }
 
     #[tool(description = "Restore a historical version of a file (from chapr_history). Default \
-writes a .restored-{timestamp} copy for comparison; set in_place=true to overwrite the live file.")]
+writes a .restored-{timestamp} copy for comparison, which changes nothing else and is the safe \
+choice. in_place=true overwrites the live file and REQUIRES base: the version you last saw at \
+that path, or \"absent\" if the file is soft-deleted and you are recovering it. Restoring a \
+soft-deleted file in place brings it back at its ORIGINAL name. An in-place restore is refused \
+if the file is not in the state you describe, so it cannot destroy contents nobody has read.")]
     async fn chapr_restore(
         &self,
         Parameters(RestoreArgs {
             uri,
             version,
             in_place,
+            base,
         }): Parameters<RestoreArgs>,
     ) -> Result<CallToolResult, McpError> {
         let version = VersionToken::from_hex(version)
@@ -532,6 +608,23 @@ writes a .restored-{timestamp} copy for comparison; set in_place=true to overwri
             RestoreMode::InPlace
         } else {
             RestoreMode::Copy
+        };
+        // Parse before doing anything: a `base` we cannot interpret must not fall
+        // back to either meaning, since one of them overwrites a file.
+        let base = match base.as_deref() {
+            None => None,
+            Some(s) if s.eq_ignore_ascii_case("absent") => {
+                Some(RestoreBase::Absent(chapr_proto::AbsentMarker::Absent))
+            }
+            Some(s) => Some(RestoreBase::Version(
+                VersionToken::from_hex(s.to_string()).ok_or_else(|| {
+                    McpError::invalid_params(
+                        "base must be a version token from chapr_stat/chapr_read, or \"absent\" \
+                         for a soft-deleted file",
+                        None,
+                    )
+                })?,
+            )),
         };
         match ops::restore(
             &self.coord,
@@ -542,6 +635,7 @@ writes a .restored-{timestamp} copy for comparison; set in_place=true to overwri
             &uri,
             version,
             mode,
+            base,
         )
         .await
         {
@@ -555,7 +649,7 @@ writes a .restored-{timestamp} copy for comparison; set in_place=true to overwri
                     resp.version
                 ))]))
             }
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_restore", &uri, e).await),
         }
     }
 
@@ -598,7 +692,7 @@ governance history may span both names.")]
             Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "moved {src_uri} -> {dst_uri}"
             ))])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_move", &src_uri, e).await),
         }
     }
 
@@ -613,13 +707,15 @@ and who lost."
     ) -> Result<CallToolResult, McpError> {
         let scope = canonicalize(&scope, grammar_for(self.backend.kind()))
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // Kept for the refusal audit; `scope` moves into the query below.
+        let scope_for_audit = scope.as_str().to_string();
         match self.coord.list_conflicts(&ConflictsQuery { scope }).await {
             Ok(resp) => {
                 let json = serde_json::to_string_pretty(&resp.conflicts)
                     .unwrap_or_else(|_| "[]".to_string());
                 Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_conflicts", &scope_for_audit, e).await),
         }
     }
 
@@ -635,6 +731,9 @@ reconciled for the audit trail. resolution is one of kept_mine, kept_theirs, mer
         }): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, McpError> {
         let resolution = parse_resolution(&resolution)?;
+        // Kept for the refusal audit: `conflict_id` moves into the request, and
+        // the subject of this operation is the conflict, not a path.
+        let conflict_id_for_audit = conflict_id.clone();
         let req = ResolveConflictControl {
             conflict_id: ConflictId::new_unchecked(conflict_id),
             resolution,
@@ -646,7 +745,7 @@ reconciled for the audit trail. resolution is one of kept_mine, kept_theirs, mer
                 "resolved {} as {:?}",
                 entry.conflict_id, resolution
             ))])),
-            Err(e) => Ok(self.tool_failure(e).await),
+            Err(e) => Ok(self.tool_failure("chapr_resolve_conflict", conflict_id_for_audit.as_str(), e).await),
         }
     }
 }
@@ -825,9 +924,47 @@ pub fn instructions(roots: &[chapr_proto::CanonicalPath]) -> String {
 /// draws the same line. [`crate::diag::classify`] returns `None` for designed
 /// outcomes, so a CAS conflict or an Office lock never reaches the store.
 impl ChaprServer {
-    async fn tool_failure(&self, e: ChaprError) -> CallToolResult {
+    async fn tool_failure(&self, verb: &'static str, uri: &str, e: ChaprError) -> CallToolResult {
         self.diagnostics.report(&self.coord, &self.principal, &e).await;
+        if let Some(reason) = refusal_reason(&e) {
+            self.audit_refusal(verb, uri, reason, &e.to_string()).await;
+        }
         tool_error(e)
+    }
+
+    /// Record a refused operation in the audit trail.
+    ///
+    /// The trail held only committed changes, so an agent stopped by the
+    /// coordinated-root boundary left **no trace at all** — and "did an agent
+    /// probe outside the share" was unanswerable in a trail whose whole purpose
+    /// is accountability.
+    ///
+    /// `detail` gets a greppable reason prefix (`refused[outside_root] …`) so
+    /// `/admin` can filter by cause with a substring, without the schema change
+    /// a proper reason column would need before C0.
+    ///
+    /// Best-effort, and deliberately so twice over: a failure to record must
+    /// never turn a designed refusal into a different error for the caller, and
+    /// it must not recurse — this writes through `record_audit` directly rather
+    /// than through anything that could route back into a refusal.
+    async fn audit_refusal(&self, verb: &str, uri: &str, reason: &str, message: &str) {
+        // The canonical path is not always available — the refusal may be *about*
+        // a path that would not canonicalise — so the raw uri is recorded when
+        // that is all there is. Better an imperfect subject than no row.
+        let path = canonicalize(uri, grammar_for(self.backend.kind()))
+            .unwrap_or_else(|_| chapr_proto::CanonicalPath::new_unchecked(uri.to_string()));
+        let _ = self
+            .coord
+            .record_audit(&RecordAuditRequest {
+                principal: self.principal.clone(),
+                session_id: self.session_id.clone(),
+                path,
+                kind: AuditKind::Refused,
+                from_version: None,
+                to_version: None,
+                detail: format!("refused[{reason}] {verb}: {message}"),
+            })
+            .await;
     }
 
     /// File a diagnostic for a text file the share holds in a legacy encoding.
@@ -897,6 +1034,51 @@ impl ChaprServer {
     }
 }
 
+/// The audit reason code for a refusal, or `None` when it should not be audited.
+///
+/// **`None` is the interesting half.** Auditing every failure would put one row
+/// per read into the trail during a coordinator outage, in a workload that is
+/// read-heavy by design — noise that buries the rows an administrator needs and
+/// that §12's retention numbers were never sized for. So the rule is: a refusal
+/// is audited when it records a **decision Chaperone made** about someone's
+/// request. Transport failures, internal bugs and lookups that simply found
+/// nothing are not decisions.
+fn refusal_reason(e: &ChaprError) -> Option<&'static str> {
+    use ChaprError as E;
+    Some(match e {
+        // Decisions worth answering for.
+        E::OutsideRoot { .. } => "outside_root",
+        E::Conflict { .. } => "cas_conflict",
+        E::OfficeLockPresent { .. } => "office_lock",
+        E::NearDuplicateName { .. } => "near_duplicate_name",
+        E::BaseVersionRequired { .. } => "base_version_required",
+        E::BaseVersionNotRecorded { .. } => "base_version_not_read",
+        E::ForceRequiresReason { .. } => "force_without_reason",
+        E::LeaseHeld { .. } => "lease_held",
+        E::RetryBudgetExhausted { .. } => "retry_budget_exhausted",
+        E::PermissionDenied { .. } => "permission_denied",
+        // Not decisions: the environment failed, or the answer is simply "no such
+        // thing". Both are already visible to the caller and, for the transport
+        // cases, to diagnostics.
+        E::CoordUnreachable
+        | E::Internal { .. }
+        | E::Io { .. }
+        | E::SharingViolation { .. }
+        | E::NotFound { .. }
+        | E::AlreadyExists { .. }
+        | E::ParentMissing { .. }
+        | E::VersionNotFound { .. }
+        | E::ConflictNotFound { .. }
+        | E::InvalidPath { .. }
+        | E::LeaseExpired { .. }
+        | E::LeaseLost { .. }
+        | E::MaxLeaseLifetimeExceeded { .. }
+        | E::CommittedButUnrecorded { .. }
+        | E::LeaseNotFound { .. }
+        | E::RecoveryFailed { .. } => return None,
+    })
+}
+
 fn tool_error(e: ChaprError) -> CallToolResult {
     let guidance = match &e {
         // E-027's payload. Reached only after the local queue and the bounded
@@ -913,17 +1095,55 @@ fn tool_error(e: ChaprError) -> CallToolResult {
         ChaprError::LeaseHeld { .. } => "\n\nNOTHING WAS CHANGED. Another session holds this \
              file. Continue with other work and try this file again shortly."
             .to_string(),
-        ChaprError::Conflict { sidecar_path, .. } => format!(
-            "\n\nNOTHING WAS OVERWRITTEN and NOTHING WAS LOST. The file changed after you read \
-             it, so your version was parked at {sidecar_path} instead of replacing theirs. \
+        // Two shapes, because two things happen. A `write` submitted content, so
+        // there are bytes parked somewhere the caller can point a human at. A
+        // `delete` or `move` submitted none, so telling the caller its version
+        // was "parked" names a file that does not exist — which is what this said
+        // for three of the four verbs that raise it (B6).
+        ChaprError::Conflict {
+            base_path,
+            sidecar_path: Some(sidecar),
+            ..
+        } => format!(
+            "\n\nNOTHING WAS OVERWRITTEN and NOTHING WAS LOST. {base_path} changed after you \
+             read it, so your version was parked at {sidecar} instead of replacing theirs. \
              Read the file again, re-apply your change to the current contents, and write it \
              back with the new version. Do not force the write unless a person asks you to — \
              that discards their edit."
+        ),
+        ChaprError::Conflict {
+            base_path,
+            sidecar_path: None,
+            ..
+        } => format!(
+            "\n\nNOTHING WAS CHANGED. {base_path} is not the version you read, so this was \
+             refused rather than applied to content you have not seen. Nothing was parked \
+             because this operation submitted no content of its own. Read the file again and \
+             decide from its current contents."
         ),
         ChaprError::OfficeLockPresent { .. } => "\n\nNOTHING WAS CHANGED. A person has this \
              document open in Word, Excel or PowerPoint, and a person always wins over an \
              agent. Ask them to close it, then try again."
             .to_string(),
+        // The message already names the parent and says Chaperone does not create
+        // one implicitly. What the guidance adds is the *next action*, because the
+        // failure this replaces sent callers into a filename-permutation loop:
+        // `create` reporting `not found` on the path it was asked to create named
+        // the one path the caller had right.
+        ChaprError::ParentMissing { parent, .. } => format!(
+            "\n\nNOTHING WAS CHANGED, and the file you asked for is not the problem — the \
+             directory {parent} does not exist. Do NOT retry with a different file name. \
+             Either create the directory with chapr_mkdir first, or write into a directory \
+             that is already there (chapr_list shows which)."
+        ),
+        ChaprError::NearDuplicateName { similar, .. } => format!(
+            "\n\nNOTHING WAS CREATED. A directory named almost the same thing already exists \
+             here ({}). Almost certainly you want that one — near-duplicate folders are how a \
+             share becomes unusable, and Chaperone keys coordination by exact path, so the two \
+             would never merge. Use the existing directory, or ask the person whether the new \
+             name is intended and pass confirm_new only if they say yes.",
+            similar.join(", ")
+        ),
         // The one case where the change DID land. Saying "failed" here is the
         // most damaging thing the tool could do: the caller repeats the operation
         // and then collides with its own committed state.
@@ -962,6 +1182,10 @@ fn tool_error(e: ChaprError) -> CallToolResult {
         | ChaprError::AlreadyExists { .. }
         | ChaprError::PermissionDenied { .. }
         | ChaprError::InvalidPath { .. }
+        // No extra guidance: the message already carries the input, the resolved
+        // form, the roots, and when they were read — everything a caller or a
+        // person can act on.
+        | ChaprError::OutsideRoot { .. }
         | ChaprError::VersionNotFound { .. }
         | ChaprError::ConflictNotFound { .. }
         | ChaprError::BaseVersionRequired { .. }
@@ -1062,6 +1286,28 @@ pub enum RefusalKind {
 }
 
 impl NotAnalysable {
+    /// One line for the audit trail: what was refused and why, no advice.
+    ///
+    /// Deliberately not [`Self::message`]. That one is a paragraph written to
+    /// stop a model looping, and putting a paragraph of guidance in every audit
+    /// row would make the trail unreadable while saying nothing an auditor asked.
+    fn audit_summary(&self) -> String {
+        match &self.kind {
+            RefusalKind::Container(c) => {
+                format!("{} container, {} bytes", c.label(), self.raw)
+            }
+            RefusalKind::NonUtf8Text(ev) => format!(
+                "text in {}, first invalid byte 0x{:02X} at offset {}",
+                ev.looks_like.label(),
+                ev.first_invalid_byte,
+                ev.first_invalid_offset
+            ),
+            RefusalKind::UnknownBinary => {
+                format!("unrecognised binary, {} bytes", self.raw)
+            }
+        }
+    }
+
     /// What to tell the model.
     ///
     /// Same discipline as [`BodyTooLarge::message`]: separate what the model can

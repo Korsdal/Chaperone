@@ -168,7 +168,15 @@ async fn commit_tail(
             blob_hash: v_new.clone(),
             writer_principal: principal.clone(),
             size: receipt.size,
-            event: VersionEvent::Write,
+            // A forced write gets its own event, so `chapr_history` shows that
+            // this version discarded a concurrent edit. It was recorded as a
+            // plain `Write` — indistinguishable from the legitimate writes around
+            // it — while the only trace of the force sat in the audit log, which
+            // agents assessing provenance never read.
+            event: match mode {
+                WriteMode::Force { .. } => VersionEvent::WriteForced,
+                WriteMode::Cas => VersionEvent::Write,
+            },
             // The bytes step 7 snapshotted. This entry names the version the write
             // *produced*; the blob just uploaded is the one it *replaced*. For a
             // file Chaperone authored those line up one write apart, so coord finds

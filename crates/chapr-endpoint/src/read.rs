@@ -32,7 +32,8 @@ use crate::coord_client::CoordClient;
 use crate::pathgrammar::grammar_for;
 use chapr_proto::{
     AuditKind, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest, ConflictsQuery,
-    Integrity, JournalState, ListEntry, ListResponse, Principal, ReadContent, ReadReceipt,
+    EntryType, Integrity, JournalState, ListEntry, ListResponse, Principal, ReadContent,
+    ReadReceipt,
     ReadResponse, RecordAuditRequest, RecoverJournalRequest, RefreshIndexRequest, ResolveRequest,
     SessionId, StatResponse, VersionToken,
 };
@@ -52,8 +53,27 @@ pub struct FileStat {
 /// tool-layer [`list`] adds).
 pub struct RawDirEntry {
     pub name: String,
+    /// File, directory or neither. Both backends get this free from the
+    /// `read_dir` metadata they already fetch for `size` and `mtime`.
+    pub entry_type: EntryType,
     pub size: u64,
     pub mtime: DateTime<Utc>,
+}
+
+/// Classify a directory entry from the metadata a backend already has.
+///
+/// Shared by both backends so the two cannot disagree about what a reparse point
+/// or a symlink is. `Other` is deliberate rather than folded into `File`:
+/// Chaperone cannot coordinate a socket or a device, and an agent told it is a
+/// file will try.
+pub fn entry_type_of(md: &std::fs::Metadata) -> EntryType {
+    if md.is_dir() {
+        EntryType::Dir
+    } else if md.is_file() {
+        EntryType::File
+    } else {
+        EntryType::Other
+    }
 }
 
 /// The file backend (SMB share / local NTFS / …). The narrow **read sub-seam**:
@@ -434,6 +454,7 @@ pub async fn list(
         let open_conflicts = conflict_counts.get(canonical_path.as_str()).copied();
         entries.push(ListEntry {
             name: e.name,
+            entry_type: e.entry_type,
             size: e.size,
             mtime: e.mtime,
             version: None,
