@@ -17,7 +17,51 @@ Versions appear here only once a human has set them; work in flight sits under
 
 ## Unreleased
 
+*(nothing in flight)*
+
+---
+
+## 0.1.4 — 2026-09-09
+
+Set by jok. Note for upgraders: **`chapr_restore` gains a required argument** —
+an in-place restore must now state the version it expects to find (or `absent`).
+
 ### What was the problem
+
+Two cowork sessions against a real share found the engine behaving and not
+explaining itself. Four misconfigurations were byte-identical from the tool
+surface. `restore(in_place)` performed no CAS, so an agent could destroy content
+it had never read. Errors named the wrong subject: a create reported `not found`
+for the file it was asked to create; a conflict named the sidecar rather than the
+file. A directory appeared in a listing as `size: 0`, and none could be created.
+
+### What was changed
+
+| Area | Change |
+|---|---|
+| Refusals | Carry the root, the setting it came from, and when it was read — a stale root and a wrong one looked identical. All paths formatted plainly; two of three were Debug-escaped, doubling backslashes on every refusal |
+| `restore(in_place)` | Requires the state the caller observed and CAS-checks it. A soft-deleted target comes back at its **original name**, so recoverability is kept in practice |
+| `chapr_mkdir` | New. Refuses a name resembling a sibling, deterministically by edit distance; numbered siblings (2026/2027) are exempt |
+| Errors | A conflict names the file, and the sidecar only when one exists; a missing parent names the **parent** |
+| Audit | Every refusal is recorded, reads included, with a greppable reason; `/admin` gains path and detail search |
+| Provenance | A forced write records `write_forced`, visible in `chapr_history` where agents look; `chapr_move` returns its version; listings carry an entry type |
+| Packaging | The bundle template ships no defaults, requires the coordinated root, and no longer renders our own notes in the install dialog |
+
+### What was deferred / backlogged
+
+Move provenance in history needs real columns and therefore C0's migration
+machinery. The coordinator setup epic — a UI wizard, uninstall, update — is
+specified and unbuilt, which leaves an installer dependent on being told the URL
+and share path by hand. No `chapr_config` tool: refusal enrichment covers three
+of the four misconfiguration states, and the fourth is a decision about growing
+the tool surface.
+
+### Also released here: the truth pass and the correctness core
+
+Everything below sat unreleased since 0.1.3 and ships in this version. Kept in
+its own words rather than rewritten, because each part was checked as written.
+
+#### The truth pass (Phase A) — what was the problem
 
 Several things the code said about itself were false, and one of them was
 dangerous: after a `chapr_move` renamed a file successfully, a failure to reach
@@ -26,7 +70,7 @@ writes"* — the opposite of what had happened, to an agent that would then act 
 it. The rest were comments and tool descriptions that had drifted from the
 behaviour they described.
 
-### What was changed
+#### What was changed
 
 | Site | Change |
 |---|---|
@@ -36,13 +80,25 @@ behaviour they described.
 | `ops.rs`, `tools.rs` | Restore no longer claims it "cannot clobber a concurrent writer"; it performs no CAS, and the docs now say so |
 | `server.rs` | Move's description stops implying the audit trail follows a rename; an unrecognised file type no longer instructs the model to escalate |
 
-### What was deferred / backlogged
+#### What was deferred
 
 Restore's spec-versus-code disagreement (concept §6.5 says it runs the full write
 path, which would imply a CAS) is recorded, not resolved — it needs a decision.
 Journalling the move window, so a stale coordinator is genuinely recoverable, and
 auditing the history an overwrite-move discards both remain open in the roadmap's
 correctness phase. Holding the handle through the rename is still I-007.
+
+#### The correctness core (B1, B2, B3, B8)
+
+`move_cas_core` violated invariant 4 — it hashed the source, released the handle,
+then renamed — so the CAS proved nothing about the bytes that moved (I-007). The
+rename now runs through the handle held since the source's CAS, and the two-path
+`FsPrimitives::rename` was deleted so the unsafe order is no longer expressible.
+A move records its intent before renaming, and the coordinator discharges that
+record inside the migration's own transaction, which makes completing an
+interrupted move exactly-once by construction (B3, D-046). The self-test's exit
+code stops contradicting its own output: a check that could not run counts, one
+that cannot apply here does not (B8).
 
 ---
 

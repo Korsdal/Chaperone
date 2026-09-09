@@ -46,7 +46,7 @@ members = [
 # Human owns version bumps (see README) — nothing automated touches this line, and
 # the release workflow refuses a tag that disagrees with it, so the bump is the
 # decision and the tag only records it.
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 # 1.88.0 is the highest rust-version declared anywhere in the LOCKED dependency
 # graph: darling 0.23 and time 0.3.55 require it, with the icu_* 2.2 crates just
