@@ -5,7 +5,8 @@
 //! POSIX filesystem primitives for the shared §7 core (E-019).
 //!
 //! The POSIX counterpart to `winfs`: an exclusive-open via **advisory** `flock`
-//! (`fs4`), plus create-new and rename. Unlike SMB's `share = NONE` (a mandatory
+//! (`fs4`), plus create-new, and a rename that runs through the held lock.
+//! Unlike SMB's `share = NONE` (a mandatory
 //! lock excluding Excel/Explorer), `flock` only excludes other *advisory* lockers
 //! — so a non-Chaperone editor can still write concurrently. That is the accepted
 //! trade-off (decisions D-F / D-019); the CAS re-hash-under-lock still protects
@@ -30,6 +31,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[derive(Debug)]
 pub struct PosixFile {
     file: File,
+    /// The path this was opened by, kept so [`LockedFile::rename_to`] can rename
+    /// without closing. POSIX has no rename-by-fd for the source name (`renameat`
+    /// wants a directory fd plus a name), so the path is the only handle-free
+    /// thing to name it with.
+    path: String,
 }
 
 impl PosixFile {
@@ -41,7 +47,10 @@ impl PosixFile {
     pub fn open_existing(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         FileExt::try_lock(&file).map_err(io::Error::from)?;
-        Ok(PosixFile { file })
+        Ok(PosixFile {
+            file,
+            path: path.to_string(),
+        })
     }
 }
 
@@ -62,6 +71,29 @@ impl LockedFile for PosixFile {
         f.sync_all()?; // durable before we drop the lock (crash safety, §7)
         Ok(())
     }
+
+    /// Rename without releasing the lock. `flock` is held on the open file
+    /// description, not on the name, so it survives the rename and stays held
+    /// until this value drops — the fd remains valid and refers to the same
+    /// inode at its new name.
+    ///
+    /// Honest about what this is and is not: on Win32 the equivalent renames the
+    /// object the handle *already refers to*, so no name is resolved twice. Here
+    /// the source is still named by path, so a sufficiently adversarial third
+    /// party could in principle swap it in between. That is the same advisory
+    /// trade-off this whole backend is built on (`mandatory_lock: false`, D-F /
+    /// D-019) and not a new gap — a non-Chaperone writer can already race every
+    /// other operation in this module. Against two Chaperone endpoints, which is
+    /// what the lock is for, the window is closed.
+    fn rename_to(&self, dst: &str, replace: bool) -> io::Result<()> {
+        if !replace && std::path::Path::new(dst).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination exists",
+            ));
+        }
+        std::fs::rename(&self.path, dst)
+    }
 }
 
 impl Drop for PosixFile {
@@ -78,19 +110,6 @@ pub fn create_new(path: &str, bytes: &[u8]) -> io::Result<()> {
     f.write_all(bytes)?;
     f.sync_all()?;
     Ok(())
-}
-
-/// Rename `src` to `dst`. POSIX `rename(2)` atomically replaces an existing
-/// destination, so we guard the non-overwrite case explicitly to match the SMB
-/// backend's semantics (which refuse via `MoveFileExW` without `REPLACE_EXISTING`).
-pub fn rename(src: &str, dst: &str, overwrite: bool) -> io::Result<()> {
-    if !overwrite && std::path::Path::new(dst).exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination exists",
-        ));
-    }
-    std::fs::rename(src, dst)
 }
 
 #[cfg(test)]
@@ -146,19 +165,63 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// The rename happens **through the held lock** (I-007), so this drives it
+    /// via [`LockedFile::rename_to`] on an open file rather than by path. The
+    /// non-overwrite guard has to survive that move; it is the only thing
+    /// stopping a move from silently destroying an unrelated destination.
     #[test]
     fn rename_guards_non_overwrite() {
         let src = tmp("mvsrc");
         let dst = tmp("mvdst");
         std::fs::write(&src, b"s").unwrap();
         std::fs::write(&dst, b"d").unwrap();
-        let (ss, ds) = (src.to_string_lossy().to_string(), dst.to_string_lossy().to_string());
+        let (ss, ds) = (
+            src.to_string_lossy().to_string(),
+            dst.to_string_lossy().to_string(),
+        );
+
+        let f = PosixFile::open_existing(&ss).unwrap();
         assert!(matches!(
-            rename(&ss, &ds, false),
+            f.rename_to(&ds, false),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists
         ));
-        rename(&ss, &ds, true).unwrap();
+        f.rename_to(&ds, true).unwrap();
+        // Drop BEFORE reading the destination, and the reason is worth keeping:
+        // `fs4` is `LockFileEx` on Windows, which is **mandatory**, so a plain
+        // `std::fs::read` of the still-locked file fails with
+        // `ERROR_LOCK_VIOLATION` (33). Reading here first is how this test failed
+        // when it was written — and the failure was evidence *for* the property
+        // I-007 wanted: the lock followed the file through the rename.
+        drop(f);
         assert_eq!(std::fs::read(&ds).unwrap(), b"s");
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// The property I-007 is about: the lock is still held *after* the rename,
+    /// so nothing can slip in between the CAS and the mutation. If `rename_to`
+    /// released it, a second `open_existing` on the new name would succeed.
+    #[test]
+    fn lock_survives_the_rename() {
+        let src = tmp("holdsrc");
+        let dst = tmp("holddst");
+        std::fs::write(&src, b"s").unwrap();
+        let _ = std::fs::remove_file(&dst);
+        let (ss, ds) = (
+            src.to_string_lossy().to_string(),
+            dst.to_string_lossy().to_string(),
+        );
+
+        let held = PosixFile::open_existing(&ss).unwrap();
+        held.rename_to(&ds, false).unwrap();
+        assert!(
+            PosixFile::open_existing(&ds).is_err(),
+            "the advisory lock must still be held at the new name after the rename"
+        );
+        drop(held);
+        assert!(
+            PosixFile::open_existing(&ds).is_ok(),
+            "and released once the holder drops"
+        );
         let _ = std::fs::remove_file(&dst);
     }
 }

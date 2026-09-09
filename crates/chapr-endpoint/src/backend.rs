@@ -16,8 +16,9 @@
 //! the private generic `*_core` functions below, parameterised over two seams:
 //!
 //! - [`FsPrimitives`] — the backend's exclusive-open ([`LockedFile`]), create-new
-//!   and rename primitives (SMB = `CreateFileW share=NONE` / `MoveFileExW`;
-//!   POSIX = `open`+advisory-`flock` / `rename`).
+//!   primitives, plus a rename that runs through the held handle (SMB =
+//!   `CreateFileW share=NONE` + `SetFileInformationByHandle`; POSIX =
+//!   `open`+advisory-`flock` + `rename`).
 //! - [`crate::pathgrammar::PathGrammar`] — separator, casefold, and the
 //!   human-lock / sidecar / restored name conventions.
 //!
@@ -41,7 +42,7 @@ use crate::coord_client::CoordClient;
 use crate::pathgrammar::grammar_for;
 use crate::read::{system_time_to_utc, FileSource, FileStat, RawDirEntry};
 #[cfg(windows)]
-use crate::winfs::{create_new_file, move_file, ExclusiveFile};
+use crate::winfs::{create_new_file, ExclusiveFile};
 use chapr_proto::{
     BackendDescriptor, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest, HistoryQuery,
     LeaseId, MovePathsRequest, OpenJournalRequest, PreImage, Principal, ReadReceipt,
@@ -124,6 +125,7 @@ pub struct CommitReceipt {
 
 /// A move reports nothing to the tool layer: its version-log entry + audit are
 /// emitted coord-side by `move_paths` (D-013).
+#[derive(Debug)]
 pub struct MoveReceipt;
 
 /// Args for the contended §7 write (`write_cas`).
@@ -168,6 +170,17 @@ pub trait LockedFile {
     /// — never temp-rename (a rename carries the source ACL and strips the
     /// target's; concept §7 step 9).
     fn overwrite(&self, bytes: &[u8]) -> io::Result<()>;
+    /// Rename this file to `dst` **without releasing the lock** (I-007,
+    /// invariant 4). `replace` allows overwriting an existing `dst`.
+    ///
+    /// The move path's version-check and its mutation must share one handle for
+    /// the same reason the write path's do: closing in between opens a window in
+    /// which another writer's bytes land in the file and are then renamed away
+    /// with no snapshot and no conflict. Both backends can do this — Win32 via
+    /// `SetFileInformationByHandle(FileRenameInfo)`, POSIX because `rename(2)`
+    /// operates on the directory entry and never needed the fd closed — so it
+    /// belongs on the seam rather than in either backend's adapter.
+    fn rename_to(&self, dst: &str, replace: bool) -> io::Result<()>;
 }
 
 /// The per-backend filesystem primitives the shared §7 core drives. Kept separate
@@ -184,10 +197,17 @@ pub trait FsPrimitives: Send + Sync {
     /// Create a brand-new file (fails if it exists) — sidecar / restore-copy /
     /// create. Uniquely named, so no lock is needed.
     fn create_new(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
-    /// Rename `src` to `dst` (a true rename preserving identity/ACL), replacing
-    /// an existing `dst` when `overwrite`.
-    fn rename(&self, src: &str, dst: &str, overwrite: bool) -> io::Result<()>;
 }
+
+// There is deliberately **no** `rename(src, dst)` on this seam. A rename that
+// takes two paths can only be reached by closing the exclusive handle first,
+// which is precisely the invariant-4 violation I-007 recorded: between the close
+// and the rename, another writer's bytes can land in the source and be moved to
+// the destination unnoticed, with no snapshot and no conflict. Renaming is a
+// method on the *held file* ([`LockedFile::rename_to`]) so that the type system
+// makes the safe order the only expressible one. If a future backend genuinely
+// cannot rename through a handle, give it an explicit capability flag and a
+// documented degradation — do not put the two-path version back here.
 
 /// A fileserver backend. `Backend: FileSource` (supertrait) so a backend also
 /// serves the read path; the narrow `FileSource` seam stays separate to keep the
@@ -213,17 +233,33 @@ pub trait Backend: FileSource + Send + Sync {
     fn write_cas(&self, ctx: &WriteCtx, args: &WriteCasArgs) -> Result<CommitReceipt, ChaprError>;
 
     /// Create a new file (atomic exists-check). No pre-image.
-    fn create(&self, ctx: &WriteCtx, path: &CanonicalPath, content: &[u8]) -> Result<CommitReceipt, ChaprError>;
+    fn create(
+        &self,
+        ctx: &WriteCtx,
+        path: &CanonicalPath,
+        content: &[u8],
+    ) -> Result<CommitReceipt, ChaprError>;
 
     /// Soft delete: snapshot the pre-image, then remove. CAS on `base_version`.
-    fn delete_cas(&self, ctx: &WriteCtx, args: &DeleteCasArgs) -> Result<CommitReceipt, ChaprError>;
+    fn delete_cas(&self, ctx: &WriteCtx, args: &DeleteCasArgs)
+        -> Result<CommitReceipt, ChaprError>;
 
     /// Restore old bytes into a fresh uniquely-named sibling (no lease). Returns
     /// the path written.
-    fn restore_copy(&self, ctx: &WriteCtx, path: &CanonicalPath, bytes: &[u8], version: &VersionToken) -> Result<CanonicalPath, ChaprError>;
+    fn restore_copy(
+        &self,
+        ctx: &WriteCtx,
+        path: &CanonicalPath,
+        bytes: &[u8],
+        version: &VersionToken,
+    ) -> Result<CanonicalPath, ChaprError>;
 
     /// Restore old bytes in place (the full contended path).
-    fn restore_in_place(&self, ctx: &WriteCtx, args: &RestoreInPlaceArgs) -> Result<CommitReceipt, ChaprError>;
+    fn restore_in_place(
+        &self,
+        ctx: &WriteCtx,
+        args: &RestoreInPlaceArgs,
+    ) -> Result<CommitReceipt, ChaprError>;
 
     /// Atomic dual-lease rename with CAS on both sides. Coord state is migrated
     /// server-side (`move_paths`), so nothing is returned for the tool layer.
@@ -288,7 +324,9 @@ fn write_cas_core<P: FsPrimitives>(
     check_human_lock(g, path)?;
 
     // Step 4: exclusive open. A sharing violation means someone raced us.
-    let file = prims.open_existing(path.as_str()).map_err(|e| map_os_err(path, e))?;
+    let file = prims
+        .open_existing(path.as_str())
+        .map_err(|e| map_os_err(path, e))?;
 
     // Step 5: read current bytes under the lock and hash → V_now.
     let current = file.read_all().map_err(|e| map_os_err(path, e))?;
@@ -337,7 +375,9 @@ fn write_cas_core<P: FsPrimitives>(
         // Conflict: park the losing bytes in a fresh sidecar and register it.
         // Neither party's bytes are lost; Office binaries are never merged.
         let sidecar = g.sidecar_path(path, principal);
-        prims.create_new(sidecar.as_str(), content).map_err(|e| map_os_err(&sidecar, e))?;
+        prims
+            .create_new(sidecar.as_str(), content)
+            .map_err(|e| map_os_err(&sidecar, e))?;
         let _entry = rt.block_on(coord.register_conflict(&RegisterConflictRequest {
             base_path: path.clone(),
             sidecar_path: sidecar.clone(),
@@ -396,7 +436,8 @@ fn write_cas_core<P: FsPrimitives>(
     // matches it against the journal's `intended_version`, and clears it
     // (`read::serve_dangling`).
     if !atomic_writes {
-        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        if let Err(e) =
+            rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
         {
             tracing::warn!(
                 path = %path, error = %e,
@@ -437,7 +478,9 @@ fn create_core<P: FsPrimitives>(
             ),
         });
     }
-    prims.create_new(path.as_str(), content).map_err(|e| map_os_err(path, e))?;
+    prims
+        .create_new(path.as_str(), content)
+        .map_err(|e| map_os_err(path, e))?;
     // After the file exists: a failed snapshot must not leave a phantom create.
     // Best-effort — the bytes are on the share either way, and the tool layer's
     // version-log append is what makes the version visible.
@@ -472,7 +515,9 @@ fn delete_cas_core<P: FsPrimitives>(
 
     check_human_lock(g, path)?;
 
-    let file = prims.open_existing(path.as_str()).map_err(|e| map_os_err(path, e))?;
+    let file = prims
+        .open_existing(path.as_str())
+        .map_err(|e| map_os_err(path, e))?;
     let current = file.read_all().map_err(|e| map_os_err(path, e))?;
     let v_now = VersionToken::hash(&current);
     if v_now != args.base_version {
@@ -505,7 +550,8 @@ fn delete_cas_core<P: FsPrimitives>(
     // false. A read of the path now fails at `stat` before the journal is ever
     // consulted, and a later `create` supersedes the entry (INSERT OR REPLACE).
     if !atomic_writes {
-        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        if let Err(e) =
+            rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
         {
             tracing::warn!(
                 path = %path, error = %e,
@@ -534,7 +580,9 @@ fn restore_copy_core<P: FsPrimitives>(
 ) -> Result<CanonicalPath, ChaprError> {
     let g = grammar_for(prims.kind());
     let restored = g.restored_path(path);
-    prims.create_new(restored.as_str(), bytes).map_err(|e| map_os_err(&restored, e))?;
+    prims
+        .create_new(restored.as_str(), bytes)
+        .map_err(|e| map_os_err(&restored, e))?;
     Ok(restored)
 }
 
@@ -560,7 +608,9 @@ fn restore_in_place_core<P: FsPrimitives>(
     // outlives an Office crash, which is a case the rule exists to respect.
     check_human_lock(g, path)?;
 
-    let file = prims.open_existing(path.as_str()).map_err(|e| map_os_err(path, e))?;
+    let file = prims
+        .open_existing(path.as_str())
+        .map_err(|e| map_os_err(path, e))?;
     let current = file.read_all().map_err(|e| map_os_err(path, e))?;
     let v_prev = VersionToken::hash(&current);
 
@@ -575,13 +625,15 @@ fn restore_in_place_core<P: FsPrimitives>(
         }))?;
     }
 
-    file.overwrite(&args.bytes).map_err(|e| map_os_err(path, e))?;
+    file.overwrite(&args.bytes)
+        .map_err(|e| map_os_err(path, e))?;
     drop(file);
 
     // Not fatal, for the same reason as `write_cas_core`: the restored bytes are
     // durable, and the next read reconciles the entry against `intended_version`.
     if !atomic_writes {
-        if let Err(e) = rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
+        if let Err(e) =
+            rt.block_on(coord.journal_clear(&ClearJournalRequest { path: path.clone() }))
         {
             tracing::warn!(
                 path = %path, error = %e,
@@ -617,7 +669,9 @@ fn move_cas_core<P: FsPrimitives>(
     check_human_lock(g, src)?;
 
     // CAS the source: exclusive open, hash, compare to the version read.
-    let sfile = prims.open_existing(src.as_str()).map_err(|e| map_os_err(src, e))?;
+    let sfile = prims
+        .open_existing(src.as_str())
+        .map_err(|e| map_os_err(src, e))?;
     let sbytes = sfile.read_all().map_err(|e| map_os_err(src, e))?;
     let src_now = VersionToken::hash(&sbytes);
     let size = sbytes.len() as u64;
@@ -631,7 +685,12 @@ fn move_cas_core<P: FsPrimitives>(
             sidecar_path: src.clone(),
         });
     }
-    drop(sfile); // close before renaming
+    // `sfile` is deliberately NOT dropped here. It stays held until the rename
+    // below goes through it, so version-check and mutation share one handle
+    // (invariant 4, I-007). Closing here — as this used to — left the source
+    // unlocked across the destination's CAS and blob upload, a window in which
+    // another writer could replace the very bytes we just hashed and have them
+    // renamed into `dst` unnoticed.
 
     // Overwrite? Then CAS the destination too (concept §6.3).
     let overwrite = std::path::Path::new(dst.as_str()).exists();
@@ -648,7 +707,9 @@ fn move_cas_core<P: FsPrimitives>(
             path: dst.clone(),
             version: dbv.clone(),
         }))?;
-        let dfile = prims.open_existing(dst.as_str()).map_err(|e| map_os_err(dst, e))?;
+        let dfile = prims
+            .open_existing(dst.as_str())
+            .map_err(|e| map_os_err(dst, e))?;
         let dbytes = dfile.read_all().map_err(|e| map_os_err(dst, e))?;
         let dst_now = VersionToken::hash(&dbytes);
         if dst_now != *dbv {
@@ -676,22 +737,16 @@ fn move_cas_core<P: FsPrimitives>(
                 ),
             });
         }
-        // Upload while the exclusive handle is STILL HELD, then close immediately
-        // before the rename. Win32 cannot rename a file held with
-        // `FILE_SHARE_NONE` (`MoveFileExW` → ERROR_SHARING_VIOLATION), so a
-        // handle-free instant before the rename is unavoidable here — but it must
-        // be an instant. Closing first and *then* uploading, as this did, stretched
-        // it across a network round-trip of up to `MAX_PRE_IMAGE_BYTES`, during
-        // which a non-Chaperone writer's bytes could land in `dst` and be destroyed
-        // by the rename with no snapshot and no conflict. Other Chaperone sessions
-        // are already excluded by the all-or-none `{src,dst}` lease; this narrows
-        // the window for everyone else to two adjacent syscalls.
+        // Upload while the exclusive handle is still held. The destination's
+        // handle must be closed before the rename can replace it — a rename
+        // cannot unlink a name this process holds with `FILE_SHARE_NONE` — but
+        // that close now happens immediately before the rename, with nothing
+        // between them, and the *source* stays locked throughout.
         //
-        // The residual window is a true invariant-4 gap: version-check and mutation
-        // are not under one handle. Closing it properly means renaming *through*
-        // the held handle via `SetFileInformationByHandle(FileRenameInfo)`, which
-        // requires `DELETE` in the open's access mask — deferred, and tracked,
-        // because it needs verifying against the real SMB target.
+        // This used to close first and upload afterwards, stretching the unlocked
+        // window across a network round-trip of up to `MAX_PRE_IMAGE_BYTES`.
+        // Other Chaperone sessions are excluded by the all-or-none `{src,dst}`
+        // lease either way; what changed is the window for everyone else.
         let dst_size = dbytes.len() as u64;
         rt.block_on(coord.put_blob(dbytes))?;
         dst_pre_image = Some(PreImage {
@@ -701,8 +756,12 @@ fn move_cas_core<P: FsPrimitives>(
         drop(dfile);
     }
 
-    // Ground truth first: the rename.
-    prims.rename(src.as_str(), dst.as_str(), overwrite).map_err(|e| map_os_err(dst, e))?;
+    // Ground truth first: the rename — through the source handle held since its
+    // CAS, so nothing could have changed the bytes we verified (invariant 4).
+    sfile
+        .rename_to(dst.as_str(), overwrite)
+        .map_err(|e| map_os_err(dst, e))?;
+    drop(sfile); // released here rather than by scope end, so the order is explicit
 
     // Then migrate coord state atomically to match.
     //
@@ -807,9 +866,6 @@ impl FsPrimitives for SmbBackend {
     fn create_new(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         create_new_file(path, bytes)
     }
-    fn rename(&self, src: &str, dst: &str, overwrite: bool) -> io::Result<()> {
-        move_file(src, dst, overwrite)
-    }
 }
 
 #[cfg(windows)]
@@ -848,7 +904,11 @@ impl Backend for SmbBackend {
         create_core(self, ctx, path, content)
     }
 
-    fn delete_cas(&self, ctx: &WriteCtx, args: &DeleteCasArgs) -> Result<CommitReceipt, ChaprError> {
+    fn delete_cas(
+        &self,
+        ctx: &WriteCtx,
+        args: &DeleteCasArgs,
+    ) -> Result<CommitReceipt, ChaprError> {
         delete_cas_core(self, self.capabilities().atomic_writes, ctx, args)
     }
 
@@ -924,9 +984,6 @@ impl FsPrimitives for PosixBackend {
     fn create_new(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         crate::posixfs::create_new(path, bytes)
     }
-    fn rename(&self, src: &str, dst: &str, overwrite: bool) -> io::Result<()> {
-        crate::posixfs::rename(src, dst, overwrite)
-    }
 }
 
 impl Backend for PosixBackend {
@@ -965,7 +1022,11 @@ impl Backend for PosixBackend {
         create_core(self, ctx, path, content)
     }
 
-    fn delete_cas(&self, ctx: &WriteCtx, args: &DeleteCasArgs) -> Result<CommitReceipt, ChaprError> {
+    fn delete_cas(
+        &self,
+        ctx: &WriteCtx,
+        args: &DeleteCasArgs,
+    ) -> Result<CommitReceipt, ChaprError> {
         delete_cas_core(self, self.capabilities().atomic_writes, ctx, args)
     }
 
@@ -1047,9 +1108,7 @@ pub fn make_backend(kind: BackendKind) -> Result<std::sync::Arc<dyn Backend>, St
         #[cfg(windows)]
         BackendKind::Smb => Ok(std::sync::Arc::new(SmbBackend)),
         #[cfg(not(windows))]
-        BackendKind::Smb => {
-            Err("the SMB backend is only available on Windows builds".to_string())
-        }
+        BackendKind::Smb => Err("the SMB backend is only available on Windows builds".to_string()),
         BackendKind::Posix => Ok(std::sync::Arc::new(PosixBackend)),
     }
 }
@@ -1112,6 +1171,9 @@ mod tests {
             fn overwrite(&self, _bytes: &[u8]) -> io::Result<()> {
                 unreachable!("no handle is ever produced")
             }
+            fn rename_to(&self, _dst: &str, _replace: bool) -> io::Result<()> {
+                unreachable!("no handle is ever produced")
+            }
         }
 
         impl FsPrimitives for StubFs {
@@ -1124,9 +1186,6 @@ mod tests {
             }
             fn create_new(&self, _path: &str, _bytes: &[u8]) -> io::Result<()> {
                 unreachable!("a restore in place creates nothing")
-            }
-            fn rename(&self, _s: &str, _d: &str, _o: bool) -> io::Result<()> {
-                unreachable!("a restore in place renames nothing — never temp-rename")
             }
         }
 
@@ -1205,6 +1264,256 @@ mod tests {
                 !matches!(err, ChaprError::OfficeLockPresent { .. }),
                 "pre-flight refused with no lock file present: {err:?}"
             );
+        }
+    }
+
+    /// `move_cas_core` — which had **no tests at all** until I-007's fix (B2).
+    ///
+    /// These drive the real generic core against the real [`PosixBackend`] and
+    /// real files in a tempdir, with only coord mocked. That combination is the
+    /// point: the core's whole job is ordering real filesystem operations around
+    /// real coord calls, and a stub filesystem would skip exactly the part that
+    /// can lose someone's data.
+    mod move_cas {
+        use super::*;
+        use wiremock::matchers::{method as wmethod, path as wpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A coord that accepts every call the move path makes.
+        async fn coord() -> MockServer {
+            let s = MockServer::start().await;
+            for p in ["/reads/assert", "/move"] {
+                Mock::given(wmethod("POST"))
+                    .and(wpath(p))
+                    .respond_with(ResponseTemplate::new(204))
+                    .mount(&s)
+                    .await;
+            }
+            Mock::given(wmethod("PUT"))
+                .and(wpath("/blobs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": VersionToken::hash(b"ignored").as_str(),
+                    "size": 0, "deduplicated": false
+                })))
+                .mount(&s)
+                .await;
+            Mock::given(wmethod("POST"))
+                .and(wpath("/history"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "entries": [] })),
+                )
+                .mount(&s)
+                .await;
+            s
+        }
+
+        fn canon(p: &std::path::Path) -> CanonicalPath {
+            CanonicalPath::new_unchecked(p.to_string_lossy().to_string())
+        }
+
+        /// Drive `move_cas_core` against the real POSIX backend.
+        async fn run(
+            coord_uri: String,
+            src: &std::path::Path,
+            dst: &std::path::Path,
+            src_base: VersionToken,
+            dst_base: Option<VersionToken>,
+        ) -> Result<MoveReceipt, ChaprError> {
+            let src = canon(src);
+            let dst = canon(dst);
+            tokio::task::spawn_blocking(move || {
+                let client = CoordClient::new(coord_uri);
+                let principal = Principal::new_unchecked("CONTOSO\\tester");
+                let session_id = SessionId::new_unchecked("sess-move");
+                let rt = Handle::current();
+                let ctx = WriteCtx {
+                    rt: &rt,
+                    coord: &client,
+                    principal: &principal,
+                    session_id: &session_id,
+                };
+                let args = MoveCasArgs {
+                    src,
+                    dst,
+                    src_base_version: src_base,
+                    dst_base_version: dst_base,
+                };
+                move_cas_core(&PosixBackend, &ctx, &args)
+            })
+            .await
+            .expect("join")
+        }
+
+        /// The happy path, and the assertion that matters most: the bytes that
+        /// arrive at `dst` are the bytes that were CAS-verified at `src`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn renames_and_preserves_the_verified_bytes() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"the verified bytes").unwrap();
+            let v = VersionToken::hash(b"the verified bytes");
+
+            let c = coord().await;
+            run(c.uri(), &src, &dst, v, None).await.expect("move");
+
+            assert!(!src.exists(), "the source name must be gone after a rename");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"the verified bytes");
+        }
+
+        /// A stale `src_base_version` must lose, and must lose *before* touching
+        /// anything. The regression this guards: a move that renames first and
+        /// checks afterwards silently discards a concurrent writer's work.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stale_source_version_conflicts_and_moves_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"what is actually on disk").unwrap();
+
+            let c = coord().await;
+            let err = run(
+                c.uri(),
+                &src,
+                &dst,
+                VersionToken::hash(b"what we read earlier"),
+                None,
+            )
+            .await
+            .expect_err("a stale base version must conflict");
+
+            assert!(
+                matches!(err, ChaprError::Conflict { .. }),
+                "expected Conflict, got {err:?}"
+            );
+            assert!(src.exists(), "the source must survive a refused move");
+            assert!(!dst.exists(), "and the destination must not be created");
+            assert_eq!(std::fs::read(&src).unwrap(), b"what is actually on disk");
+        }
+
+        /// Overwriting an existing destination requires its base version too
+        /// (concept §6.3). Without it the move would destroy `dst` with no CAS.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn overwrite_without_dst_base_version_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"source").unwrap();
+            std::fs::write(&dst, b"destination worth keeping").unwrap();
+
+            let c = coord().await;
+            let err = run(c.uri(), &src, &dst, VersionToken::hash(b"source"), None)
+                .await
+                .expect_err("an overwrite-move needs dst_base_version");
+
+            assert!(
+                matches!(err, ChaprError::BaseVersionRequired { .. }),
+                "expected BaseVersionRequired, got {err:?}"
+            );
+            assert_eq!(
+                std::fs::read(&dst).unwrap(),
+                b"destination worth keeping",
+                "the destination must be untouched"
+            );
+        }
+
+        /// A stale destination version loses too, and leaves both files intact.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stale_destination_version_conflicts() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"source").unwrap();
+            std::fs::write(&dst, b"dst as it really is").unwrap();
+
+            let c = coord().await;
+            let err = run(
+                c.uri(),
+                &src,
+                &dst,
+                VersionToken::hash(b"source"),
+                Some(VersionToken::hash(b"dst as we read it")),
+            )
+            .await
+            .expect_err("a stale dst base version must conflict");
+
+            assert!(
+                matches!(err, ChaprError::Conflict { .. }),
+                "expected Conflict, got {err:?}"
+            );
+            assert_eq!(std::fs::read(&src).unwrap(), b"source");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"dst as it really is");
+        }
+
+        /// A successful overwrite-move replaces the destination with the source.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn overwrite_move_replaces_the_destination() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"the winner").unwrap();
+            std::fs::write(&dst, b"the replaced").unwrap();
+
+            let c = coord().await;
+            run(
+                c.uri(),
+                &src,
+                &dst,
+                VersionToken::hash(b"the winner"),
+                Some(VersionToken::hash(b"the replaced")),
+            )
+            .await
+            .expect("overwrite move");
+
+            assert!(!src.exists());
+            assert_eq!(std::fs::read(&dst).unwrap(), b"the winner");
+        }
+
+        /// Coord failing *after* the rename must not tell the agent nothing
+        /// happened — that was A1's bug, and this is its regression test at the
+        /// core rather than at the tool layer. The file is at `dst`, and the
+        /// error must name `dst`, because sending the caller back to `src` sends
+        /// it to a path that no longer exists.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn coord_failure_after_the_rename_reports_committed_but_unrecorded() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"moved anyway").unwrap();
+
+            // Everything succeeds except the bookkeeping that follows the rename.
+            let s = MockServer::start().await;
+            Mock::given(wmethod("POST"))
+                .and(wpath("/move"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&s)
+                .await;
+            Mock::given(wmethod("POST"))
+                .and(wpath("/reads/assert"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&s)
+                .await;
+
+            let err = run(
+                s.uri(),
+                &src,
+                &dst,
+                VersionToken::hash(b"moved anyway"),
+                None,
+            )
+            .await
+            .expect_err("coord refused the bookkeeping");
+
+            match err {
+                ChaprError::CommittedButUnrecorded { path, .. } => assert_eq!(
+                    path.as_str(),
+                    dst.to_string_lossy(),
+                    "the caller must be sent to where the file now IS"
+                ),
+                other => panic!("expected CommittedButUnrecorded, got {other:?}"),
+            }
+            assert!(!src.exists(), "the rename really happened");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"moved anyway");
         }
     }
 }

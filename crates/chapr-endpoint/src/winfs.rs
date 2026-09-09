@@ -17,15 +17,20 @@
 
 use std::io;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, BOOLEAN, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, MoveFileExW, ReadFile, SetEndOfFile, SetFilePointerEx, WriteFile,
-    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_NONE,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    CreateFileW, FileRenameInfo, FlushFileBuffers, ReadFile, SetEndOfFile,
+    SetFileInformationByHandle, SetFilePointerEx, WriteFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+    FILE_BEGIN, FILE_RENAME_INFO, FILE_SHARE_NONE, OPEN_EXISTING,
 };
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+/// `DELETE` (0x0001_0000) is what `SetFileInformationByHandle(FileRenameInfo)`
+/// requires — a rename is, to Win32, an unlink of the source name. Requesting it
+/// in the *access mask* does not weaken the `FILE_SHARE_NONE` share mode: the
+/// mask says what this handle may do, the share mode says what others may do.
+const DELETE: u32 = 0x0001_0000;
 
 fn wide(path: &str) -> Vec<u16> {
     path.encode_utf16().chain(std::iter::once(0)).collect()
@@ -55,7 +60,7 @@ impl ExclusiveFile {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(w.as_ptr()),
-                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE | DELETE,
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
@@ -94,13 +99,80 @@ impl ExclusiveFile {
             unsafe { WriteFile(self.handle, Some(&bytes[off..]), Some(&mut written), None) }
                 .map_err(to_io)?;
             if written == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "WriteFile wrote 0 bytes"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "WriteFile wrote 0 bytes",
+                ));
             }
             off += written as usize;
         }
         unsafe { SetEndOfFile(self.handle) }.map_err(to_io)?;
         unsafe { FlushFileBuffers(self.handle) }.map_err(to_io)?;
         Ok(())
+    }
+
+    /// Rename this file to `dst` **through the handle that is still held**
+    /// (I-007, invariant 4). `replace` allows overwriting an existing `dst`.
+    ///
+    /// This is the whole point of the method, so it is worth being explicit:
+    /// `MoveFileExW` cannot do this. It opens the source by *name*, and a file
+    /// this process holds with `FILE_SHARE_NONE` refuses that open —
+    /// `ERROR_SHARING_VIOLATION` (32), which D-027 established empirically. The
+    /// move path therefore used to close the handle and then rename, leaving a
+    /// window between version-check and mutation in which another writer's bytes
+    /// could land in the file and be renamed away unnoticed. That window is
+    /// exactly the invariant-4 violation I-007 tracked.
+    ///
+    /// `SetFileInformationByHandle(FileRenameInfo)` renames the object the handle
+    /// already refers to, so there is no second open to violate and no window at
+    /// all. It needs `DELETE` in the access mask (see the constant above).
+    ///
+    /// `FILE_RENAME_INFO` is a variable-length struct — a fixed header followed
+    /// by the destination name inline — so it is built in a byte buffer rather
+    /// than as a value. `FileNameLength` counts **bytes and excludes** the NUL,
+    /// and with `RootDirectory` null the name must be fully qualified, which
+    /// every path reaching here already is (invariant 5 canonicalises to UNC).
+    pub fn rename_to(&self, dst: &str, replace: bool) -> io::Result<()> {
+        let name: Vec<u16> = dst.encode_utf16().collect();
+        let name_bytes = name.len() * std::mem::size_of::<u16>();
+        // The header already carries `FileName[1]`, so it covers the trailing NUL
+        // we leave room for but do not count in `FileNameLength`.
+        let header = std::mem::size_of::<FILE_RENAME_INFO>();
+        let total = header + name_bytes;
+
+        // Backed by `u64`, not `u8`, and that is load-bearing rather than
+        // fussiness: `FILE_RENAME_INFO` contains a `HANDLE`, so it needs pointer
+        // alignment, while a `Vec<u8>`'s allocation is only guaranteed to be
+        // 1-aligned. Writing through a misaligned `*mut FILE_RENAME_INFO` would be
+        // undefined behaviour that happens to work, which is exactly what this
+        // module must not contain. `u64` matches the struct's alignment on both
+        // 32- and 64-bit Windows.
+        let words = total.div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; words];
+        debug_assert!(buf.len() * std::mem::size_of::<u64>() >= total);
+
+        // SAFETY: `buf` is at least `total` bytes, zero-initialised, and aligned
+        // for `FILE_RENAME_INFO` by construction above. Every write below lands
+        // inside it: the header at offset 0, and `name.len()` `u16`s at
+        // `FileName`, which the `total` computation sized the tail for.
+        unsafe {
+            let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
+            (*info).Anonymous.ReplaceIfExists = BOOLEAN(u8::from(replace));
+            (*info).RootDirectory = HANDLE::default();
+            (*info).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                std::ptr::addr_of_mut!((*info).FileName) as *mut u16,
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                self.handle,
+                FileRenameInfo,
+                buf.as_ptr() as *const core::ffi::c_void,
+                total as u32,
+            )
+        }
+        .map_err(to_io)
     }
 }
 
@@ -120,6 +192,9 @@ impl crate::backend::LockedFile for ExclusiveFile {
     }
     fn overwrite(&self, bytes: &[u8]) -> io::Result<()> {
         ExclusiveFile::overwrite(self, bytes)
+    }
+    fn rename_to(&self, dst: &str, replace: bool) -> io::Result<()> {
+        ExclusiveFile::rename_to(self, dst, replace)
     }
 }
 
@@ -143,27 +218,127 @@ pub fn create_new_file(path: &str, bytes: &[u8]) -> io::Result<()> {
     file.overwrite(bytes)
 }
 
-/// Rename `src` to `dst` (concept §6.3). A true rename — preserves the file's
-/// identity and ACL (unlike read+create+delete). `replace` allows overwriting
-/// an existing destination. `WRITE_THROUGH` makes the move durable before
-/// returning.
+/// Tests for the rename-through-a-held-handle primitive (I-007).
 ///
-/// Deliberately **without** `MOVEFILE_COPY_ALLOWED`. That flag makes Win32
-/// silently fall back to CopyFile+DeleteFile whenever the destination is on
-/// another volume or share — which is not a rename at all: the destination
-/// becomes a *new* file inheriting the target directory's ACEs, losing the
-/// original's, and the operation stops being atomic. That is precisely the ACL
-/// loss the "never temp-rename" rule exists to prevent, and it contradicted the
-/// promise in this doc comment. Without the flag a cross-volume move fails with
-/// `ERROR_NOT_SAME_DEVICE` instead of quietly doing the wrong thing; a
-/// cross-volume move needs an explicit copy verb with its own ACL story, not a
-/// silent one.
-pub fn move_file(src: &str, dst: &str, replace: bool) -> io::Result<()> {
-    let s = wide(src);
-    let d = wide(dst);
-    let mut flags = MOVEFILE_WRITE_THROUGH;
-    if replace {
-        flags |= MOVEFILE_REPLACE_EXISTING;
+/// These run against a **local NTFS temp path**, not a share. That is a
+/// deliberate limit and worth stating: what they prove is that the
+/// `FILE_RENAME_INFO` buffer is laid out correctly and that `DELETE` in the
+/// access mask is sufficient — the parts that are pure Win32 API contract and
+/// fail identically everywhere. What they cannot prove is that a *remote SMB
+/// server* honours the same call; that is the e2e rig's job, and the mandatory
+/// lock it checks is the property that has to be measured rather than assumed.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("chapr-winfs-{name}-{}", std::process::id()))
     }
-    unsafe { MoveFileExW(PCWSTR(s.as_ptr()), PCWSTR(d.as_ptr()), flags) }.map_err(to_io)
+
+    /// The core claim: a file held with `FILE_SHARE_NONE` can rename **itself**,
+    /// which `MoveFileExW` cannot do (it reopens by name and hits
+    /// `ERROR_SHARING_VIOLATION`). If the `FILE_RENAME_INFO` buffer were laid out
+    /// wrong this is where it shows up, as `ERROR_INVALID_PARAMETER` (87).
+    #[test]
+    fn renames_through_the_held_handle() {
+        let src = tmp("rt-src");
+        let dst = tmp("rt-dst");
+        std::fs::write(&src, b"held bytes").unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        let f = ExclusiveFile::open_existing(&src.to_string_lossy()).unwrap();
+        f.rename_to(&dst.to_string_lossy(), false)
+            .expect("a held handle must be able to rename itself");
+        drop(f);
+
+        assert!(!src.exists(), "the source name is gone");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"held bytes");
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// The property that makes this an invariant-4 fix rather than a rename
+    /// convenience: the exclusive lock is **still held** after the rename, so
+    /// nothing can slip between the CAS and the mutation.
+    #[test]
+    fn the_exclusive_lock_survives_the_rename() {
+        let src = tmp("hold-src");
+        let dst = tmp("hold-dst");
+        std::fs::write(&src, b"x").unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        let held = ExclusiveFile::open_existing(&src.to_string_lossy()).unwrap();
+        held.rename_to(&dst.to_string_lossy(), false).unwrap();
+
+        let ds = dst.to_string_lossy().to_string();
+        assert!(
+            ExclusiveFile::open_existing(&ds).is_err(),
+            "a second exclusive open must still be refused at the new name"
+        );
+        drop(held);
+        assert!(
+            ExclusiveFile::open_existing(&ds).is_ok(),
+            "and must succeed once the holder drops"
+        );
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// `replace = false` must refuse an existing destination rather than
+    /// destroying it. This is the guard that stops a move from silently
+    /// discarding an unrelated file.
+    #[test]
+    fn refuses_an_existing_destination_unless_replacing() {
+        let src = tmp("rep-src");
+        let dst = tmp("rep-dst");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&dst, b"do not lose me").unwrap();
+
+        let f = ExclusiveFile::open_existing(&src.to_string_lossy()).unwrap();
+        assert!(
+            f.rename_to(&dst.to_string_lossy(), false).is_err(),
+            "must refuse without replace"
+        );
+        drop(f);
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"do not lose me",
+            "the destination must be untouched by a refused rename"
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// And `replace = true` does replace it.
+    #[test]
+    fn replaces_an_existing_destination_when_asked() {
+        let src = tmp("ovr-src");
+        let dst = tmp("ovr-dst");
+        std::fs::write(&src, b"the winner").unwrap();
+        std::fs::write(&dst, b"the replaced").unwrap();
+
+        let f = ExclusiveFile::open_existing(&src.to_string_lossy()).unwrap();
+        f.rename_to(&dst.to_string_lossy(), true).unwrap();
+        drop(f);
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"the winner");
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// A long name exercises the variable-length tail of the buffer — the part
+    /// most likely to be sized wrong. A too-small buffer surfaces here.
+    #[test]
+    fn handles_a_long_destination_name() {
+        let src = tmp("long-src");
+        let dst = tmp(&format!("long-{}", "n".repeat(180)));
+        std::fs::write(&src, b"y").unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        let f = ExclusiveFile::open_existing(&src.to_string_lossy()).unwrap();
+        f.rename_to(&dst.to_string_lossy(), false)
+            .expect("a long name must not overrun the rename buffer");
+        drop(f);
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"y");
+        let _ = std::fs::remove_file(&dst);
+    }
 }
