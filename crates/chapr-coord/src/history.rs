@@ -245,6 +245,7 @@ fn event_str(e: VersionEvent) -> &'static str {
         VersionEvent::Baseline => "baseline",
         VersionEvent::Create => "create",
         VersionEvent::Write => "write",
+        VersionEvent::WriteForced => "write_forced",
         VersionEvent::Delete => "delete",
         VersionEvent::Restore => "restore",
         VersionEvent::Move => "move",

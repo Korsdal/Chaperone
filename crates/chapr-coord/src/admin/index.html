@@ -331,8 +331,36 @@
   <div data-panel="audit" hidden>
     <section class="card">
       <h2>Audit trail</h2>
-      <p class="hint">Every lease, write, restore and recovery, stamped with the principal
-        that caused it. Newest first.</p>
+      <p class="hint">Every lease, write, restore, directory creation and recovery — and every
+        <strong>refusal</strong>, including reads. Stamped with the principal that caused it,
+        newest first.</p>
+      <!-- Search, because one Refused kind covers every refusal and the reason
+           lives in Detail as a `refused[reason]` prefix. Without a detail search,
+           "did an agent probe outside the root" means reading the list by eye. -->
+      <div class="row" id="audit-filters">
+        <label>Principal <input id="af-principal" type="text" placeholder="CONTOSO\jsmith" size="18"></label>
+        <label>Action
+          <select id="af-kind">
+            <option value="">any</option>
+            <option value="refused">refused</option>
+            <option value="write_commit">write_commit</option>
+            <option value="restore">restore</option>
+            <option value="dir_create">dir_create</option>
+            <option value="conflict_open">conflict_open</option>
+            <option value="conflict_resolve">conflict_resolve</option>
+            <option value="crash_recover">crash_recover</option>
+            <option value="lease_grant">lease_grant</option>
+            <option value="lease_renew">lease_renew</option>
+            <option value="lease_expire">lease_expire</option>
+          </select>
+        </label>
+        <label>Path contains <input id="af-path" type="text" placeholder="\tenders\" size="18"></label>
+        <label>Detail contains <input id="af-detail" type="text" placeholder="refused[outside_root]" size="22"></label>
+        <label>Since <input id="af-since" type="datetime-local"></label>
+        <button id="af-apply" type="button">Search</button>
+        <button id="af-clear" type="button" class="ghost">Clear</button>
+        <span class="save-note" id="af-note"></span>
+      </div>
       <div class="scroll"><table>
         <thead><tr><th>Time</th><th>Principal</th><th>Action</th><th>Path</th><th>Version</th><th>Detail</th></tr></thead>
         <tbody id="audit"></tbody>
@@ -623,7 +651,7 @@ function renderLeases(list) {
 function renderAudit(list) {
   const tb = document.getElementById("audit");
   clear(tb);
-  if (!list.length) { emptyRow(tb, 6, "Nothing recorded yet."); return; }
+  if (!list.length) { emptyRow(tb, 6, "Nothing matched."); return; }
   for (const a of list) {
     const tr = el("tr");
     tr.appendChild(cell(stamp(a.timestamp)));
@@ -633,6 +661,44 @@ function renderAudit(list) {
     tr.appendChild(cell(shortVersion(a.to_version), "mono"));
     tr.appendChild(cell(a.detail));
     tb.appendChild(tr);
+  }
+}
+
+/// Read the filter row into an /audit/query body.
+///
+/// Empty fields are omitted rather than sent as empty strings: the query treats
+/// NULL as "no filter", and an empty `LIKE '%%'` would match every row while
+/// looking like a filter had been applied.
+function auditQuery() {
+  const val = (id) => {
+    const v = document.getElementById(id).value.trim();
+    return v === "" ? undefined : v;
+  };
+  const q = { limit: 200 };
+  const principal = val("af-principal");
+  if (principal) q.principal = principal;
+  const kind = val("af-kind");
+  if (kind) q.kind = kind;
+  const pathLike = val("af-path");
+  if (pathLike) q.path_like = pathLike;
+  const detailLike = val("af-detail");
+  if (detailLike) q.detail_like = detailLike;
+  const since = val("af-since");
+  // datetime-local has no zone; the browser's own offset is the operator's
+  // intent, so let Date apply it rather than pretending the input is UTC.
+  if (since) q.since = new Date(since).toISOString();
+  return q;
+}
+
+async function searchAudit() {
+  const note = document.getElementById("af-note");
+  note.textContent = "searching…";
+  try {
+    const rows = await post("/audit/query", auditQuery());
+    renderAudit(rows || []);
+    note.textContent = `${(rows || []).length} row(s)`;
+  } catch (e) {
+    note.textContent = `failed: ${e.message || e}`;
   }
 }
 
@@ -860,6 +926,20 @@ async function refresh() {
 buildTabs();
 selectTab("overview");
 document.getElementById("refresh").addEventListener("click", refresh);
+document.getElementById("af-apply").addEventListener("click", searchAudit);
+document.getElementById("af-clear").addEventListener("click", () => {
+  for (const id of ["af-principal", "af-kind", "af-path", "af-detail", "af-since"]) {
+    document.getElementById(id).value = "";
+  }
+  searchAudit();
+});
+// Enter in any filter box searches, so the row behaves like a search bar rather
+// than a form that has to be submitted with the mouse.
+for (const id of ["af-principal", "af-path", "af-detail"]) {
+  document.getElementById(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") searchAudit();
+  });
+}
 document.getElementById("logout").addEventListener("click", () => {
   localStorage.removeItem(TOKEN_KEY);
   token = "";

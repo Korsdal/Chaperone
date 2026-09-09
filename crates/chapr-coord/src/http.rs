@@ -61,6 +61,19 @@ pub struct AuditQuery {
     /// Only events at or after this instant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only events at or before this instant. Pairs with `since` to bound a
+    /// window, which is what makes the substring filters below affordable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Substring match on the canonical path — "everything under \\srv\share\x"
+    /// without needing the exact path the `path` field requires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_like: Option<String>,
+    /// Substring match on `detail`. The reason a refusal happened lives there as
+    /// a `refused[<reason>]` prefix, so this is how "show me every boundary
+    /// refusal" is asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_like: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -769,6 +782,9 @@ async fn query_audit(
                 req.principal.as_deref(),
                 req.kind,
                 req.since.map(|t| t.timestamp_millis()),
+                req.until.map(|t| t.timestamp_millis()),
+                req.path_like.as_deref(),
+                req.detail_like.as_deref(),
                 req.limit.unwrap_or(200) as i64,
             )
             .await?
@@ -962,11 +978,17 @@ impl IntoResponse for ApiError {
 
             AlreadyExists { .. } => StatusCode::CONFLICT,
 
-            // Bad request from the caller.
+            // Bad request from the caller. The three new ones are endpoint-side
+            // refusals that coord never raises itself; they are mapped anyway
+            // because the error type is shared and an unmapped variant would be
+            // a 500 the first time anything relayed one.
             BaseVersionNotRecorded { .. }
             | BaseVersionRequired { .. }
             | ForceRequiresReason { .. }
-            | InvalidPath { .. } => StatusCode::BAD_REQUEST,
+            | InvalidPath { .. }
+            | OutsideRoot { .. }
+            | NearDuplicateName { .. }
+            | ParentMissing { .. } => StatusCode::BAD_REQUEST,
 
             PermissionDenied { .. } => StatusCode::FORBIDDEN,
 

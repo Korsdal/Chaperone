@@ -101,13 +101,41 @@ pub async fn query(pool: &SqlitePool, path: &CanonicalPath) -> Result<Vec<AuditE
 ///
 /// `ORDER BY id DESC` uses the primary key, so no index is needed for the plain
 /// listing; `idx_audit_principal` covers the `principal` filter.
+/// `path_like` and `detail_like` are **substring** filters, not prefixes.
+///
+/// They exist because refusals are recorded as one `Refused` kind with the cause
+/// as a greppable prefix in `detail` (`refused[outside_root] …`). Without a
+/// detail search, "did an agent probe outside the root" means reading every
+/// refusal by eye, and the trail answers a question only in principle. A proper
+/// reason column would query better and needs a schema change `CREATE TABLE IF
+/// NOT EXISTS` cannot make until C0 lands.
+///
+/// `LIKE` with leading wildcards cannot use an index, so both are deliberately
+/// paired with `limit`. At this deployment's volumes a scan of a bounded window
+/// is the right trade; if the audit log ever outgrows that, the fix is FTS5 or
+/// the real column, not a cleverer `LIKE`.
+#[allow(clippy::too_many_arguments)]
 pub async fn query_recent(
     pool: &SqlitePool,
     principal: Option<&str>,
     kind: Option<AuditKind>,
     since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    path_like: Option<&str>,
+    detail_like: Option<&str>,
     limit: i64,
 ) -> Result<Vec<AuditEvent>, ChaprError> {
+    // `%` and `_` are LIKE metacharacters, and a path is full of neither by
+    // accident — but a `detail` search for `refused[` would silently match more
+    // than asked if someone typed one. Escaped with a declared ESCAPE clause.
+    let like = |s: Option<&str>| {
+        s.map(|v| {
+            format!(
+                "%{}%",
+                v.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            )
+        })
+    };
     let rows = sqlx::query(
         "SELECT event_id, timestamp_ms, principal, session_id, canonical_path,
                 kind, from_version, to_version, detail
@@ -115,12 +143,18 @@ pub async fn query_recent(
           WHERE (?1 IS NULL OR principal = ?1)
             AND (?2 IS NULL OR kind = ?2)
             AND (?3 IS NULL OR timestamp_ms >= ?3)
+            AND (?4 IS NULL OR timestamp_ms <= ?4)
+            AND (?5 IS NULL OR canonical_path LIKE ?5 ESCAPE '\\')
+            AND (?6 IS NULL OR detail LIKE ?6 ESCAPE '\\')
           ORDER BY id DESC
-          LIMIT ?4",
+          LIMIT ?7",
     )
     .bind(principal)
     .bind(kind.map(kind_str))
     .bind(since_ms)
+    .bind(until_ms)
+    .bind(like(path_like))
+    .bind(like(detail_like))
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -162,6 +196,8 @@ fn kind_str(k: AuditKind) -> &'static str {
         AuditKind::ConflictOpen => "conflict_open",
         AuditKind::ConflictResolve => "conflict_resolve",
         AuditKind::CrashRecover => "crash_recover",
+        AuditKind::DirCreate => "dir_create",
+        AuditKind::Refused => "refused",
     }
 }
 
@@ -175,6 +211,8 @@ fn kind_from_str(s: &str) -> Option<AuditKind> {
         "conflict_open" => AuditKind::ConflictOpen,
         "conflict_resolve" => AuditKind::ConflictResolve,
         "crash_recover" => AuditKind::CrashRecover,
+        "dir_create" => AuditKind::DirCreate,
+        "refused" => AuditKind::Refused,
         _ => return None,
     })
 }
@@ -219,20 +257,20 @@ mod tests {
         }
 
         // Fleet-wide, newest first.
-        let all = query_recent(&st.pool, None, None, None, 100).await.unwrap();
+        let all = query_recent(&st.pool, None, None, None, None, None, None, 100).await.unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].canonical_path, b, "newest first");
 
         // Filters compose and are independent.
-        let by_who = query_recent(&st.pool, Some("CONTOSO\\one"), None, None, 100)
+        let by_who = query_recent(&st.pool, Some("CONTOSO\\one"), None, None, None, None, None, 100)
             .await
             .unwrap();
         assert_eq!(by_who.len(), 2);
-        let by_kind = query_recent(&st.pool, None, Some(AuditKind::LeaseGrant), None, 100)
+        let by_kind = query_recent(&st.pool, None, Some(AuditKind::LeaseGrant), None, None, None, None, 100)
             .await
             .unwrap();
         assert_eq!(by_kind.len(), 1);
-        let capped = query_recent(&st.pool, None, None, None, 1).await.unwrap();
+        let capped = query_recent(&st.pool, None, None, None, None, None, None, 1).await.unwrap();
         assert_eq!(capped.len(), 1);
     }
 
