@@ -45,6 +45,7 @@ pub mod read;
 pub mod selftest;
 pub mod server;
 pub mod sniff;
+pub mod traceprobe;
 #[cfg(windows)]
 pub mod winfs;
 pub mod write;

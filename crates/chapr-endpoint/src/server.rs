@@ -17,6 +17,7 @@ use crate::lease_manager::LeaseManager;
 use crate::pathgrammar::grammar_for;
 use crate::ops;
 use crate::read::{list, read, stat, ReadConfig};
+use crate::traceprobe::meta_keys;
 use crate::write::write;
 use crate::CoordClient;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -94,6 +95,10 @@ pub struct ChaprServer {
     /// Reports unexpected failures to coord and to a local file (E-026). `Arc` so
     /// clones of the server share one sink rather than one per clone.
     diagnostics: Arc<crate::diag::Diagnostics>,
+    /// Observes what the host puts in `_meta` (D-044's one unmeasured input).
+    /// Changes no behaviour; see [`crate::traceprobe`]. `Arc` for the same reason
+    /// as `diagnostics`: one set of seen contexts per run, not per clone.
+    trace_probe: Arc<crate::traceprobe::TraceProbe>,
 }
 
 impl ChaprServer {
@@ -146,6 +151,7 @@ impl ChaprServer {
             cfg: ReadConfig::default(),
             max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
             diagnostics,
+            trace_probe: Arc::new(crate::traceprobe::TraceProbe::default()),
         }
     }
 
@@ -647,6 +653,35 @@ reconciled for the audit trail. resolution is one of kept_mine, kept_theirs, mer
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ChaprServer {
+    /// Dispatch a tool call, having first noted what the host said about it.
+    ///
+    /// Hand-written only so the observation covers all eleven tools instead of
+    /// whichever one carried an extra parameter. `#[tool_handler]` generates
+    /// `call_tool` *unless the impl already defines it*, so this replaces the
+    /// generated body — and the two lines after the probe are exactly what it
+    /// generated. Nothing here can change a tool's outcome: the probe takes
+    /// `&self`, returns a value, and is consulted before dispatch.
+    ///
+    /// `RequestContext.meta` is the whole of the request's `_meta`: the service
+    /// loop swaps it out of the request before `handle_request` sees it, and
+    /// `ToolCallContext::new` then discards the params' own copy — so this is
+    /// the one place a stdio server can read it. See [`crate::traceprobe`] for
+    /// what the question is and how to read the answer.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(seen) = self
+            .trace_probe
+            .observe(context.meta.get_traceparent(), &meta_keys(&context.meta))
+        {
+            seen.log();
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         // ServerInfo (= InitializeResult) is #[non_exhaustive], so build from
         // Default and set the fields we care about.
