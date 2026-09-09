@@ -45,8 +45,8 @@
 //! An invariant enforced on type shape alone does not hold; state the channel too.
 
 use crate::enums::{
-    AuditKind, ConflictResolution, Integrity, JournalState, LeasePurpose, RestoreMode,
-    VersionEvent, WriteMode,
+    AuditKind, ConflictResolution, EntryType, Integrity, JournalState, LeasePurpose, RestoreBase,
+    RestoreMode, VersionEvent, WriteMode,
 };
 use crate::ids::{CanonicalPath, ConflictId, LeaseId, Principal, SessionId};
 use crate::records::{ConflictEntry, LeaseRef, MoveJournalEntry, RecoveredFrom};
@@ -112,6 +112,9 @@ pub struct ListRequest {
 pub struct ListEntry {
     pub name: String,
     pub canonical_path: CanonicalPath,
+    /// File or directory — see [`EntryType`]. Without it a directory was
+    /// `size: 0` and indistinguishable from an empty file.
+    pub entry_type: EntryType,
     pub size: u64,
     pub mtime: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +174,47 @@ pub struct WriteResponse {
     pub version: VersionToken,
 }
 
+/// `chapr.mkdir(uri, confirm_new)` — create one directory.
+///
+/// Directories were **first-class in the output and absent from the API**:
+/// `chapr.list` returns them, and nothing could bring one into existence, so an
+/// agent could see the shape of the tree and not extend it. That friction pushed
+/// work outside Chaperone, which is the opposite of the point.
+///
+/// No CAS, no journal, no history — a directory has no content to version. It is
+/// **non-recursive**: a missing parent is [`ChaprError::ParentMissing`], the same
+/// answer `create` gives, so the tree is only ever extended one deliberate level
+/// at a time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MkdirRequest {
+    pub uri: String,
+    /// Proceed even though the near-name guard found similar siblings.
+    ///
+    /// The guard exists because implicit or careless directory creation is how a
+    /// share ends up with `Reports`, `reports` and `Repotrs` — and invariant 5
+    /// keys coordination by canonical path, so each of those is a distinct,
+    /// permanent key. It compares the requested name against existing siblings
+    /// **deterministically** (normalised form plus edit distance), never by asking
+    /// a model to judge similarity, and refuses with the candidates named.
+    ///
+    /// Setting this is the caller asserting the new name is deliberate. It is
+    /// audited, so the assertion is attributable.
+    #[serde(default)]
+    pub confirm_new: bool,
+}
+
+/// `chapr.mkdir` success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MkdirResponse {
+    pub canonical_path: CanonicalPath,
+    /// Similar sibling names that were present and overridden via
+    /// `confirm_new`. Empty on an unambiguous create. Returned so the model can
+    /// tell the human what it decided past, rather than the fact living only in
+    /// the audit log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub similar_existing: Vec<String>,
+}
+
 /// `chapr.create(uri, content)` — no prior version; CAS with base = null
 /// (concept §6.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,10 +263,21 @@ pub struct MoveRequest {
     pub dst_base_version: Option<VersionToken>,
 }
 
-/// `chapr.move` success. Empty — the version-log chain and any open
-/// journal/conflict entries are migrated to the new canonical path internally.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MoveResponse {}
+/// `chapr.move` success. The version-log chain and any open journal/conflict
+/// entries are migrated to the new canonical path internally.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveResponse {
+    /// The moved content's version, at its new path.
+    ///
+    /// This response used to be empty, which made `move` the only verb that
+    /// dropped something the caller demonstrably needs: `create` and `write`
+    /// both return the new version, so a caller can chain a CAS write with no
+    /// extra round trip, while after a move it had to read the destination
+    /// first. The value is already in hand — a move CAS-verifies the source and
+    /// the content is unchanged by a rename, so this is the source's verified
+    /// version.
+    pub version: VersionToken,
+}
 
 // ===========================================================================
 // Leases (concept §6.4, §9)
@@ -299,16 +354,21 @@ pub struct HistoryResponse {
 /// call and the restore is overwritten without a conflict, recoverable only
 /// through the snapshot. `mode` defaults to `Copy` (concept §6.5).
 ///
-/// (Concept §6.5 and §12 describe this as running "the full write path", which
-/// would imply a CAS. Spec and code disagree here and the disagreement is open,
-/// not settled — see the roadmap's restore question. This doc describes the
-/// code.)
+/// **Concept §6.5's "full write path" now holds for `in_place`** — the
+/// disagreement between spec and code is resolved in the spec's favour (Q13,
+/// option (a)): an in-place restore CAS-checks the target against `base`.
+/// `Copy` writes a fresh sibling and needs no base.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreRequest {
     pub uri: String,
     pub version: VersionToken,
     #[serde(default)]
     pub mode: RestoreMode,
+    /// What the caller observed at the target: a version hex, or `"absent"` for
+    /// a soft-deleted path. **Required for `in_place`** and ignored for `Copy`.
+    /// See [`RestoreBase`] for why it is not optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<RestoreBase>,
 }
 
 /// `chapr.restore` success.
@@ -717,7 +777,13 @@ mod tests {
     #[test]
     fn empty_responses_serialize_as_empty_objects() {
         assert_eq!(serde_json::to_string(&DeleteResponse {}).unwrap(), "{}");
-        assert_eq!(serde_json::to_string(&MoveResponse {}).unwrap(), "{}");
+        // `MoveResponse` is no longer empty: it carries the version that landed
+        // at the destination, so a caller can chain a CAS write without reading
+        // the file it just moved. It was the only verb that dropped that.
+        let moved = MoveResponse {
+            version: VersionToken::hash(b"moved"),
+        };
+        assert!(serde_json::to_string(&moved).unwrap().contains("version"));
     }
 
     #[test]

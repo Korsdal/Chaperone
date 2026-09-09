@@ -65,8 +65,8 @@ pub use diagnostics::{
     DiagnosticsResponse, Severity,
 };
 pub use enums::{
-    AuditKind, ConflictResolution, ConflictState, Integrity, JournalState, LeasePurpose,
-    RestoreMode, VersionEvent, WriteMode,
+    AbsentMarker, AuditKind, ConflictResolution, ConflictState, EntryType, Integrity,
+    JournalState, LeasePurpose, RestoreBase, RestoreMode, VersionEvent, WriteMode,
 };
 pub use error::ChaprError;
 pub use ids::{CanonicalPath, ConflictId, EventId, LeaseId, Principal, SessionId};
@@ -82,6 +82,7 @@ pub use tools::{
     HistoryRequest, HistoryResponse,
     LeaseAcquireRequest, LeaseAcquireResponse, LeaseRenewRequest, LeaseRenewResponse,
     LeaseReleaseRequest, LeaseReleaseResponse, ListEntry, ListRequest, ListResponse,
+    MkdirRequest, MkdirResponse,
     MovePathsRequest, MoveRequest, MoveResponse, OpenJournalRequest, OpenMoveJournalRequest,
     PreImage, PutBlobResponse,
     ReadContent, ReadReceipt, ReadRequest, ReadResponse,

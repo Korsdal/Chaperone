@@ -10,6 +10,7 @@
 //! read cleanly in the audit log and SQLite. Enums that carry data document
 //! their tagging individually.
 
+use crate::version::VersionToken;
 use serde::{Deserialize, Serialize};
 
 /// Trust level attached to bytes returned by `chapr.read` (concept §6.1, §8).
@@ -85,6 +86,29 @@ pub enum AuditKind {
     ConflictOpen,
     ConflictResolve,
     CrashRecover,
+    /// A directory created through `chapr.mkdir`. Its own kind rather than
+    /// `WriteCommit` because no content was versioned — there is no blob, no
+    /// pre-image and no version to record, so calling it a write commit would
+    /// put a row in the trail that no `chapr.history` can corroborate.
+    DirCreate,
+    /// An operation Chaperone **refused**, including reads.
+    ///
+    /// The trail recorded only committed changes, so an agent blocked by the
+    /// coordinated-root boundary left no trace at all — a hole in something sold
+    /// as accountability, and it makes "did an agent probe outside the root"
+    /// unanswerable.
+    ///
+    /// One kind for every refusal, with the reason as a machine-greppable prefix
+    /// in `detail` (`refused[outside_root] chapr_write \\srv\share\f.md: …`).
+    /// A structured reason column would query better and needs a schema change
+    /// `CREATE TABLE IF NOT EXISTS` cannot deliver until C0 lands; a prefix is
+    /// searchable by substring today and can become a column later.
+    ///
+    /// Only refusals that are **decisions** land here — the boundary, a binary
+    /// container, non-UTF-8 text, a CAS conflict, an Office lock, a missing base
+    /// version. A coordinator outage is not a decision, and auditing it would
+    /// write one row per read in a read-heavy workload.
+    Refused,
 }
 
 /// The event that produced a [`crate::records::VersionLogEntry`]. Narrower than
@@ -108,6 +132,16 @@ pub enum VersionEvent {
     Create,
     /// An ordinary in-place overwrite (`chapr.write`).
     Write,
+    /// A write that **forced past a CAS mismatch**, deliberately discarding a
+    /// concurrent edit (`mode = "force"` with a reason).
+    ///
+    /// Its own event because the alternative was worse than it looks: a forced
+    /// write was recorded as `Write`, shape-identical to the two legitimate
+    /// writes around it, so the most governance-relevant fact about that version
+    /// was invisible in `chapr.history`. The reason string stays in the audit
+    /// log — **agents assess provenance from history, humans read the panel**,
+    /// and only the first of those needed fixing here.
+    WriteForced,
     /// A soft delete — the pre-image is snapshotted before removal.
     Delete,
     /// A restore, itself versioned so you can undo an undo (concept §6.5).
@@ -163,8 +197,67 @@ pub enum RestoreMode {
     /// Write the old version as `F.restored-{ts}.ext` for human comparison.
     #[default]
     Copy,
-    /// Overwrite the live file in place (goes through lease + CAS regardless).
+    /// Overwrite the live file in place. Requires a [`crate::RestoreBase`]
+    /// describing the state the caller observed — see that type for why.
     InPlace,
+}
+
+/// What a caller observed at the target before asking for an in-place restore.
+///
+/// ## Why this exists
+///
+/// `restore(in_place)` performed **no CAS at all** — it reinstated old bytes over
+/// whatever was there. Data-loss prevention is the whole point of Chaperone, and
+/// that made restore the one verb handed a bazooka: an agent could destroy current
+/// content it had never read, with no conflict, no sidecar and nothing parked.
+///
+/// Requiring this field makes the rule structural rather than advisory: **an agent
+/// cannot restore over content it has not looked at**, because it has to say what
+/// it saw. It also retires a lie — an in-place restore of a soft-deleted file used
+/// to report `not found` for a path whose history resolved and whose copy-restore
+/// worked. Absence is now a state a caller can describe, not an error.
+///
+/// Required, never `Option`: a model omits optional fields under pressure
+/// (the same reasoning as `write`'s `base_version`, concept §6.2).
+///
+/// Wire form is a string: `"absent"`, or the version hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RestoreBase {
+    /// The caller expects **no file** at the path — it was soft-deleted, and
+    /// restoring recreates it at its original name. A file found there instead is
+    /// a conflict: something was created since the caller looked.
+    Absent(AbsentMarker),
+    /// The caller read this version at the path. A different version there now is
+    /// a conflict; the same version is safe to overwrite.
+    Version(VersionToken),
+}
+
+/// The literal `"absent"` in [`RestoreBase`], as its own type so `serde`'s
+/// untagged representation cannot confuse it with a version hex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbsentMarker {
+    #[default]
+    Absent,
+}
+
+/// Whether a directory entry is a file or a directory (`chapr.list`).
+///
+/// Listings carried `name`, `size` and `mtime` and nothing else, so a directory
+/// appeared with `size: 0` — indistinguishable from an empty file. A model reading
+/// that listing has to guess, in the one surface whose job is telling an agent what
+/// is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryType {
+    File,
+    Dir,
+    /// Neither a regular file nor a directory — a symlink, socket, device, or a
+    /// reparse point Windows reports as none of the above. Its own variant rather
+    /// than being folded into `File`, because Chaperone cannot coordinate it and
+    /// an agent should not be told it can.
+    Other,
 }
 
 #[cfg(test)]
