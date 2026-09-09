@@ -127,10 +127,10 @@ Three properties that make it useful vs. a file that gets abandoned:
 | Document | Holds |
 |---|---|
 | `logbook/decisions/architecture.md` | 24 decision bodies — data model, protocol, read/write path, backends, invariants, coord internals |
-| `logbook/decisions/deployment.md` | 12 decision bodies — installer, service, packaging, releases, auth, admin authority, hosting |
+| `logbook/decisions/deployment.md` | 13 decision bodies — installer, service, packaging, releases, auth, admin authority, hosting |
 | `logbook/decisions/process.md` | 6 decision bodies — naming, licensing, repo posture, publication, agent/plugin behaviour |
 | `logbook/decisions/product.md` | 4 decision bodies — product scope, positioning, market boundaries (new 2026-08-21, D-037) |
-| `logbook/logs/2026-09.md` | 3 session entries (09-09a, 09-08, 09-07) |
+| `logbook/logs/2026-09.md` | 4 session entries (09-09b, 09-09a, 09-08, 09-07) |
 | `logbook/logs/2026-08.md` | 9 session entries (08-03 … 08-28) |
 | `logbook/logs/2026-07.md` | 18 session entries (07-21 … 07-22) |
 | `logbook/ISSUES.md` | all 16 issues in full, live and resolved |
@@ -148,8 +148,9 @@ Three properties that make it useful vs. a file that gets abandoned:
 **Phase:** implementation — v1 complete, installed at a customer, pilot-tested on
 real hardware (2026-08-14), phase 1 of the 0.2 plan delivered (2026-08-21) and
 corrected (2026-08-25), **Phase A "Truth" (2026-09-07)**, **Phase B's correctness
-core B0/B1/B2/B8 (2026-09-08) and B3 (2026-09-09)**, and **the cowork-findings
-slice (2026-09-09, D-047)**. Multi-backend (SMB + POSIX); Windows, Linux and macOS
+core B0/B1/B2/B8 (2026-09-08) and B3 (2026-09-09)**, and the cowork spec's two
+workstreams — **W1, the endpoint slice (D-047)**, and **W2, the coord setup epic
+(D-048)**, both 2026-09-09. Multi-backend (SMB + POSIX); Windows, Linux and macOS
 all run the suite in CI.
 
 **Version `0.1.4`, set by jok 2026-09-09 — the tag is not pushed.** A patch bump
@@ -158,19 +159,33 @@ stays 0.1.x until it is tested and true, and the minor number is a claim about
 proven-ness rather than a changelog of effort. Versioning is a human
 responsibility; never fill in a bump.
 
-**Status:** three crates build clean; **440** tests pass (was 420); clippy
+**Status:** three crates build clean; **444** tests pass (was 420); clippy
 `-D warnings` clean. **12** tools (was 11 — `chapr_mkdir`) against **32** coord
-routes, plus the six-tab token-gated admin page whose Audit tab now searches by
-path and detail. MSRV **1.88.0**. `cargo fmt` still drifts and remains jok's call.
-*Counts re-measured 2026-09-09 by grepping `#[tool(` and `.route(`; both moved
-this session, so do not carry them forward unread — that is what I-004 is for.*
+service routes, plus the six-tab token-gated admin page whose Audit tab now
+searches by path and detail. Coord has **6** subcommands (was 3 — `handover`,
+`status`, `uninstall`) and its setup wizard now runs **in a browser** by default.
+MSRV **1.88.0**. `cargo fmt` still drifts and remains jok's call.
+*Counts re-measured 2026-09-09 by grepping `#[tool(` and `.route(`; tools and
+subcommands both moved this session, so do not carry them forward unread — that is
+what I-004 is for. The wizard's own two routes are deliberately **not** in the 32:
+they live on a temporary loopback listener, not the service router.*
 
-**⚠ What has NOT been driven against a real share.** The whole cowork slice is
-verified by the unit suite, wiremock, and a live *local* coordinator — **not** by
-the rig. CI run **#16 on `fdbc2f8` was green across 7 jobs** and predates all of
-it. The plan's verification walkthrough is owed: rebuild the rig bundle *without*
-defaults, revert the `clean-share` checkpoint, and confirm the four
-misconfiguration states are distinguishable from the tool surface alone.
+**⚠ What has NOT been driven against a real share or a real service install.**
+Both workstreams are verified by the unit suite, wiremock, real local processes
+and a live *local* coordinator — **not** by the rig. CI run **#16 on `fdbc2f8`
+was green across 7 jobs** and predates all of it. Specifically:
+
+- **W1** (the endpoint slice) has never touched an SMB share.
+- **W2**'s service paths have **never executed**: every walkthrough used
+  `--no-service` in an unelevated shell, so `install_service`, `remove_service`
+  and the SCM branches of `lifecycle.rs` are untested outside compilation. That
+  needs one elevated run on `CHAPR-FS`.
+
+The plan's verification walkthrough is owed for both: rebuild the endpoint bundle
+*without* defaults, revert the `clean-share` checkpoint, and confirm the four
+misconfiguration states are distinguishable from the tool surface alone. **jok
+has a happy-path-test skill** for driving the MCP from the user side once the
+whole spec is done, which is the natural close.
 
 **The cowork sessions' lesson, which is worth more than the fixes.** Driving all
 the tools against the rig showed **the engine behaving and not explaining
@@ -227,13 +242,21 @@ coordinator lacks. **C0 is therefore blocking two things**: move provenance in
 history (2.4, where jok chose real columns over a side table) and the coord update
 path in W2.
 
-**Next up is the coord setup epic (W2), as one piece of work (jok).** GUI wizard,
-`uninstall`, `status`, and the **handover output** — coord printing the endpoint
-values IT must distribute, which the no-defaults rule makes a prerequisite rather
-than a nicety. Update is backlogged behind C0. **Correction carried forward:**
-`setup` already installs an auto-start Windows service (`setup.rs:833`), so the
-fragility jok hit on the rig was my telling him to run `chapr-coord serve` in a
-terminal.
+**W2 landed: the coordinator has a life beyond install (D-048).** The wizard runs
+**in a browser** — `--ui`, and the default for a double-click, while `setup` keeps
+the prompts — on loopback, behind a one-time token, single-shot. It is a **front
+end for `SetupArgs` and nothing else**: it calls the same `setup::run`, so probe /
+config write / hardening / service install / handover exist once and cannot drift.
+`status` reports config, service existence, service state and port response
+separately, exiting 0 only when all four hold. `uninstall` removes the service and
+**keeps every byte of data**, with no `--purge`. `handover` reprints the values
+and adds an `mcpServers` block — load-bearing now that bundles ship no defaults.
+
+**There is no `chapr-coord update`, and the reason is C0.** `db::migrate` is
+`CREATE TABLE IF NOT EXISTS` only, so an update needing a column would silently do
+nothing. The interim path is documented: uninstall → replace the binary → setup
+against the **same** data directory, which keeps history and the audit trail.
+**Ordering rule:** coordinator before endpoints.
 
 **D-044's `traceparent` probe is in and the measurement is still owed.** `rmcp`
 2.2 surfaces `_meta`; `traceprobe.rs` logs once per distinct trace id, covering
@@ -274,14 +297,16 @@ A YAML parser (`js-yaml` under node) validates the workflows locally, which is h
 run #15's invalid `ci.yml` should have been caught before the push.
 
 **What's next:**
-1. **W2, the coord setup epic** — wizard, uninstall, status, handover. The
-   handover is the load-bearing part: no-defaults means an installer must be told
-   the URL and the share path, and coord is the only thing holding all three
-   values.
-2. **The rig walkthrough for W1**, per the plan's verification section. Nothing in
-   the cowork slice has met a real share.
-3. **C0** — now blocking move provenance (2.4) and W2's update path, not only
-   Phase C.
+1. **The rig walkthrough, for both workstreams** — the one honest gap. W1 has
+   never met an SMB share; W2's `install_service` / `remove_service` / SCM paths
+   have **never executed**, because every walkthrough ran `--no-service`
+   unelevated. One elevated run on `CHAPR-FS` closes the second. Rebuild the
+   endpoint bundle *without* defaults and revert the `clean-share` checkpoint
+   first.
+2. **jok's happy-path-test skill**, for driving the MCP from the user side once
+   the whole spec is verified. That is the natural close on this spec.
+3. **C0** — now blocking move provenance (2.4) **and** the coord update path, not
+   only Phase C.
 4. **I-016 needs jok's semantics call** before B4; **B7**'s three scenarios need a
    fault-injecting proxy that does not exist.
 5. **Owed and cheap:** run the `traceparent` measurement; answer whether
@@ -310,8 +335,8 @@ wants untangling.
 > **Index only** — one row per decision, most recent first. Bodies are in
 > `logbook/decisions/<theme>.md`; click an ID to jump to its entry.
 > **Threshold raised 8000 → 12000 by jok, 2026-09-07** (reasoning in the YAML).
-> The section is at **9369 bytes across 46 rows** — re-measured 2026-09-09, not
-> carried over — so there is room for roughly 19 more decisions before this needs
+> The section is at **9700 bytes across 47 rows** — re-measured 2026-09-09, not
+> carried over — so there is room for roughly 17 more decisions before this needs
 > another call. Re-measure rather than trusting that number; it has gone stale
 > three times, which is I-013's whole point.
 >
@@ -324,12 +349,13 @@ wants untangling.
 > `sections.decision_log.themes` in the YAML), then add one row here.
 > Never delete a row — mark `SUPERSEDED-BY-D-NNN` or `INVALIDATED`.
 >
-> **`D-009` was never issued.** D-001…D-008, D-010…D-047; nothing was deleted or
+> **`D-009` was never issued.** D-001…D-008, D-010…D-048; nothing was deleted or
 > retracted, so stop looking for it. (Recorded 2026-09-07 with the D-038 dedupe —
 > see that session's entry.)
 
 | ID | Decision | Date | Theme | Status |
 |----|----------|------|-------|--------|
+| [D-048](logbook/decisions/deployment.md#d-048) | The coordinator's install experience: the wizard is a **browser page** (no new dependency, not Windows-only) and a front end for `SetupArgs` only; `uninstall` keeps the data with no `--purge`; `handover` reprints; update backlogged behind C0 | 2026-09-09 | deployment | CURRENT |
 | [D-047](logbook/decisions/architecture.md#d-047) | The cowork-findings slice: **Q13 closed as (a)** so restore cannot overwrite unseen content; `chapr_mkdir` with a deterministic near-name guard; every refusal audited; B6 pulled in whole | 2026-09-09 | architecture | CURRENT |
 | [D-046](logbook/decisions/architecture.md#d-046) | The move journal is a separate table (a column cannot reach the live install until C0); interrupted moves are swept at start-up, not served from a read | 2026-09-09 | architecture | CURRENT |
 | [D-045](logbook/decisions/process.md#d-045) | Three test environments with separate jobs; an UNVERIFIED self-test check exits non-zero | 2026-09-08 | process | CURRENT |
@@ -391,7 +417,7 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 >
 > `/logbook end`: **move the entry below into its month file first**, then write
 > the new one here. Threshold: 10000; the section sits just inside it as of
-> 2026-09-09 at 8453 bytes, re-measured after the cowork-slice entry.
+> 2026-09-09 at 6974 bytes, re-measured after W2's entry.
 > **Take the ~9 KB ceiling on a single entry literally**: it is the real limit,
 > and prose that feels essential while writing is usually already in a decision
 > body or a commit message. Headroom is thin by design — the entry here is
@@ -399,32 +425,32 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 
 | Month | Entries |
 |---|---|
-| `logbook/logs/2026-09.md` | 3 — 2026-09-09a, 2026-09-08, 2026-09-07 |
+| `logbook/logs/2026-09.md` | 4 — 2026-09-09b, 2026-09-09a, 2026-09-08, 2026-09-07 |
 | `logbook/logs/2026-08.md` | 9 — 2026-08-28, 08-25, 08-21b, 08-21, 08-19/20, 08-14, 08-06, 08-05, 08-03 |
 | `logbook/logs/2026-07.md` | 18 — 2026-07-22 (a–c), 2026-07-21 (base, b–o) |
 
-### Session 2026-09-09b — jok / Claude
-**Type:** engineering (the cowork-findings slice, W1) + product decisions
-**Focus:** jok ran two cowork sessions against the rig — a setup session and a happy-path pass over all 11 tools plus 5 refusal paths — and wrote them up. Thirteen findings, every one reproduced in code, then decided interactively and built.
+### Session 2026-09-09c — jok / Claude
+**Type:** engineering (W2, the coord setup epic)
+**Focus:** the second workstream from the cowork spec, taken as one piece of work at jok's request. Decisions recorded as **D-048**.
 
 **Worked on:**
-- [x] **The findings landed as a file first, and two of them needed correcting.** `specs/cowork-findings-0909.md`, merged from both reports under jok's numbering. **§4 was wrong**: leases *are* acquired by every mutating verb (five release sites) — they are invisible because their lifetime is one tool call, which is D-011's own note, so the fix is `chapr_stat`'s description not the field. **1.1's recommended fix already existed** and had not helped: the resolved root is logged at `info`, but stderr is not the tool surface, `instructions` reaches the model rather than the user, a fail-closed start announces nothing, and a *stale* config starts cleanly so there is nothing to log.
-- [x] **Every decision surfaced as a question rather than assumed** (jok's ask). Fourteen forks across four rounds. His answers overrode the roadmap once (**Q13 → option (a)**, where it leant (b)/(c)) and corrected my framing once: I offered "make the binary require a root", and he pointed out that would *"make the ship-exe-and-mcpb solution worthless"* — D-035(3) ships the bare executable, and one that refuses to start until configured is unusable for a Claude Code user. Config belongs after install.
-- [x] **Restore can no longer overwrite what nobody read.** jok's question — *does recreating a deleted file let an agent overwrite something?* — turned out to have a bigger answer than the case he asked about: **restore performed no CAS at all**, by design, so the bazooka already existed. It now requires the caller to state what it saw (a version, or `absent`) and checks it under the exclusive handle. Five outcomes, one test each. A soft-deleted target plus `absent` **recreates the file at its original name**, so `chapr_delete`'s promise of recoverability is kept in practice rather than technically.
-- [x] **`chapr_mkdir`, guarded deterministically.** jok took the tool over the refusal, with the reasoning that manual folder creation is friction and friction pushes work outside Chaperone. His own objection was non-determinism, which the design answers by putting the comparison in the **tool**: normalise, then Damerau-Levenshtein within a length-scaled budget, refuse naming the candidates, `confirm_new` overrides and is audited. **A test caught the failure that would have got it switched off** — `2026` and `2027` are one edit apart and both deliberate, so numbered siblings are exempt.
-- [x] **Every refusal is audited, reads included**, with the reason as a greppable prefix, plus path and detail search on `/admin`'s Audit tab. Transport failures are excluded deliberately: a coordinator outage would write one row per read in a read-heavy workload, and it is not a decision anyone made.
-- [x] **B6 pulled in whole rather than patched**, which was the right call and not obvious. `Conflict` carried only `sidecar_path` — that is *why* `delete` and `move` set it to the live file, since they park nothing and the message had to read correctly. Rewording the string alone would have fixed `write` and broken the other two. Both paths are fields now, and `create` gained the `~$F` preflight (B6a, an omission not design: Word holds `~$F` for an unsaved document).
-- [x] **Two failures were mine, from the bundle I handed jok yesterday.** "NOTE to packager" text rendered verbatim in his install dialog, and I pre-filled defaults so nothing had to be typed — which is exactly what hid a stale stored value. A root typo'd as `charptest` survived several edits and a new build, and that string appears nowhere in the source: stored `user_config` is keyed by extension, not version, so a *corrected* default never reaches anyone who already installed. Template now ships no defaults and requires the root.
+- [x] **The correction that shrank the epic before any of it was built.** `setup` has installed an **auto-start Windows service** since E-016 (`setup.rs:833`). The fragility jok hit on the rig was mine — I told him to run `chapr-coord serve` in a terminal, which bypasses the service. So "make it run as a service" needed no work; what was missing was every question *after* install, and any front end other than prompts.
+- [x] **The wizard is a browser page** (jok's call from three options). `--ui`, and the default for a **double-click**, while the named `setup` subcommand still gives the prompts — discoverable without a flag to turn anything off. **No new dependency**: coord already has axum and an HTML admin page, where a native dialog means a GUI toolkit in a one-file binary, Windows-only UI, and UI code in the crate whose rule is that it holds no Windows primitives. Guarded by 127.0.0.1 + ephemeral port, a one-time constant-time token, single-shot shutdown, and the URL printed as well as opened.
+- [x] **It is a front end for `SetupArgs` and nothing else**, which is the design decision that matters: the page collects values and calls the same `setup::run`, so probe / config write / hardening / service install / handover exist once and the two front ends cannot drift.
+- [x] **`status`, `uninstall`, `handover`.** `status` reports config, service existence, service state and port response **separately** — they fail separately — and exits 0 only when all four hold. `uninstall` removes the service and **keeps every byte of data**, printing where it is, with **no `--purge`**: a flag that erases an audit trail is a flag someone puts in a script. `handover` reprints the values and adds an `mcpServers` block, with `--out` to write it for distribution.
+- [x] **The update path is backlogged behind C0**, for a concrete reason rather than caution: `db::migrate` is `CREATE TABLE IF NOT EXISTS` only, so an update needing a column would silently do nothing. The deployment guide now documents the interim path (uninstall → replace → setup against the **same** data directory, which keeps history) and the ordering rule **coordinator before endpoints**.
 
-**The withdrawn appendix finding was real, and the lesson generalises.** jok reported the boundary refusal escaping the input path with two backslashes while the root showed one, then withdrew it as unreproducible. It was deterministic and on **every** refusal: `{out:?}` and `{raw:?}` are Debug formatting, which doubles backslashes, while the roots printed through `as_str()`. **"Did not reproduce" on a formatting complaint deserves a look at the format string.** This is the third time this session that an assumption about what could not be checked was simply untested — after "only Actions can validate the workflow" (a YAML parser did it in a second) and yesterday's "CI results are unreachable from this laptop".
+**A constraint found by the compiler, and worth keeping.** `setup::run` redirecting to the UI made the two mutually recursive — and a recursive `async fn` whose other arm owns an HTTP server has a future that can never be `Send`, which stops the wizard's own handler from being a valid axum handler. Reported only as *"the trait bound is not satisfied"*, with no mention of Send. Two wrong diagnoses on the way (I blamed `Box<dyn Error>`'s non-Send-ness, then a match scrutinee — the second was **also** a real bug and is fixed) before the front-end choice moved to `main`, which is where a choice between front ends belongs anyway.
 
-**Verified:** **440** tests (from 431 mid-session, 420 at its start), 0 failed; clippy `-D warnings` clean. **Four guards mutation-checked** — the restore CAS comparison, the near-name check, `create`'s preflight and the parent-missing branch. The `create` preflight is worth noting: removing it left all 216 endpoint tests green, so the test was written *because* the mutation check found nothing. `/admin`'s new filters were driven against a live coordinator, where a `detail_like` of `refused[outside_root]` discriminated between two refusal reasons.
+**Four defects the end-to-end walkthrough caught, each of which would have shipped:** the form **ignored the args it was handed**, so a double-click's `%ProgramData%` paths were replaced by defaults and the install would have landed beside the exe — undoing the one thing `default_for_wizard` exists to do; the handover **re-read the config from disk**, from a directory setup had just hardened, so an unelevated run reported "could not be re-read" after otherwise succeeding (`setup::run` now returns what it applied); `--out` reused the **data directory's ACL** and locked the file against the operator who asked for it; and a missing service reported `IO error in winapi call`, where 1060 and 5 mean *opposite* things and reporting the second as absence would send someone to reinstall over a working install.
 
-**State changes:** **v0.1.4**, set by jok — tag not pushed. Tool surface **11 → 12** (`chapr_mkdir`); coord routes **32** (unchanged by this slice); tests 420 → 440. New: `chapr-endpoint/src/nearname.rs`, `ChaprError::{OutsideRoot, ParentMissing, NearDuplicateName}`, `VersionEvent::WriteForced`, `AuditKind::{Refused, DirCreate}`, `EntryType`, `RestoreBase`, `MoveResponse.version`. **Q13 CLOSED.** D-047 written. CHANGELOG restructured so the previously-unreleased Phase A and correctness-core work sits inside 0.1.4 rather than reading as newer than it.
+**Verified:** **444** tests (from 440), 0 failed; clippy `-D warnings` clean; both new modules fmt-clean. Driven end to end against real processes, not mocks: the token guard refuses missing / wrong / reused links; an apply writes the config, hardens the directory, returns the handover and shuts the listener down; and the config it produced then feeds `handover --json` and `status`. **Hardening locking my own shell out of the wizard's log** is what surfaced defect two — the documented unelevated limitation, doing exactly what it says.
 
-**Open questions:** **13 now** — Q13 closed by jok's restore decision, Q11 still open but no longer blocking anything I built. Still jok's: **Q4** (chain versus erasure, gates C3/C4), **Q11** (I-016, gates B4), **Q1** (5.1 chunked reads). New and small: does uninstalling an MCPB clear stored `user_config`? If not, "uninstall and reinstall" is not a recovery path we can offer anyone.
+**State changes:** coord subcommands **3 → 6** (`handover`, `status`, `uninstall`); new modules `lifecycle.rs` and `setup_ui.rs`; `setup::run` returns `Applied`; coord's **service** route count unchanged at 32 (the wizard's two routes live on a temporary listener, not the service router). `docs/deployment-guide.md` updated. **D-048** written. No version change — `0.1.4` stands.
 
-**Next session start from:** **the coord setup epic (W2), which jok chose as one piece of work** — GUI wizard, uninstall, status, handover output, with update backlogged behind C0. The handover is the load-bearing part: the no-defaults rule means an installer must be told the coordinator URL and share path, and coord is the only thing that knows all three values. Note the correction from this session: **`setup` already installs an auto-start Windows service** (`setup.rs:833`), so the fragility jok hit was my telling him to run `chapr-coord serve` in a terminal. **Also owed:** the rig walkthrough in the plan's verification section — nothing in W1 has been driven end-to-end against a real share, only against wiremock, a live local coordinator and the unit suite. Rebuild the rig bundle *without* defaults, revert the `clean-share` checkpoint first, and check that the four misconfiguration states are now distinguishable from the tool surface alone. **C0 remains the constraint** on move provenance (2.4) and on W2's update path.
+**Open questions:** unchanged at 13. Nothing in W2 needed a new one. Still jok's: **Q4**, **Q11** (I-016, gates B4), **Q1**. Small and still unanswered from W1: does uninstalling an MCPB clear stored `user_config`?
+
+**Next session start from:** **the rig walkthrough — it is the honest gap and it now covers both workstreams.** Nothing in W1 or W2 has met a real share or a real service install: W1 is unit tests + wiremock + a live local coordinator, W2 is real processes but `--no-service` and an unelevated shell, so `install_service`, `remove_service` and the SCM paths in `lifecycle.rs` have **never executed**. That needs an elevated run on `CHAPR-FS`. The plan's verification section has the steps; rebuild the endpoint bundle **without** defaults first and revert the `clean-share` checkpoint. **jok has a happy-path-test skill** for driving the MCP from the user side, to run once the whole spec is done — that is the natural close. **Then C0**, which now blocks move provenance (2.4) *and* the coord update path. **I-016 still needs jok's semantics call** before B4.
 
 
 

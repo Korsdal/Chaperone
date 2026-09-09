@@ -10,6 +10,98 @@
 
 ---
 
+<a id="d-048"></a>
+### D-048 — The coordinator's install experience: a browser wizard, and an uninstall that keeps the data — 2026-09-09
+
+**Problem:** jok's ask, verbatim: *"Click the installer - open an actual UI setup
+wizard - point it to the installer - make it run as a service instead of through
+an application/terminal that kills coord when it is closed. Give it a place for
+uninstall as well - and backlog an 'update' functionality."* Taken as **one epic**
+rather than piecemeal (his call).
+
+**First, the correction that shrank the epic.** `setup` has installed an
+**auto-start Windows service** since E-016 (`setup.rs:833` → `service_win::install`
+with `ServiceStartType::AutoStart`). The fragility jok hit on the rig was mine: I
+told him to run `chapr-coord serve` in a terminal, which bypasses the service
+entirely. So "make it run as a service" needed no work — what was missing was
+every question *after* install, and any front end other than prompts.
+
+**Choices:**
+
+- **The wizard is a browser page, not a native dialog.** Coord already has `axum`
+  and already serves an HTML admin page, so a served page costs **no new
+  dependency**. A native dialog means a GUI toolkit inside a binary whose whole
+  delivery story is one self-contained executable, is Windows-only (coord runs on
+  Linux), and would put UI code in the crate whose standing rule is that it holds
+  no Windows primitives. `--ui`, and the default for a **double-click**; the named
+  `setup` subcommand still gives the terminal prompts, so the rule is discoverable
+  without a flag to turn anything off.
+  - **It is a front end for `SetupArgs` and nothing else.** The page collects
+    values and calls the same `setup::run` in its unattended mode. There is no
+    second copy of probe / config write / hardening / service install / handover,
+    so the two front ends **cannot** drift. Anything the browser can express,
+    `--non-interactive` flags can express.
+  - **Guards:** 127.0.0.1 on an ephemeral port (never a wildcard, even for the
+    seconds it lives), a one-time token compared in constant time with the admin
+    token's primitive, single-shot shutdown after one successful apply, and the
+    URL printed to the console as well as opened — a wizard reachable only through
+    an auto-opened browser fails on a server that has none.
+  - **A found constraint worth recording:** the two must not call each other.
+    `setup::run` redirecting to the UI made them mutually recursive, and a
+    recursive `async fn` whose other arm owns an HTTP server has a future that can
+    never be `Send` — which stops the wizard's own handler from being a valid axum
+    handler, reported only as *"the trait bound is not satisfied"*. The front end
+    is chosen in `main`, which is where a choice between front ends belongs.
+- **`uninstall` removes the service and keeps every byte of data** (jok's call).
+  The audit trail is a primary deliverable and history is only restorable when the
+  database and blobs come from the same moment, so a command that deleted them
+  would irreversibly destroy the two things the product exists to preserve. **No
+  `--purge`**: a flag that erases an audit trail is a flag someone puts in a
+  script. It prints the paths and leaves the decision to a human. The cost is
+  stated rather than hidden — the tokens remain live until the directory is gone.
+- **`status` reports four things separately**, because they fail separately: the
+  config loads, the service exists, it runs, the port answers. Exit code 0 only
+  when all four hold, so a monitor needs no parsing. It deliberately does **not**
+  ask the SCM which config the service was registered with; it tells the operator
+  how to check (`sc qc`) rather than guessing.
+- **`handover` reprints, and adds an `mcpServers` block plus `--out`** (jok chose
+  the file option knowing the credential cost). This is load-bearing *because* the
+  bundle template now ships no defaults: three values have to be distributed, and
+  distribution by retyping is where a root typo'd as `charptest` came from. The
+  `command` field is a marked placeholder — coord has never seen the user's
+  machine, and a plausible-looking wrong path is worse than an obvious hole.
+- **The update path is backlogged behind C0**, and the reason is concrete rather
+  than cautious: `db::migrate` is `CREATE TABLE IF NOT EXISTS` and nothing else,
+  so an update needing a column would silently do nothing. Documented in the
+  deployment guide as uninstall → replace → setup against the same data
+  directory, which keeps history.
+
+**Four defects the walkthrough caught, each of which would have shipped:**
+
+1. **The form ignored the args it was handed**, so a double-click's
+   `%ProgramData%` paths were replaced by built-in defaults and the install would
+   have landed beside the executable — undoing the one thing
+   `default_for_wizard` exists to do. Now pre-filled from the args, with a test.
+2. **The handover re-read the config from disk** — from a directory setup had just
+   hardened, so an unelevated run reported "could not be re-read" after otherwise
+   succeeding. `setup::run` now returns what it applied; the values were already
+   in hand.
+3. **`--out` reused the data directory's ACL** (Administrators + SYSTEM), which
+   locked the file against the operator who asked for it. A handover file its
+   author cannot read is not a safer file. Now creator + Administrators, the
+   latter by SID because the group name is localised.
+4. **`IO error in winapi call`** for a missing service. 1060 (no such service) and
+   5 (access denied) mean *opposite* things — absent versus
+   present-but-invisible — and reporting the second as absence would send someone
+   to reinstall over a working install.
+
+**Made by:** jok (the epic, the wizard-versus-dialog call, uninstall's data
+policy, the handover file) / Claude (mechanism, the service correction, and the
+four defects above) | **Review date:** N/A
+**Status:** CURRENT
+
+---
+
 <a id="d-042"></a>
 ### D-042 — What the audit trail claims: an amendment scoping D-024, not a reversal of it — 2026-09-07
 
