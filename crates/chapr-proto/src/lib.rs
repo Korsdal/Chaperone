@@ -71,15 +71,19 @@ pub use enums::{
 pub use error::ChaprError;
 pub use ids::{CanonicalPath, ConflictId, EventId, LeaseId, Principal, SessionId};
 pub use records::{
-    AuditEvent, ConflictEntry, JournalEntry, LeaseRecord, LeaseRef, RecoveredFrom, VersionLogEntry,
+    AuditEvent, ConflictEntry, JournalEntry, LeaseRecord, LeaseRef, MoveJournalEntry,
+    RecoveredFrom, VersionLogEntry,
 };
 pub use tools::{
-    AcquireLeaseRequest, AppendVersionLogRequest, ClearJournalRequest, ConflictsQuery,
-    ConflictsRequest, ConflictsResponse, CreateRequest, CreateResponse, DeleteRequest,
-    DeleteResponse, HistoryEntry, HistoryQuery, HistoryRequest, HistoryResponse,
+    AcquireLeaseRequest, AppendVersionLogRequest, ClearJournalRequest, ClearMoveJournalRequest,
+    ConflictsQuery,
+    ConflictsRequest, ConflictsResponse, CreateRequest, CreateResponse,
+    DanglingMovesResponse, DeleteRequest, DeleteResponse, HistoryEntry, HistoryQuery,
+    HistoryRequest, HistoryResponse,
     LeaseAcquireRequest, LeaseAcquireResponse, LeaseRenewRequest, LeaseRenewResponse,
     LeaseReleaseRequest, LeaseReleaseResponse, ListEntry, ListRequest, ListResponse,
-    MovePathsRequest, MoveRequest, MoveResponse, OpenJournalRequest, PreImage, PutBlobResponse,
+    MovePathsRequest, MoveRequest, MoveResponse, OpenJournalRequest, OpenMoveJournalRequest,
+    PreImage, PutBlobResponse,
     ReadContent, ReadReceipt, ReadRequest, ReadResponse,
     RecordAuditRequest, RecoverJournalRequest, RefreshIndexRequest, RegisterConflictRequest,
     ResolveConflictControl, ResolveConflictRequest, ResolveConflictResponse, ResolveRequest,

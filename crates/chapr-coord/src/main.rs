@@ -275,6 +275,27 @@ pub(crate) async fn run_server_ready(
         }
     }
 
+    // The same scan for in-flight moves (B3). Reported separately because it
+    // means something different: a dangling *write* may have left torn bytes, a
+    // dangling *move* has intact bytes under one name or the other and owes only
+    // this coordinator's bookkeeping. Both are the endpoint's to resolve — coord
+    // would have to hash the file to tell which name the bytes are under.
+    let stale_moves = mv::dangling_moves(&state.pool, chrono::Utc::now().timestamp_millis()).await?;
+    if stale_moves.is_empty() {
+        tracing::info!("startup recovery scan: no in-flight moves");
+    } else {
+        tracing::warn!(
+            count = stale_moves.len(),
+            "startup recovery scan: renames whose coord migration is still owed; an endpoint completes these"
+        );
+        for e in &stale_moves {
+            tracing::warn!(
+                src = %e.src, dst = %e.dst, principal = %e.principal, overwrite = e.overwrite,
+                "in-flight move"
+            );
+        }
+    }
+
     reaper::spawn(state.clone(), Duration::from_secs(cfg.reap_secs));
     tracing::info!(reap_secs = cfg.reap_secs, "lease reaper started");
 

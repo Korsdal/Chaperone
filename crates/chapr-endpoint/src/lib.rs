@@ -37,6 +37,7 @@ pub mod hostconfig;
 pub mod identity;
 pub mod lease_manager;
 pub mod mount;
+pub mod moverecover;
 pub mod ops;
 pub mod pathgrammar;
 pub mod pathlock;

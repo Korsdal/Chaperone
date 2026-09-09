@@ -23,9 +23,11 @@
 
 use chapr_proto::{
     AcquireLeaseRequest, AppendVersionLogRequest, AuditEvent, ChaprError, ClearJournalRequest,
-    ConflictEntry, ConflictsQuery, ConflictsResponse, DiagnosticGroup, DiagnosticReport,
+    ClearMoveJournalRequest, ConflictEntry, ConflictsQuery, ConflictsResponse,
+    DanglingMovesResponse, DiagnosticGroup, DiagnosticReport,
     HistoryQuery, HistoryResponse,
-    LeaseAcquireResponse, LeaseId, LeaseRenewResponse, OpenJournalRequest, PutBlobResponse,
+    LeaseAcquireResponse, LeaseId, LeaseRenewResponse, OpenJournalRequest,
+    OpenMoveJournalRequest, PutBlobResponse,
     MovePathsRequest, ReadReceipt, RecordAuditRequest, RecoverJournalRequest, RecoveredFrom,
     RefreshIndexRequest, RegisterConflictRequest, ResolveConflictControl, ResolveRequest,
     ResolveResponse, VersionLogEntry, VersionToken,
@@ -255,9 +257,53 @@ impl CoordClient {
             .await
     }
 
-    /// Migrate coord state after an SMB rename (concept §6.3).
+    /// Migrate coord state after an SMB rename (concept §6.3). Also discharges
+    /// the move intent opened by [`Self::open_move`], in the same transaction.
     pub async fn move_paths(&self, req: &MovePathsRequest) -> Result<(), ChaprError> {
         self.recv_empty(self.http.post(self.url("/move")).json(req)).await
+    }
+
+    /// Record the intent to rename, *before* renaming (B3). Fail-closed: a move
+    /// that cannot record its intent must not proceed, for the same reason the
+    /// write path refuses when it cannot journal — nothing has been changed yet,
+    /// so refusing costs a retry and proceeding costs recoverability.
+    /// A **404 is translated**, because there is one realistic way to get one:
+    /// a coordinator older than this endpoint, which has no `/move/open` route.
+    /// Failing closed is right — silently skipping the intent would restore the
+    /// unrecoverable window while reporting success — but `HTTP 404 Not Found`
+    /// on a move would send an operator hunting for a missing file. It is the
+    /// coordinator that is missing, and the fix is to update it first.
+    pub async fn open_move(&self, req: &OpenMoveJournalRequest) -> Result<(), ChaprError> {
+        match self
+            .recv_empty(self.http.post(self.url("/move/open")).json(req))
+            .await
+        {
+            Err(ChaprError::Internal { message }) if message.contains("404") => {
+                Err(ChaprError::Internal {
+                    message: format!(
+                        "this coordinator has no /move/open route, so it is older than this \
+                         endpoint. A move records its intent before renaming, so that an \
+                         interrupted move can be finished; without the route it cannot, and the \
+                         move is refused rather than made unrecoverable. Update the coordinator \
+                         first, then the endpoints. ({message})"
+                    ),
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// Drop a move intent because the rename did not happen.
+    pub async fn clear_move(&self, req: &ClearMoveJournalRequest) -> Result<(), ChaprError> {
+        self.recv_empty(self.http.post(self.url("/move/clear")).json(req))
+            .await
+    }
+
+    /// Renames whose coord migration is still owed (lease dead). The endpoint
+    /// resolves these; coord can only report them, having no file access.
+    pub async fn dangling_moves(&self) -> Result<DanglingMovesResponse, ChaprError> {
+        self.recv_json(self.http.get(self.url("/move/dangling")))
+            .await
     }
 
     // ---- read-before-write (concept §6.2) --------------------------------
@@ -468,6 +514,39 @@ mod tests {
             .unwrap();
         assert_eq!(rf.version, VersionToken::hash(b"pre"));
         assert_eq!(rf.interrupted_writer, Principal::new_unchecked("CONTOSO\\crashed"));
+    }
+
+    /// The realistic upgrade mistake: endpoints updated before the coordinator.
+    /// The move is refused either way — that is the fail-closed choice — but the
+    /// message has to name the actual cause, or an operator reads "404 Not
+    /// Found" on a move and goes looking for a missing file.
+    #[tokio::test]
+    async fn a_coordinator_without_the_route_says_so_in_the_error() {
+        // An empty mock server answers 404 to everything, which is exactly what
+        // a coordinator predating this route does.
+        let server = MockServer::start().await;
+        let client = CoordClient::new(server.uri());
+        let err = client
+            .open_move(&chapr_proto::OpenMoveJournalRequest {
+                src: cpath(),
+                dst: CanonicalPath::new_unchecked("\\\\srv\\share\\b.md"),
+                lease_id: LeaseId::new_unchecked("lease-1"),
+                principal: Principal::new_unchecked("CONTOSO\\demo"),
+                session_id: chapr_proto::SessionId::new_unchecked("sess-1"),
+                version: VersionToken::hash(b"x"),
+                size: 1,
+                overwrite: false,
+                dst_pre_image: None,
+            })
+            .await
+            .unwrap_err();
+        let ChaprError::Internal { message } = err else {
+            panic!("expected Internal, got {err:?}");
+        };
+        assert!(
+            message.contains("older than this endpoint") && message.contains("Update the coordinator"),
+            "the error must name the cause and the fix: {message}"
+        );
     }
 
     #[tokio::test]

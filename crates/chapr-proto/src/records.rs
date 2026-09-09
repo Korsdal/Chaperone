@@ -16,6 +16,7 @@
 
 use crate::enums::{AuditKind, ConflictResolution, ConflictState, LeasePurpose, VersionEvent};
 use crate::ids::{CanonicalPath, ConflictId, EventId, LeaseId, Principal, SessionId};
+use crate::tools::PreImage;
 use crate::version::VersionToken;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,38 @@ pub struct JournalEntry {
     /// The version the write intends to produce. `None` if the process crashed
     /// after opening the journal entry but before hashing the new content.
     pub intended_version: Option<VersionToken>,
+    pub opened_at: DateTime<Utc>,
+}
+
+/// A record of an in-flight **move** (B3, D-013's "stale-but-recoverable").
+///
+/// Deliberately a separate record from [`JournalEntry`] rather than a nullable
+/// field on it, for two reasons. A write journal answers "what bytes do I
+/// reinstate at this path"; a move journal answers "which two paths belong to
+/// each other, and what migration is still owed" — different questions with
+/// different fields. And the entry is keyed by `src` while the *file* ends up at
+/// `dst`, so it is not one path's state at all.
+///
+/// Recovery from it is decidable by hashing, and has exactly three outcomes:
+/// `dst` hashes to `version` and `src` is gone (the rename committed → complete
+/// the migration); `src` is still there (it did not → drop the entry, nothing
+/// happened); neither (unresolvable → leave it and tell a human, per the
+/// bounded-retry rule).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveJournalEntry {
+    pub src: CanonicalPath,
+    pub dst: CanonicalPath,
+    /// The dual lease over `{src, dst}`; its liveness is the live-vs-dangling
+    /// signal, exactly as for a write.
+    pub lease_id: LeaseId,
+    pub principal: Principal,
+    pub session_id: SessionId,
+    /// The source's CAS-verified version — what `dst` must hash to.
+    pub version: VersionToken,
+    pub size: u64,
+    pub overwrite: bool,
+    /// The destination's snapshotted pre-image, on an overwrite-move only.
+    pub dst_pre_image: Option<PreImage>,
     pub opened_at: DateTime<Utc>,
 }
 

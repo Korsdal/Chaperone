@@ -430,6 +430,9 @@ pub async fn mv(
         dst: dst.clone(),
         src_base_version,
         dst_base_version,
+        // The move journal records this (B3): the lease's liveness is what tells
+        // a later sweep whether a move is in flight or died owing a migration.
+        lease_id: lease.lease_id.clone(),
     };
     let result = tokio::task::spawn_blocking(move || {
         let ctx = WriteCtx {

@@ -44,9 +44,10 @@ use crate::read::{system_time_to_utc, FileSource, FileStat, RawDirEntry};
 #[cfg(windows)]
 use crate::winfs::{create_new_file, ExclusiveFile};
 use chapr_proto::{
-    BackendDescriptor, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest, HistoryQuery,
-    LeaseId, MovePathsRequest, OpenJournalRequest, PreImage, Principal, ReadReceipt,
-    RegisterConflictRequest, SessionId, VersionToken, WriteMode,
+    BackendDescriptor, BackendKind, CanonicalPath, ChaprError, ClearJournalRequest,
+    ClearMoveJournalRequest, HistoryQuery, LeaseId, MovePathsRequest, OpenJournalRequest,
+    OpenMoveJournalRequest, PreImage, Principal, ReadReceipt, RegisterConflictRequest, SessionId,
+    VersionToken, WriteMode,
 };
 use chrono::{DateTime, Utc};
 use std::io;
@@ -152,12 +153,19 @@ pub struct RestoreInPlaceArgs {
     pub version: VersionToken,
 }
 
-/// Args for a move/rename (`move_cas`). No `lease_id`: move does not journal.
+/// Args for a move/rename (`move_cas`).
 pub struct MoveCasArgs {
     pub src: CanonicalPath,
     pub dst: CanonicalPath,
     pub src_base_version: VersionToken,
     pub dst_base_version: Option<VersionToken>,
+    /// The all-or-none `{src, dst}` lease this move holds.
+    ///
+    /// This used to be absent, with the note "move does not journal" — which was
+    /// true and was the bug B3 fixed. The move journal records the lease for the
+    /// same reason the write journal does: its liveness is what separates a move
+    /// still running from one that died owing coord a migration.
+    pub lease_id: LeaseId,
 }
 
 /// A file held open exclusively, from version-check to close (invariant 4).
@@ -756,11 +764,48 @@ fn move_cas_core<P: FsPrimitives>(
         drop(dfile);
     }
 
+    // Record the intent BEFORE the rename (B3), so the window D-013 accepted has
+    // something to recover from. Everything the migration needs is in the entry,
+    // because the session that completes it is often not this one.
+    //
+    // Fail-closed, exactly like the write path's `journal_open`: nothing has been
+    // changed at this point, so refusing costs a retry, while proceeding would
+    // buy a rename that no record connects to its destination — which is the
+    // state B3 exists to abolish.
+    rt.block_on(coord.open_move(&OpenMoveJournalRequest {
+        src: src.clone(),
+        dst: dst.clone(),
+        lease_id: args.lease_id.clone(),
+        principal: principal.clone(),
+        session_id: session_id.clone(),
+        version: src_now.clone(),
+        size,
+        overwrite,
+        dst_pre_image: dst_pre_image.clone(),
+    }))?;
+
     // Ground truth first: the rename — through the source handle held since its
     // CAS, so nothing could have changed the bytes we verified (invariant 4).
-    sfile
-        .rename_to(dst.as_str(), overwrite)
-        .map_err(|e| map_os_err(dst, e))?;
+    if let Err(e) = sfile.rename_to(dst.as_str(), overwrite) {
+        // The rename did not happen, so the intent describes nothing. Drop it,
+        // or the next sweep would find an entry whose `src` still exists and
+        // reach the same conclusion the slow way — and until it did, coord would
+        // report a pending move that never began.
+        //
+        // Best-effort: the move already failed and this is bookkeeping. A left
+        // entry is self-correcting (recovery sees `src` present and clears it),
+        // so failing the call twice would only replace a precise error with a
+        // vaguer one.
+        if let Err(clear_err) =
+            rt.block_on(coord.clear_move(&ClearMoveJournalRequest { src: src.clone() }))
+        {
+            tracing::warn!(
+                src = %src, dst = %dst, error = %clear_err,
+                "the rename failed and its move intent could not be cleared; the next sweep resolves it"
+            );
+        }
+        return Err(map_os_err(dst, e));
+    }
     drop(sfile); // released here rather than by scope end, so the order is explicit
 
     // Then migrate coord state atomically to match.
@@ -1282,7 +1327,7 @@ mod tests {
         /// A coord that accepts every call the move path makes.
         async fn coord() -> MockServer {
             let s = MockServer::start().await;
-            for p in ["/reads/assert", "/move"] {
+            for p in ["/reads/assert", "/move", "/move/open", "/move/clear"] {
                 Mock::given(wmethod("POST"))
                     .and(wpath(p))
                     .respond_with(ResponseTemplate::new(204))
@@ -1337,6 +1382,7 @@ mod tests {
                     dst,
                     src_base_version: src_base,
                     dst_base_version: dst_base,
+                    lease_id: LeaseId::new_unchecked("lease-move"),
                 };
                 move_cas_core(&PosixBackend, &ctx, &args)
             })
@@ -1482,17 +1528,21 @@ mod tests {
             std::fs::write(&src, b"moved anyway").unwrap();
 
             // Everything succeeds except the bookkeeping that follows the rename.
+            // `/move/open` is among the successes on purpose: this is the window
+            // B3's intent record exists for, and the record must survive it.
             let s = MockServer::start().await;
             Mock::given(wmethod("POST"))
                 .and(wpath("/move"))
                 .respond_with(ResponseTemplate::new(500))
                 .mount(&s)
                 .await;
-            Mock::given(wmethod("POST"))
-                .and(wpath("/reads/assert"))
-                .respond_with(ResponseTemplate::new(204))
-                .mount(&s)
-                .await;
+            for p in ["/reads/assert", "/move/open"] {
+                Mock::given(wmethod("POST"))
+                    .and(wpath(p))
+                    .respond_with(ResponseTemplate::new(204))
+                    .mount(&s)
+                    .await;
+            }
 
             let err = run(
                 s.uri(),
@@ -1514,6 +1564,98 @@ mod tests {
             }
             assert!(!src.exists(), "the rename really happened");
             assert_eq!(std::fs::read(&dst).unwrap(), b"moved anyway");
+        }
+
+        /// B3's fail-closed edge: a move that cannot record its intent must not
+        /// touch the file. Before the intent existed this move would have
+        /// succeeded on disk and left coord with no way to learn it had.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_move_that_cannot_record_its_intent_moves_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            let dst = dir.path().join("dst.txt");
+            std::fs::write(&src, b"stays put").unwrap();
+
+            let s = MockServer::start().await;
+            Mock::given(wmethod("POST"))
+                .and(wpath("/move/open"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&s)
+                .await;
+            Mock::given(wmethod("POST"))
+                .and(wpath("/reads/assert"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&s)
+                .await;
+            // No `/move` mock at all: reaching it would be the failure this test
+            // is about, and a 404 there would be indistinguishable from success
+            // at telling us whether the rename ran.
+
+            let err = run(s.uri(), &src, &dst, VersionToken::hash(b"stays put"), None)
+                .await
+                .expect_err("the intent could not be recorded");
+
+            assert!(
+                !matches!(err, ChaprError::CommittedButUnrecorded { .. }),
+                "nothing was committed, so this must not claim otherwise: {err:?}"
+            );
+            assert!(src.exists(), "the source was renamed away despite refusing");
+            assert!(
+                !dst.exists(),
+                "the destination was created despite refusing"
+            );
+            assert_eq!(std::fs::read(&src).unwrap(), b"stays put");
+        }
+
+        /// The other side of it: a rename that fails leaves no intent behind,
+        /// because an intent for a move that never began would have coord
+        /// reporting a pending migration forever.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failed_rename_clears_the_intent_it_opened() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src.txt");
+            // A directory that does not exist: the rename cannot succeed.
+            let dst = dir.path().join("missing").join("dst.txt");
+            std::fs::write(&src, b"cannot land").unwrap();
+
+            let s = coord().await;
+            let err = run(
+                s.uri(),
+                &src,
+                &dst,
+                VersionToken::hash(b"cannot land"),
+                None,
+            )
+            .await
+            .expect_err("the rename could not land");
+            assert!(
+                !matches!(err, ChaprError::CommittedButUnrecorded { .. }),
+                "a rename that failed must not report a commit: {err:?}"
+            );
+            assert!(src.exists(), "the source is still there");
+
+            // The intent was opened and then cleared: both calls happened, in
+            // that order, which is what distinguishes "cleaned up" from "never
+            // opened".
+            let calls: Vec<String> = s
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.url.path().to_string())
+                .collect();
+            assert!(
+                calls.iter().any(|p| p == "/move/open"),
+                "the intent was never opened: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|p| p == "/move/clear"),
+                "the intent was left behind: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|p| p == "/move"),
+                "a failed rename must not migrate coord state: {calls:?}"
+            );
         }
     }
 }

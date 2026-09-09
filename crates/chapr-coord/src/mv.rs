@@ -16,13 +16,178 @@
 //! (`write_commit` — `AuditKind` has no dedicated move; the detail records it).
 //! All-or-nothing: a failure rolls back and coord is unchanged.
 //!
+//! ## The move window, and why the intent record makes it recoverable (B3)
+//!
+//! D-013 accepted that the rename and this migration cannot share a transaction:
+//! the file is ground truth (invariant 1), so it moves first, and a failure
+//! afterwards leaves coord "stale-but-recoverable". *Recoverable* was aspiration
+//! until [`open_move`] existed — nothing recorded that the two paths belonged to
+//! one another, so a migration that never ran left `dst` without its lineage and
+//! `src`'s rows describing a file that had gone.
+//!
+//! The record is written before the rename and deleted **inside this function's
+//! transaction**. That ordering is what makes the whole thing exactly-once
+//! without any idempotency logic: a surviving row *proves* the migration did not
+//! commit, so a recovering session can run it without checking whether it
+//! already ran. There is no state in which the row and the migration both exist.
+//!
+//! Coord cannot resolve one of these itself — deciding whether the rename
+//! actually happened means hashing the file, and coord does no file I/O
+//! (invariant 1, and E-004's "detect and flag, never restore"). So it reports
+//! them ([`dangling_moves`]) and the endpoint decides.
+//!
 //! Named `mv` because `move` is a Rust keyword.
 
 use crate::state::AppState;
-use chapr_proto::{CanonicalPath, ChaprError, Principal, SessionId, VersionToken};
-use chrono::Utc;
-use sqlx::Row;
+use chapr_proto::{
+    CanonicalPath, ChaprError, LeaseId, MoveJournalEntry, PreImage, Principal, SessionId,
+    VersionToken,
+};
+use chrono::{DateTime, Utc};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
+
+/// Record the intent to rename `src` → `dst`, before the rename (B3).
+///
+/// Keyed by `src`, `INSERT OR REPLACE` like [`crate::journal::open`] and for the
+/// same reason: the caller holds the all-or-none `{src, dst}` lease, so no *live*
+/// entry for either path can be present to clobber. A *dangling* one can be —
+/// the endpoint resolves those before opening a new intent on the same paths.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_move(
+    st: &AppState,
+    src: &CanonicalPath,
+    dst: &CanonicalPath,
+    lease_id: &LeaseId,
+    principal: &Principal,
+    session_id: &SessionId,
+    version: &VersionToken,
+    size: u64,
+    overwrite: bool,
+    dst_pre_image: Option<&PreImage>,
+) -> Result<(), ChaprError> {
+    let _guard = st.acquire_lock.lock().await;
+    sqlx::query(
+        "INSERT OR REPLACE INTO move_journal
+           (src, dst, lease_id, principal, session_id, version, size, overwrite,
+            dst_pre_image_version, dst_pre_image_size, opened_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind(src.as_str())
+    .bind(dst.as_str())
+    .bind(lease_id.as_str())
+    .bind(principal.as_str())
+    .bind(session_id.as_str())
+    .bind(version.as_str())
+    .bind(size as i64)
+    .bind(overwrite as i64)
+    .bind(dst_pre_image.map(|p| p.version.as_str().to_string()))
+    .bind(dst_pre_image.map(|p| p.size as i64))
+    .bind(Utc::now().timestamp_millis())
+    .execute(&st.pool)
+    .await
+    .map_err(|e| ChaprError::Internal {
+        message: format!("coord db error: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Drop a move intent without migrating anything — the rename did not happen.
+///
+/// Distinct from [`move_paths`], which also removes the row: that one removes it
+/// *because the migration committed*. This one removes it because there is
+/// nothing to migrate, and calling the wrong one of the two would either lose a
+/// file's lineage or invent a move that never occurred.
+pub async fn clear_move(st: &AppState, src: &CanonicalPath) -> Result<(), ChaprError> {
+    let _guard = st.acquire_lock.lock().await;
+    sqlx::query("DELETE FROM move_journal WHERE src = ?1")
+        .bind(src.as_str())
+        .execute(&st.pool)
+        .await
+        .map_err(|e| ChaprError::Internal {
+            message: format!("coord db error: {e}"),
+        })?;
+    Ok(())
+}
+
+/// Every move intent whose owning lease is no longer live — a rename that may
+/// have committed with its migration still owed.
+///
+/// Same shape and same meaning of "dangling" as [`crate::journal::scan_dangling`]:
+/// entry present, lease dead. Unlike a write's, a dangling move does **not**
+/// imply damaged bytes — the file is intact under one name or the other — which
+/// is why this is swept rather than consulted on the read path.
+pub async fn dangling_moves(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> Result<Vec<MoveJournalEntry>, ChaprError> {
+    let rows = sqlx::query(
+        "SELECT src, dst, lease_id, principal, session_id, version, size, overwrite,
+                dst_pre_image_version, dst_pre_image_size, opened_at_ms
+         FROM move_journal m
+         WHERE NOT EXISTS (
+             SELECT 1 FROM leases l
+             WHERE l.lease_id = m.lease_id AND l.expiry_ms > ?1 AND l.hard_expiry_ms > ?1
+         )",
+    )
+    .bind(now_ms)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ChaprError::Internal {
+        message: format!("coord db error: {e}"),
+    })?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let src: String = row.get("src");
+        let Some(version) = VersionToken::from_hex(row.get::<String, _>("version")) else {
+            // A stored token is always valid, so an unparseable one means a
+            // corrupt row. Skipping is the only safe move: a fabricated version
+            // would make recovery conclude the rename never happened and drop a
+            // migration that is genuinely owed.
+            tracing::warn!(%src, "skipping move_journal row with unparseable version");
+            continue;
+        };
+        // The two pre-image columns are written together or not at all; a row
+        // with one of them is corrupt, and treating it as absent would let GC
+        // reclaim the snapshot. Skip, so a human sees it in the dangling report.
+        let dst_pre_image = match (
+            row.get::<Option<String>, _>("dst_pre_image_version"),
+            row.get::<Option<i64>, _>("dst_pre_image_size"),
+        ) {
+            (Some(hex), Some(size)) => match VersionToken::from_hex(hex) {
+                Some(version) => Some(PreImage {
+                    version,
+                    size: size as u64,
+                }),
+                None => {
+                    tracing::warn!(%src, "skipping move_journal row with unparseable pre-image");
+                    continue;
+                }
+            },
+            (None, None) => None,
+            _ => {
+                tracing::warn!(%src, "skipping move_journal row with a half-written pre-image");
+                continue;
+            }
+        };
+
+        out.push(MoveJournalEntry {
+            src: CanonicalPath::new_unchecked(src),
+            dst: CanonicalPath::new_unchecked(row.get::<String, _>("dst")),
+            lease_id: LeaseId::new_unchecked(row.get::<String, _>("lease_id")),
+            principal: Principal::new_unchecked(row.get::<String, _>("principal")),
+            session_id: SessionId::new_unchecked(row.get::<String, _>("session_id")),
+            version,
+            size: row.get::<i64, _>("size") as u64,
+            overwrite: row.get::<i64, _>("overwrite") != 0,
+            dst_pre_image,
+            opened_at: DateTime::<Utc>::from_timestamp_millis(row.get::<i64, _>("opened_at_ms"))
+                .unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn move_paths(
@@ -144,6 +309,21 @@ pub async fn move_paths(
     .await
     .map_err(db)?;
 
+    // The move intent is discharged here, in the same transaction as the
+    // migration it describes (B3). Deleting it anywhere else — a second call
+    // after the commit, say — would create a window where both the row and the
+    // migration exist, and a recovering session that saw that row would run the
+    // migration a second time. Inside the transaction there is no such window:
+    // the row survives if and only if the migration did not.
+    //
+    // No-op for a caller that never opened one (an older endpoint against this
+    // coordinator), which is why nothing here checks that a row was removed.
+    sqlx::query("DELETE FROM move_journal WHERE src = ?1")
+        .bind(src.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+
     tx.commit().await.map_err(db)?;
     Ok(())
 }
@@ -151,8 +331,8 @@ pub async fn move_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{audit, conflict, db, history};
-    use chapr_proto::{AuditKind, VersionEvent};
+    use crate::{audit, conflict, db, history, lease};
+    use chapr_proto::{AuditKind, LeasePurpose, VersionEvent};
 
     fn src() -> CanonicalPath {
         CanonicalPath::new_unchecked("\\\\srv\\share\\old.md")
@@ -165,6 +345,171 @@ mod tests {
     }
     fn sess() -> SessionId {
         SessionId::new_unchecked("sess-1")
+    }
+
+    fn now_ms() -> i64 {
+        Utc::now().timestamp_millis()
+    }
+
+    /// Open a move intent under a real, live dual lease — the arrangement the
+    /// endpoint actually produces.
+    async fn open_intent(st: &AppState, overwrite: bool, pre: Option<PreImage>) -> LeaseId {
+        let granted = lease::acquire(
+            st,
+            who(),
+            sess(),
+            LeasePurpose::Move,
+            vec![src(), dst()],
+        )
+        .await
+        .unwrap();
+        open_move(
+            st,
+            &src(),
+            &dst(),
+            &granted.lease_id,
+            &who(),
+            &sess(),
+            &VersionToken::hash(b"moved"),
+            5,
+            overwrite,
+            pre.as_ref(),
+        )
+        .await
+        .unwrap();
+        granted.lease_id
+    }
+
+    async fn intent_rows(st: &AppState) -> i64 {
+        sqlx::query("SELECT COUNT(*) AS n FROM move_journal")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap()
+            .get::<i64, _>("n")
+    }
+
+    /// The property the whole design rests on: a surviving intent row proves the
+    /// migration did not commit, because the migration deletes it in its own
+    /// transaction. If these two could both be true, a recovering session would
+    /// re-run a migration that had already happened.
+    #[tokio::test]
+    async fn the_migration_discharges_the_intent_it_describes() {
+        let st = AppState::new(db::test_pool().await);
+        open_intent(&st, false, None).await;
+        assert_eq!(intent_rows(&st).await, 1);
+
+        move_paths(
+            &st,
+            &src(),
+            &dst(),
+            &VersionToken::hash(b"moved"),
+            5,
+            false,
+            &who(),
+            &sess(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(intent_rows(&st).await, 0, "the migration left its intent behind");
+    }
+
+    /// A move still in flight must not be reported: its lease is alive, so some
+    /// session is mid-rename and completing it from elsewhere would race.
+    #[tokio::test]
+    async fn an_intent_is_dangling_only_once_its_lease_dies() {
+        let st = AppState::new(db::test_pool().await);
+        let lease_id = open_intent(&st, false, None).await;
+        assert!(
+            dangling_moves(&st.pool, now_ms()).await.unwrap().is_empty(),
+            "a live move was reported as needing recovery"
+        );
+
+        lease::release(&st, &lease_id).await.unwrap();
+        let stale = dangling_moves(&st.pool, now_ms()).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].src, src());
+        assert_eq!(stale[0].dst, dst());
+        assert_eq!(stale[0].version, VersionToken::hash(b"moved"));
+        assert_eq!(stale[0].size, 5);
+        assert!(!stale[0].overwrite);
+        assert!(stale[0].dst_pre_image.is_none());
+    }
+
+    /// An overwrite intent has to carry the snapshot forward, because the blob is
+    /// referenced by nothing until a `baseline` entry names it and GC would
+    /// otherwise reclaim the only copy of what the rename destroyed.
+    #[tokio::test]
+    async fn an_overwrite_intent_carries_the_destinations_pre_image() {
+        let st = AppState::new(db::test_pool().await);
+        let pre = PreImage {
+            version: VersionToken::hash(b"dst-old"),
+            size: 7,
+        };
+        let lease_id = open_intent(&st, true, Some(pre.clone())).await;
+        lease::release(&st, &lease_id).await.unwrap();
+
+        let stale = dangling_moves(&st.pool, now_ms()).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].overwrite);
+        assert_eq!(stale[0].dst_pre_image, Some(pre));
+    }
+
+    /// The other half of the two-outcome split: clearing must not look like a
+    /// move that happened. Nothing is appended, nothing is re-keyed.
+    #[tokio::test]
+    async fn clearing_an_intent_migrates_nothing() {
+        let st = AppState::new(db::test_pool().await);
+        let v1 = VersionToken::hash(b"v1");
+        history::append_version_log(&st, &src(), &v1, &who(), 2, VersionEvent::Create, None)
+            .await
+            .unwrap();
+        open_intent(&st, false, None).await;
+
+        clear_move(&st, &src()).await.unwrap();
+
+        assert_eq!(intent_rows(&st).await, 0);
+        // src keeps its own history: the file never went anywhere.
+        assert_eq!(history::history(&st.pool, &src()).await.unwrap().entries.len(), 1);
+        assert!(history::history(&st.pool, &dst()).await.unwrap().entries.is_empty());
+        // Not "no audit events on dst" — acquiring the dual lease legitimately
+        // audits one on each path. What must be absent is a *move*.
+        assert!(
+            !audit::query(&st.pool, &dst())
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.detail.contains("move from")),
+            "clearing an intent audited a move that never happened"
+        );
+    }
+
+    /// A half-written pre-image is corruption, and reporting it as "no
+    /// pre-image" would invite recovery to complete the move without naming the
+    /// snapshot — after which GC reclaims the destination's last copy. Skipping
+    /// leaves the row for a human instead.
+    #[tokio::test]
+    async fn a_row_with_half_a_pre_image_is_skipped_not_guessed() {
+        let st = AppState::new(db::test_pool().await);
+        let lease_id = open_intent(
+            &st,
+            true,
+            Some(PreImage {
+                version: VersionToken::hash(b"dst-old"),
+                size: 7,
+            }),
+        )
+        .await;
+        lease::release(&st, &lease_id).await.unwrap();
+        sqlx::query("UPDATE move_journal SET dst_pre_image_size = NULL WHERE src = ?1")
+            .bind(src().as_str())
+            .execute(&st.pool)
+            .await
+            .unwrap();
+
+        assert!(dangling_moves(&st.pool, now_ms()).await.unwrap().is_empty());
+        assert_eq!(intent_rows(&st).await, 1, "the corrupt row must still be there");
     }
 
     #[tokio::test]

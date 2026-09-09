@@ -146,6 +146,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Finish any move a previous run left between the rename and the migration
+    // (B3). Here rather than lazily on a read, for two reasons: a stale move has
+    // intact bytes and only owes bookkeeping, so it does not belong in the
+    // read-heavy hot path; and the run most likely to owe one is the run *after*
+    // the one that died, which is exactly now. Cannot fail the start-up — an
+    // unreachable coordinator means "not this time", and the records survive.
+    chapr_endpoint::moverecover::sweep_at_startup(
+        &coord,
+        backend.as_ref(),
+        &principal,
+        &session_id,
+    )
+    .await;
+
     let mut server = ChaprServer::with_diagnostics(
         coord,
         backend,

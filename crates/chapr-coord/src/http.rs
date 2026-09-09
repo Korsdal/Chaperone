@@ -27,9 +27,11 @@ use axum::{
 use chapr_proto::{
     AcquireLeaseRequest, AppendVersionLogRequest, AuditEvent, CanonicalPath, ChaprError,
     DiagnosticGroup, DiagnosticReport, DiagnosticsQuery, DiagnosticsResponse,
-    ClearJournalRequest, ConflictEntry, ConflictsQuery, ConflictsResponse, HistoryQuery,
+    ClearJournalRequest, ClearMoveJournalRequest, ConflictEntry, ConflictsQuery,
+    ConflictsResponse, DanglingMovesResponse, HistoryQuery,
     HistoryResponse, LeaseAcquireResponse, LeaseId, LeaseReleaseResponse, LeaseRenewResponse,
-    MovePathsRequest, OpenJournalRequest, PutBlobResponse, ReadReceipt, RecordAuditRequest,
+    MovePathsRequest, OpenJournalRequest, OpenMoveJournalRequest, PutBlobResponse, ReadReceipt,
+    RecordAuditRequest,
     RecoverJournalRequest, RecoveredFrom, RefreshIndexRequest, RegisterConflictRequest,
     ResolveConflictControl, ResolveRequest, ResolveResponse, VersionLogEntry, VersionToken,
 };
@@ -175,6 +177,9 @@ pub fn router(state: AppState) -> Router {
         .route("/conflicts/query", post(query_conflicts))
         .route("/conflicts/resolve", post(resolve_conflict))
         .route("/move", post(move_paths))
+        .route("/move/open", post(open_move))
+        .route("/move/clear", post(clear_move))
+        .route("/move/dangling", get(dangling_moves))
         .route("/reads", post(record_read))
         .route("/reads/assert", post(assert_read))
         .route("/watch/event", post(watch_event))
@@ -834,6 +839,57 @@ async fn move_paths(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Record the intent to rename, before the endpoint renames (B3).
+///
+/// Takes the authenticated caller as the recorded principal for the same reason
+/// [`move_paths`] does: the entry is what a later session will act on, and a
+/// principal a caller asserted for itself would be the one field in it that
+/// nothing checked.
+async fn open_move(
+    State(st): State<AppState>,
+    caller: crate::auth::Caller,
+    Json(req): Json<OpenMoveJournalRequest>,
+) -> Result<StatusCode, ApiError> {
+    let principal = caller.0.unwrap_or(req.principal);
+    crate::mv::open_move(
+        &st,
+        &req.src,
+        &req.dst,
+        &req.lease_id,
+        &principal,
+        &req.session_id,
+        &req.version,
+        req.size,
+        req.overwrite,
+        req.dst_pre_image.as_ref(),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Drop a move intent because the rename never happened. Not the same operation
+/// as [`move_paths`], which discharges the intent by *performing* the migration.
+async fn clear_move(
+    State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
+    Json(req): Json<ClearMoveJournalRequest>,
+) -> Result<StatusCode, ApiError> {
+    crate::mv::clear_move(&st, &req.src).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Move intents whose lease is dead: renames that may have committed with their
+/// migration still owed. Coord cannot resolve one — that needs the file hashed,
+/// and coord does no file I/O — so it reports and the endpoint decides.
+async fn dangling_moves(
+    State(st): State<AppState>,
+    _auth: crate::auth::Authenticated,
+) -> Result<Json<DanglingMovesResponse>, ApiError> {
+    let entries =
+        crate::mv::dangling_moves(&st.pool, chrono::Utc::now().timestamp_millis()).await?;
+    Ok(Json(DanglingMovesResponse { entries }))
 }
 
 async fn record_read(

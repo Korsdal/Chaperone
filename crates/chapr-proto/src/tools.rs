@@ -49,7 +49,7 @@ use crate::enums::{
     VersionEvent, WriteMode,
 };
 use crate::ids::{CanonicalPath, ConflictId, LeaseId, Principal, SessionId};
-use crate::records::{ConflictEntry, LeaseRef, RecoveredFrom};
+use crate::records::{ConflictEntry, LeaseRef, MoveJournalEntry, RecoveredFrom};
 use crate::version::VersionToken;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -582,6 +582,60 @@ pub struct MovePathsRequest {
     /// does, or GC reclaims the only copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst_pre_image: Option<PreImage>,
+}
+
+/// Record the intent to rename, before the rename happens (B3, D-013).
+///
+/// D-013 accepted that the gap between the rename and the coord migration cannot
+/// be one transaction, and called what it leaves "stale-but-recoverable". Until
+/// this existed there was nothing to recover *from*: the rename committed, the
+/// migration did not, and no record said the two paths belonged to one another —
+/// so `dst` silently lost its lineage and `src`'s rows described a file that was
+/// no longer there.
+///
+/// Every field [`MovePathsRequest`] needs is carried here, deliberately: whoever
+/// completes the move afterwards is often **not** the session that opened it (a
+/// crashed endpoint's successor), and must not have to reconstruct the payload
+/// from a file it can only hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenMoveJournalRequest {
+    pub src: CanonicalPath,
+    pub dst: CanonicalPath,
+    /// The move's all-or-none dual lease over `{src, dst}`. Its liveness is what
+    /// separates a move still in flight from one that died — the same signal the
+    /// write journal uses (concept §8.1).
+    pub lease_id: LeaseId,
+    pub principal: Principal,
+    pub session_id: SessionId,
+    /// The source's CAS-verified version: what `dst` must hash to for a
+    /// recovering session to conclude the rename went through.
+    pub version: VersionToken,
+    pub size: u64,
+    pub overwrite: bool,
+    /// The destination's pre-image, present only on an overwrite-move — carried
+    /// so a recovering session can name the blob the original snapshotted, which
+    /// GC would otherwise reclaim as unreferenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_pre_image: Option<PreImage>,
+}
+
+/// Drop a move-intent entry without migrating anything: the rename did not
+/// happen, so there is nothing to complete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearMoveJournalRequest {
+    pub src: CanonicalPath,
+}
+
+/// Move-intent entries whose lease is dead — a rename that may have committed
+/// with its coord migration still owed.
+///
+/// *Dangling* means the same thing it means for a write: entry present, owning
+/// lease gone. It does **not** mean the file is damaged. A move's bytes are
+/// intact under one name or the other; what is stale is coord's bookkeeping,
+/// which is why this is swept rather than served from the read path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DanglingMovesResponse {
+    pub entries: Vec<MoveJournalEntry>,
 }
 
 /// Recover a dangling in-flight write (concept §8.1). Called by the read path

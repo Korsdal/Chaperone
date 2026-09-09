@@ -34,6 +34,14 @@ use std::time::Duration;
 /// stale-cache signal the endpoint needs (concept §8.1). Populated lazily via
 /// the refresh call until the change-watcher exists (deferred; §14).
 ///
+/// `move_journal`: the in-flight-move record (B3). A **new table** rather than
+/// columns on `journal`, and that is not only a modelling preference: [`migrate`]
+/// is `CREATE TABLE IF NOT EXISTS` and nothing more, so a new table appears on an
+/// existing database while a new *column* on an existing table would be silently
+/// skipped — the deployed coordinator would then be asked for a column it does
+/// not have. Until C0's migration machinery lands, additive-by-table is the only
+/// schema change that reaches an install that already ran.
+///
 /// Later subsystems (intent journal E-004, history/conflict/audit) add tables.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -67,6 +75,21 @@ CREATE TABLE IF NOT EXISTS journal (
     intended_version  TEXT,                 -- NULL if crashed before hashing new content (concept §5.2)
     opened_at_ms      INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS move_journal (
+    src                   TEXT    PRIMARY KEY,  -- canonical; at most one in-flight move per source
+    dst                   TEXT    NOT NULL,     -- canonical; where the file is headed
+    lease_id              TEXT    NOT NULL,     -- the dual {src,dst} lease (liveness ⇒ live vs dangling)
+    principal             TEXT    NOT NULL,
+    session_id            TEXT    NOT NULL,
+    version               TEXT    NOT NULL,     -- src's CAS-verified version; what dst must hash to
+    size                  INTEGER NOT NULL,
+    overwrite             INTEGER NOT NULL,     -- 0/1; whether dst existed and went through CAS
+    dst_pre_image_version TEXT,                 -- overwrite only: the snapshot the rename destroyed
+    dst_pre_image_size    INTEGER,              -- set together with the version, or both NULL
+    opened_at_ms          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_move_journal_dst ON move_journal(dst);
 
 CREATE TABLE IF NOT EXISTS version_log (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,  -- append order within a file
