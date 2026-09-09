@@ -168,6 +168,7 @@ See `packaging/coord/` for the config template and service install steps, and
 | [docs/architecture.md](docs/architecture.md) | Invariants, the write and read paths, failure directions, read limits, backends |
 | [docs/deployment-guide.md](docs/deployment-guide.md) | Install, configure, verify, operate |
 | [docs/security.md](docs/security.md) | Identity, and the limitations documented rather than hidden |
+| [docs/measuring-session-identity.md](docs/measuring-session-identity.md) | What the audit trail can attribute, and how to measure it on your host |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Three things not guessable from the code |
 | [LOGBOOK.md](LOGBOOK.md) | Engineering logbook: current state, decisions, issues, backlog |
 

@@ -29,6 +29,12 @@
 //! question — and a measured negative is worth more than the same conclusion
 //! reached by reading the SDK, which is all D-044 had.
 //!
+//! The steps for actually running it — pointing a host at a build, which calls
+//! to make in which conversations, where the log lands — are in
+//! `docs/measuring-session-identity.md`, which is also where the answer is
+//! written for a reader who is not a maintainer. What follows here is the same
+//! interpretation from the inside, for whoever changes this code.
+//!
 //! # What the log will say, and how to read it
 //!
 //! - **`no traceparent`** (once per run, listing the keys that *were* sent) — a
