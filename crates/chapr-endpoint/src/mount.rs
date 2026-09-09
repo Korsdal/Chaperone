@@ -75,7 +75,10 @@ impl MountTable for WinMountTable {
             WNetGetUniversalNameW, UNIVERSAL_NAME_INFOW, UNIVERSAL_NAME_INFO_LEVEL,
         };
 
-        let wide: Vec<u16> = local_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = local_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         // The API writes a `UNIVERSAL_NAME_INFOW` at the head of the buffer whose
         // one field points at a string stored in the *same* buffer, so the buffer
@@ -161,12 +164,64 @@ mod tests {
 
     #[test]
     fn a_fake_table_maps_only_its_own_drive() {
-        let m = FakeMounts { drive: "Z:", share: "\\\\srv\\share" };
+        let m = FakeMounts {
+            drive: "Z:",
+            share: "\\\\srv\\share",
+        };
         assert_eq!(
             m.universal_name("Z:\\Tenders\\bid.docx").unwrap(),
             Some("\\\\srv\\share\\Tenders\\bid.docx".to_string())
         );
         // A different letter is not this mapping, and must not be guessed at.
         assert_eq!(m.universal_name("P:\\Tenders\\bid.docx").unwrap(), None);
+    }
+
+    /// **E-022's unverified branch**, against a real mapped drive.
+    ///
+    /// Ignored by default and opt-in on purpose: `WinMountTable` calls
+    /// `WNetGetUniversalNameW`, which needs a live Windows session with an actual
+    /// mapping. There is no way to fake that and still be testing the thing, so
+    /// every other test in this module drives `FakeMounts` instead — which proves
+    /// the *canonicalisation* around the lookup and never the lookup itself.
+    ///
+    /// That gap is why E-022 has carried a live `HIGH` row while marked DONE.
+    /// Run it against the rig:
+    ///
+    /// ```text
+    /// net use Z: \\CHAPR-FS\chaprtest
+    /// set CHAPR_TEST_MAPPED_DRIVE=Z:\
+    /// cargo test -p chapr-endpoint --lib real_mapped_drive -- --ignored --nocapture
+    /// ```
+    ///
+    /// Asserts the shape rather than a literal, so it works against any rig: the
+    /// answer must be `Some`, must be a UNC path, and must not still be a drive
+    /// letter — the three ways this call can be wrong without erroring.
+    #[test]
+    #[ignore = "needs a real mapped network drive; set CHAPR_TEST_MAPPED_DRIVE"]
+    #[cfg(windows)]
+    fn real_mapped_drive_resolves_to_unc() {
+        let Ok(drive) = std::env::var("CHAPR_TEST_MAPPED_DRIVE") else {
+            panic!("set CHAPR_TEST_MAPPED_DRIVE to a mapped drive path, e.g. Z:\\");
+        };
+
+        let got = default_mounts()
+            .universal_name(&drive)
+            .unwrap_or_else(|e| panic!("universal_name({drive}) failed: {e}"));
+
+        let unc = got.unwrap_or_else(|| {
+            panic!(
+                "universal_name({drive}) returned Ok(None) — 'this path is genuinely \
+                 local'. It is a mapped network drive, so None is wrong: two users \
+                 with different letters would key the same file differently and \
+                 invariant 5 would not hold."
+            )
+        });
+
+        assert!(unc.starts_with("\\\\"), "expected a UNC name, got {unc:?}");
+        assert!(
+            !unc.starts_with(&drive[..2]),
+            "the drive letter survived into the canonical form: {unc:?}"
+        );
+        println!("  E-022: {drive} -> {unc}");
     }
 }

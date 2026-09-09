@@ -252,12 +252,31 @@ jobs:
                      -d '{"path":"//srv/share/a.md"}' "$CHAPR_COORD_URL/journal/clear")
           [ "$got" = 401 ] || { echo "::error::journal/clear was reachable unauthenticated ($got)"; exit 1; }
 
+      # E-022's mapped-drive branch is only exercised when the self-test folder is
+      # on a drive LETTER. Pointing it at the UNC path leaves that check
+      # UNVERIFIED, which since B8 is a non-zero exit rather than a silent pass —
+      # so this step is what makes the leg genuinely green instead of green by
+      # omission. It is also the only automated coverage the drive-letter → UNC
+      # resolution has ever had.
+      - name: Map a drive letter at the share (exercises E-022)
+        if: matrix.backend == 'smb'
+        shell: cmd
+        run: net use Z: %SMOKE_DIR%
+
       - name: Self-test — contention and the mandatory lock, via the shipped binary
         shell: bash
         run: |
           set -euo pipefail
           export CHAPR_COORD_TOKEN=$(tr -d '\r\n' < "$COORD_DIR/endpoint-token")
-          export CHAPR_SELFTEST_DIR="$SMOKE_DIR"
+          # CHAPR_ROOT stays the UNC form — it is what the endpoint is configured
+          # for, and confinement is checked against the canonical share. Only the
+          # self-test's own working folder moves to the mapped letter, which is
+          # precisely the difference that makes the E-022 check run.
+          if [ "${{ matrix.backend }}" = "smb" ]; then
+            export CHAPR_SELFTEST_DIR='Z:\'
+          else
+            export CHAPR_SELFTEST_DIR="$SMOKE_DIR"
+          fi
           export CHAPR_ROOT="$SMOKE_DIR"
           ./target/debug/chapr-endpoint${{ matrix.exe }} self-test
 

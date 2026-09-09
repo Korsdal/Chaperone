@@ -13,9 +13,15 @@
 //! Two rules the output obeys, because a verification tool that overstates itself
 //! is worse than none:
 //!
-//! - A check that could not run prints **SKIP**, never PASS. The mapped-drive
-//!   branch (E-022) in particular has never been confirmed against a real server,
-//!   and a green line for a check that did not execute would bury that.
+//! - A check that could not run prints **UNVERIFIED**, never PASS, **and exits
+//!   non-zero**. The mapped-drive branch (E-022) in particular has never been
+//!   confirmed against a real server, and a green line for a check that did not
+//!   execute would bury that. Printing the rule was not enough: until B8 the exit
+//!   code counted failures only, so a run that verified almost nothing still
+//!   returned 0 and every script reading it saw success. A check that genuinely
+//!   *cannot* apply to this backend — the mandatory lock against advisory POSIX
+//!   locks — prints **N/A** instead and does not affect the exit code, because
+//!   that is a correct outcome rather than a gap.
 //! - Contention is tested with **two sessions**, not two machines. Real lease
 //!   contention needs two distinct `SessionId`s against one path; separate laptops
 //!   only add distinct principals on top. One laptop is therefore enough to
@@ -26,11 +32,30 @@ use crate::{canonicalize, grammar_for, ops, read, write, CoordClient, LeaseManag
 use chapr_proto::{BackendKind, ChaprError, Principal, SessionId, WriteMode};
 use std::sync::Arc;
 
-/// One line of output, and the only three states it may have.
+/// One line of output, and the only four states it may have.
+///
+/// The split between [`Outcome::Unverified`] and [`Outcome::NotApplicable`] is
+/// the whole of B8, and it exists because the two were one variant that exited
+/// zero — so a deployment where nothing but the trivial checks ran reported
+/// success. D-032's rule is that **a skipped check is not a pass**; this module
+/// printed that sentence and then returned an exit code that contradicted it.
 enum Outcome {
     Pass(String),
     Fail(String),
-    Skip(String),
+    /// The check *applies* to this deployment but this run did not exercise it —
+    /// a missing `CHAPR_ROOT`, a folder that is not on a mapped drive. Nothing
+    /// was learned, so this counts toward a non-zero exit: an operator must not
+    /// read "we did not look" as "it is fine".
+    Unverified(String),
+    /// The check cannot apply here, and that is a correct outcome rather than a
+    /// gap — the mandatory-lock probe against a POSIX backend whose locks are
+    /// advisory by design. Does **not** affect the exit code.
+    ///
+    /// Constructed only under `cfg(not(windows))`, so on a Windows build it is
+    /// genuinely unconstructed — hence the allow, which is about the compiler not
+    /// seeing across a `cfg`, not about the variant being unused.
+    #[cfg_attr(windows, allow(dead_code))]
+    NotApplicable(String),
 }
 
 #[derive(Default)]
@@ -45,14 +70,32 @@ impl Report {
     fn fail(&mut self, what: &'static str, detail: impl Into<String>) {
         self.lines.push((what, Outcome::Fail(detail.into())));
     }
-    fn skip(&mut self, what: &'static str, detail: impl Into<String>) {
-        self.lines.push((what, Outcome::Skip(detail.into())));
+    /// The check applies here but this run did not exercise it. Counts toward a
+    /// non-zero exit — see [`Outcome::Unverified`].
+    fn unverified(&mut self, what: &'static str, detail: impl Into<String>) {
+        self.lines.push((what, Outcome::Unverified(detail.into())));
+    }
+    /// The check cannot apply to this backend or platform. Does not affect the
+    /// exit code — see [`Outcome::NotApplicable`]. Same `cfg` reasoning as the
+    /// variant it constructs.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn not_applicable(&mut self, what: &'static str, detail: impl Into<String>) {
+        self.lines
+            .push((what, Outcome::NotApplicable(detail.into())));
     }
 
-    /// Print and return the number of failures, which becomes the exit code.
+    /// Print, and return the exit code: **failures plus unverified checks**.
+    ///
+    /// Unverified counts. That is the point of B8: this returned only `failed`,
+    /// so a run in which the mapped-drive and confinement checks never executed
+    /// exited zero and a CI step went green having proved neither. An operator
+    /// running this against a new deployment needs "we did not look" to be
+    /// distinguishable from "it is fine", and an exit code is the only part of
+    /// this output a script reads.
     fn finish(&self) -> usize {
         let mut failed = 0;
-        let mut skipped = 0;
+        let mut unverified = 0;
+        let mut not_applicable = 0;
         println!();
         for (what, outcome) in &self.lines {
             match outcome {
@@ -61,18 +104,32 @@ impl Report {
                     failed += 1;
                     println!("  FAIL  {what}\n          {d}");
                 }
-                Outcome::Skip(d) => {
-                    skipped += 1;
-                    println!("  SKIP  {what}\n          {d}");
+                Outcome::Unverified(d) => {
+                    unverified += 1;
+                    println!("  UNVERIFIED  {what}\n          {d}");
+                }
+                Outcome::NotApplicable(d) => {
+                    not_applicable += 1;
+                    println!("  N/A   {what}\n          {d}");
                 }
             }
         }
-        let passed = self.lines.len() - failed - skipped;
-        println!("\n  {passed} passed, {failed} failed, {skipped} skipped");
-        if skipped > 0 {
-            println!("  A skipped check was not verified. It is not a pass.");
+        let passed = self.lines.len() - failed - unverified - not_applicable;
+        println!(
+            "\n  {passed} passed, {failed} failed, {unverified} unverified, \
+             {not_applicable} not applicable"
+        );
+        if unverified > 0 {
+            println!(
+                "  An UNVERIFIED check did not run. It is not a pass, and this exits\n  \
+                 non-zero so a script cannot mistake it for one. The detail on each\n  \
+                 line says what to set to exercise it."
+            );
         }
-        failed
+        if not_applicable > 0 {
+            println!("  An N/A check cannot apply to this backend and is not a gap.");
+        }
+        failed + unverified
     }
 }
 
@@ -111,7 +168,10 @@ pub async fn run() -> u8 {
         .with_principal(who.as_str())
         .with_token(std::env::var("CHAPR_COORD_TOKEN").unwrap_or_default());
     match coord.healthz().await {
-        Ok(()) => r.pass("coordinator reachable", format!("{coord_url}/healthz answered ok")),
+        Ok(()) => r.pass(
+            "coordinator reachable",
+            format!("{coord_url}/healthz answered ok"),
+        ),
         Err(e) => {
             r.fail(
                 "coordinator reachable",
@@ -175,11 +235,16 @@ pub async fn run() -> u8 {
             ),
         );
     } else {
-        r.pass("coordinator URL is not loopback", format!("host is {host:?}"));
+        r.pass(
+            "coordinator URL is not loopback",
+            format!("host is {host:?}"),
+        );
     }
 
     let kind = match std::env::var("CHAPR_BACKEND") {
-        Ok(v) => v.parse::<BackendKind>().unwrap_or_else(|_| default_backend_kind()),
+        Ok(v) => v
+            .parse::<BackendKind>()
+            .unwrap_or_else(|_| default_backend_kind()),
         Err(_) => default_backend_kind(),
     };
     let backend = match make_backend(kind) {
@@ -192,40 +257,61 @@ pub async fn run() -> u8 {
     r.pass("backend available", format!("driving {kind}"));
     let g = grammar_for(kind);
 
-    // 3. Mapped drive → UNC. SKIP, loudly, when there is no drive letter to
-    //    resolve: this branch has never been confirmed against a real fileserver,
-    //    and it is the one that decides whether two users with different letters
-    //    agree on which file is which (invariant 5).
-    let looks_like_drive = dir.len() >= 2
-        && dir.as_bytes()[1] == b':'
-        && dir.as_bytes()[0].is_ascii_alphabetic();
-    if !looks_like_drive {
-        r.skip(
+    // 3. Mapped drive → UNC. Loud when there is no drive letter to resolve: this
+    //    branch decides whether two users with different letters agree on which
+    //    file is which (invariant 5).
+    //
+    //    The distinction between the two negative answers is load-bearing (B8).
+    //    On a platform with **no drive-letter concept at all**, this check cannot
+    //    apply and saying so is the truthful outcome — `NoMountTable`'s own docs
+    //    make that point. On Windows it *could* have been exercised and was not,
+    //    which is a gap the operator should act on. Collapsing the two would
+    //    either exit non-zero on every POSIX deployment for a check that is
+    //    meaningless there, or let a real Windows gap pass silently.
+    #[cfg(not(windows))]
+    {
+        let _ = &dir;
+        r.not_applicable(
             "mapped drive resolves to UNC",
-            format!(
-                "the test folder ({dir}) is not on a drive letter, so nothing was resolved. \
-                 To exercise this, point CHAPR_SELFTEST_DIR at a mapped drive instead."
-            ),
+            "this platform has no drive letters; every path is already its own \
+             canonical form",
         );
-    } else {
-        match crate::mount::default_mounts().universal_name(&dir) {
-            Ok(Some(unc)) => r.pass(
-                "mapped drive resolves to UNC",
-                format!("{dir} → {unc}; colleagues with a different letter agree on this key"),
-            ),
-            // `Ok(None)` is the trait's documented answer for "genuinely local, no
-            // UNC form" — a local disk, not a failure. Nothing was resolved, so
-            // nothing was verified: SKIP. Reporting this as FAIL was this module's
-            // own rule being broken by its first implementation.
-            Ok(None) => r.skip(
+    }
+    #[cfg(windows)]
+    {
+        let looks_like_drive =
+            dir.len() >= 2 && dir.as_bytes()[1] == b':' && dir.as_bytes()[0].is_ascii_alphabetic();
+        if !looks_like_drive {
+            r.unverified(
                 "mapped drive resolves to UNC",
                 format!(
-                    "{dir} is on a local disk, not a mapped network drive, so there was \
+                    "the test folder ({dir}) is not on a drive letter, so nothing was resolved. \
+                 To exercise this, point CHAPR_SELFTEST_DIR at a mapped drive instead."
+                ),
+            );
+        } else {
+            match crate::mount::default_mounts().universal_name(&dir) {
+                Ok(Some(unc)) => r.pass(
+                    "mapped drive resolves to UNC",
+                    format!("{dir} → {unc}; colleagues with a different letter agree on this key"),
+                ),
+                // `Ok(None)` is the trait's documented answer for "genuinely local, no
+                // UNC form" — a local disk, not a failure. Nothing was resolved, so
+                // nothing was verified: SKIP. Reporting this as FAIL was this module's
+                // own rule being broken by its first implementation.
+                Ok(None) => r.unverified(
+                    "mapped drive resolves to UNC",
+                    format!(
+                        "{dir} is on a local disk, not a mapped network drive, so there was \
                      nothing to resolve. Point CHAPR_SELFTEST_DIR at a mapped drive on the \
                      share to exercise this."
+                    ),
                 ),
-            ),
-            Err(e) => r.fail("mapped drive resolves to UNC", format!("lookup failed: {e}")),
+                Err(e) => r.fail(
+                    "mapped drive resolves to UNC",
+                    format!("lookup failed: {e}"),
+                ),
+            }
         }
     }
 
@@ -250,7 +336,7 @@ pub async fn run() -> u8 {
             format!("canonical form {}", canon_dir.as_str()),
         );
     } else {
-        r.skip(
+        r.unverified(
             what_confined,
             format!(
                 "CHAPR_ROOT is not set, so confinement is off and every path passes — \
@@ -261,7 +347,10 @@ pub async fn run() -> u8 {
         );
     }
     if let Err(e) = std::fs::create_dir_all(canon_dir.as_str()) {
-        r.fail("test folder is writable", format!("{}: {e}", canon_dir.as_str()));
+        r.fail(
+            "test folder is writable",
+            format!("{}: {e}", canon_dir.as_str()),
+        );
         return r.finish().min(255) as u8;
     }
 
@@ -314,7 +403,10 @@ pub async fn run() -> u8 {
                         );
                     }
                 }
-                Err(e) => r.fail("write then read back, byte-identical", format!("read failed: {e}")),
+                Err(e) => r.fail(
+                    "write then read back, byte-identical",
+                    format!("read failed: {e}"),
+                ),
             }
             // 5. Contention: two sessions, one file, one common base version.
             //    Exactly one winner; the loser must be told and its bytes parked.
@@ -325,7 +417,7 @@ pub async fn run() -> u8 {
                 "write then read back, byte-identical",
                 format!("create failed: {e}"),
             );
-            r.skip(
+            r.unverified(
                 "two sessions contending on one file",
                 "skipped because the base file could not be created",
             );
@@ -449,7 +541,10 @@ async fn contention_check(
 
     let what = "two sessions contending on one file";
     if !unexpected.is_empty() {
-        r.fail(what, format!("unexpected failures: {}", unexpected.join("; ")));
+        r.fail(
+            what,
+            format!("unexpected failures: {}", unexpected.join("; ")),
+        );
     } else if winners == 1 && told == 1 {
         r.pass(
             what,
@@ -472,17 +567,12 @@ async fn contention_check(
 /// depends on the *server* honouring `FILE_SHARE_NONE` over SMB rather than on
 /// anything in this process. Everything in the write path is built on it
 /// (invariant 3), so it is checked as a fact rather than inferred.
-fn mandatory_lock_check(
-    r: &mut Report,
-    dir: &str,
-    stamp: u32,
-    g: &'static dyn crate::PathGrammar,
-) {
+fn mandatory_lock_check(r: &mut Report, dir: &str, stamp: u32, g: &'static dyn crate::PathGrammar) {
     let what = "exclusive open is honoured by the server";
     #[cfg(not(windows))]
     {
         let _ = (dir, stamp, g);
-        r.skip(
+        r.not_applicable(
             what,
             "this check is Windows/SMB-specific; the POSIX backend uses advisory flock",
         );
