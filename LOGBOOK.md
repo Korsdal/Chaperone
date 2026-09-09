@@ -163,11 +163,28 @@ responsibility; never fill in a bump.
 plus the six-tab token-gated admin page. MSRV **1.88.0**. `cargo fmt` still drifts
 and remains jok's call.
 
-**⚠ Seven commits are unpushed, and four changes in them are unproven in CI.**
-B8's exit-code semantics across all five legs; the `net use Z:` step; whether the
-POSIX legs report **`N/A`** rather than going red; and **B3's `/move/open`, which
-every smoke move now calls** — a wrong route registration would surface on the e2e
-legs and nowhere else in CI. **Push, then read that run before anything else.**
+**⚠ The eight commits are pushed, and CI run #15 executed NOTHING.** `ci.yml` was
+unparseable — `run: net use Z: %SMOKE_DIR%`, added by B8's step, and a plain YAML
+scalar cannot contain a colon followed by a space. GitHub created run **#15** on
+`074ab82` and it has **`total_count: 0` jobs**; its own name shows as
+`.github/workflows/ci.yml` rather than `CI`, because the parser never got as far as
+the `name:` field. Fixed in `107f844`, **unpushed** — push it, then read the run
+that one triggers.
+
+**So four changes remain unproven, and one lesson is now twice-learned.** Still
+unproven: B8's exit-code semantics across all five legs; the `net use Z:` step
+itself; whether the POSIX legs report **`N/A`** rather than going red; and **B3's
+`/move/open`, which every smoke move now calls** — a wrong route registration would
+surface on the e2e legs and nowhere else in CI.
+
+**The lesson: "only Actions can say whether the workflow is right" was false, and
+this is the second time that shape of assumption has cost a session.** A YAML parser
+answers it locally in a second (`js-yaml` via node was enough to locate the fault at
+264:23 and to confirm the pre-B8 file parsed). The first instance was 2026-09-08's
+"CI results are unreachable from this laptop", when `api.github.com` had been
+readable all along. **And when reading a run: check that jobs exist, not only that
+they are green.** An unparseable workflow is a *failed run with no jobs*, which is
+B8's own SKIP-is-not-PASS rule pointed at CI instead of the self-test.
 
 **The 2026-09-08 session spent a day uncommitted, and the record said otherwise.**
 Current State claimed its CI-bound changes were "committed but unproven"; they were
@@ -316,10 +333,13 @@ untested assumption.
 
 
 **What's next:**
-1. **Push the seven commits, then read the CI run** — the four unproven changes
-   above. Red on the POSIX legs means the `N/A` classification is wrong; red on
-   Windows means the `net use` step is; a failure inside a smoke *move* means
-   `/move/open` is registered or called under a different path than it looks.
+1. **Push `107f844` and read the run it triggers.** The eight earlier commits are
+   already on `origin/main`, but run **#15** parsed nothing — `ci.yml` was invalid
+   YAML, `total_count: 0` jobs — so the four changes below have still never
+   executed. **Check that jobs exist before reading conclusions.** Red on the POSIX
+   legs means the `N/A` classification is wrong; red on Windows means the
+   `net use` step is; a failure inside a smoke *move* means `/move/open` is
+   registered or called under a different path than it looks.
 2. **B6 is the remaining unblocked Phase B item** — the verb-uniformity sweep:
    `create` alone skips the `~$F` preflight, `restore(copy)` takes no lease or path
    lock, `delete`/`move` return `Conflict` with `sidecar_path` pointing at the file
@@ -436,7 +456,7 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 >
 > `/logbook end`: **move the entry below into its month file first**, then write
 > the new one here. Threshold: 10000; the section sits just inside it as of
-> 2026-09-09 at 7713 bytes, re-measured.
+> 2026-09-09 at 8616 bytes, re-measured after the ci.yml incident was added.
 > **Take the ~9 KB ceiling on a single entry literally**: it is the real limit,
 > and prose that feels essential while writing is usually already in a decision
 > body or a commit message. Headroom is thin by design — the entry here is
@@ -457,6 +477,7 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 - [x] **The `traceparent` probe (D-044's one unmeasured input), and it works.** `rmcp` 2.2 *does* surface `_meta` — the service loop swaps it into `RequestContext` before the handler runs and `ToolCallContext::new` then discards the params' copy, so `context.meta` is the only place a stdio server can read it. `traceprobe.rs` logs once per distinct **trace id** (keyed on the id, not the header — the span changes per operation by design), with a cap at 32 so a per-request host cannot fill a log. `call_tool` is hand-written so all eleven tools are covered; `#[tool_handler]` only generates it when the impl does not.
 - [x] **Proven over real stdio, not just in tests.** Five `tools/call` requests into the built binary: two distinct trace ids reported once each, a third call reusing a trace id with a different span **stayed silent**, and a call with no `_meta` reported absence. That run also caught two of my own errors — requests are spawned as concurrent tasks so **line order is not call order** (the absence line printed before calls that arrived earlier, and the message no longer says "on the first tool call"), and the absence message contained the exact phrase the other line is grepped by.
 - [x] **`docs/measuring-session-identity.md`** — what the trail can attribute today, the procedure, and a table from each possible log output to its conclusion. Reader-facing per the `docs/`-versus-`specs/` split, and indexed from README. **The measurement itself is owed and is jok's**: it needs a host, two conversations, one application run.
+- [x] **`ci.yml` was left unparseable by B8's own step, and jok caught it.** `run: net use Z: %SMOKE_DIR%` — a plain YAML scalar cannot hold a colon followed by a space, so it broke the *file*, not the step. jok had already pushed; GitHub made run **#15** on `074ab82` with **`total_count: 0` jobs**, its name showing as `.github/workflows/ci.yml` because the parser never reached `name:`. Fixed in `107f844` with a block scalar. **The claim "only Actions can say whether the workflow is right" was simply false** — `js-yaml` under node located the fault at 264:23 and confirmed the pre-B8 file parsed. Second instance in two sessions of an untested assumption about what cannot be checked locally.
 - [x] **B3 landed — D-013's "stale-but-recoverable" is now true.** A `move_journal` row records the intent before the rename, carrying everything the migration needs because whoever finishes it is usually not the session that started it. **`move_paths` deletes that row inside its own transaction**, and that ordering is the whole design: a surviving row *proves* the migration did not commit, so completion is exactly-once with no idempotency logic and no state where both exist. `moverecover.rs` resolves them at endpoint start-up — `src` gone and `dst` hashing to the recorded version → complete; `src` still there → drop it, nothing happened; neither, or a `dst` written since → leave it and say why. Fail-closed both ways: a move that cannot record its intent does not touch the file, and a rename that fails clears the intent it opened.
 
 **The finding inside B3, and it outlives B3: `db::migrate` is `CREATE TABLE IF NOT EXISTS` and nothing else.** A new *table* appears on a database that already exists; a new *column* is silently skipped, after which the endpoint queries a column the live coordinator does not have. B3 wanted a column on `journal` and could not have one — so it got a separate table, which the record wanted anyway (different fields, and keyed by `src` while the file ends up at `dst`). **The next schema change that genuinely needs a column has no such escape.** C0's priority is raised on the board: it is no longer only Phase C's prerequisite, it is a constraint on every schema change.
@@ -465,11 +486,11 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 
 **One deployment consequence, stated because it is easy to get wrong: update coord before endpoints.** A new endpoint against the installed older coordinator gets 404 on `/move/open` and refuses the move — the right direction, since skipping the intent would restore the unrecoverable window while reporting success. The 404 is translated into an error naming that cause and that fix, rather than reporting "HTTP 404 Not Found" on a file operation.
 
-**State changes:** **B3 DONE**; coord routes **29 → 32** (`/move/open`, `/move/clear`, `GET /move/dangling`); tests 396 → 420; new modules `chapr-endpoint/src/traceprobe.rs` and `moverecover.rs`; new coord table `move_journal`; `docs/measuring-session-identity.md` added and indexed from README. **Seven commits unpushed.** No version change — `0.1.3` stands; versioning is jok's.
+**State changes:** **B3 DONE**; coord routes **29 → 32** (`/move/open`, `/move/clear`, `GET /move/dangling`); tests 396 → 420; new modules `chapr-endpoint/src/traceprobe.rs` and `moverecover.rs`; new coord table `move_journal`; `docs/measuring-session-identity.md` added and indexed from README. **Eight commits pushed by jok, and a ninth (`107f844`) unpushed: `ci.yml` was invalid YAML, so run #15 ran no jobs at all.** No version change — `0.1.3` stands; versioning is jok's.
 
 **Open questions:** unchanged at 15, and none closed today. **Q10 is answered by B3** rather than still gating it. Still jok's: **Q11** (I-016, gates B4), **Q13** (gates B5), **Q4** (gates C3/C4), **Q1**. The `traceparent` question is now *runnable* rather than open-ended — the code and the recipe exist, the run does not.
 
-**Next session start from:** **push the seven commits, then read the CI run.** Four changes land unproven: B8's exit-code semantics on all five legs, the `net use Z:` step, whether the POSIX legs report `N/A` rather than going red, and **B3's `/move/open` on the e2e legs** — every smoke move now makes that call, so a wrong route registration would show up there and nowhere else in CI. **Then:** **B6** (verb-uniformity sweep) is the remaining unblocked Phase B item, and **C0** has a raised claim on attention after B3's schema finding. **I-016 still needs jok's semantics call** before B4. Owed and cheap: run the `traceparent` measurement per `docs/measuring-session-identity.md` and paste the log lines. The rig is unchanged and reproducible — revert the `clean-share` checkpoint before using it.
+**Next session start from:** **push `107f844` and read the run it triggers, checking that jobs exist before reading conclusions.** The eight earlier commits are on `origin/main` already, but run **#15** was a *failed run with no jobs* — `ci.yml` had invalid YAML (`run: net use Z: %SMOKE_DIR%`; a plain scalar cannot hold a colon-space), so B8's exit-code semantics, the `net use Z:` step, the POSIX `N/A` classification and **B3's `/move/open`** have still never executed anywhere. **Then:** **B6** (verb-uniformity sweep) is the remaining unblocked Phase B item, and **C0** has a raised claim on attention after B3's schema finding. **I-016 still needs jok's semantics call** before B4. Owed and cheap: run the `traceparent` measurement per `docs/measuring-session-identity.md` and paste the log lines. The rig is unchanged and reproducible — revert the `clean-share` checkpoint before using it.
 
 ---
 
