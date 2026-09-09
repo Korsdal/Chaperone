@@ -29,10 +29,12 @@ mod http;
 mod index;
 mod journal;
 mod lease;
+mod lifecycle;
 mod mv;
 mod reads;
 mod reaper;
 mod setup;
+mod setup_ui;
 mod shares;
 mod state;
 // The change-watcher *effect core* (`watch`) is platform-agnostic (E-017): it
@@ -75,6 +77,32 @@ enum Cmd {
     /// Run under the Windows Service Control Manager (used by the installed service).
     #[cfg(windows)]
     RunService {
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+    /// Reprint what to hand out to the users: coordinator URL, token, share path.
+    ///
+    /// Setup prints this once and terminals scroll. An install outlives its
+    /// terminal, and the values are needed again for every laptop added.
+    Handover {
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Also write the `mcpServers` block to this file. **It contains the
+        /// deployment token** — the command says so, and restricts the file.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Print only the `mcpServers` JSON on stdout, everything else on stderr,
+        /// so `> .mcp.json` produces a usable file.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Is the service installed, is it running, and on which config?
+    Status {
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+    /// Remove the service. **Leaves the data** — see the command's own output.
+    Uninstall {
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
@@ -123,9 +151,31 @@ fn dispatch(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             let cfg = Config::load(config.as_deref())?;
             runtime()?.block_on(run_server(cfg))
         }
-        Cmd::Setup(args) => runtime()?.block_on(setup::run(args)),
+        // Which front end collects the answers, chosen here rather than inside
+        // `setup::run` — see the note there about why the two must not call each
+        // other. `--non-interactive` has no questions, so it never gets a UI.
+        // The applied config is returned for the browser front end's benefit and
+        // discarded here: the terminal path has already printed everything.
+        Cmd::Setup(args) => {
+            if args.ui && !args.non_interactive {
+                runtime()?.block_on(setup_ui::run(args))
+            } else {
+                runtime()?.block_on(setup::run(args)).map(|_| ())
+            }
+        }
         #[cfg(windows)]
         Cmd::RunService { config } => service_win::run(config),
+        Cmd::Handover { config, out, json } => {
+            setup::handover(config.as_deref(), out.as_deref(), json)
+        }
+        // The only subcommand whose exit code carries information — 0 means
+        // installed, running and answering — so a monitoring script does not have
+        // to parse the output. Hence the explicit exit rather than a `Result`.
+        Cmd::Status { config } => {
+            let code = runtime()?.block_on(lifecycle::status(config.as_deref()));
+            std::process::exit(code);
+        }
+        Cmd::Uninstall { config } => lifecycle::uninstall(config.as_deref()),
     }
 }
 

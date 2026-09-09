@@ -68,6 +68,13 @@ pub struct SetupArgs {
     /// Fileserver backend kind this coord fronts (§14). Only `smb` today.
     #[arg(long)]
     pub backend: Option<String>,
+    /// Collect the answers in a browser instead of at the prompt.
+    ///
+    /// Opens a one-time, loopback-only page and then runs exactly this same
+    /// wizard with the values it gathered — see [`crate::setup_ui`]. Ignored
+    /// under `--non-interactive`, which has no questions to ask.
+    #[arg(long)]
+    pub ui: bool,
 }
 
 impl SetupArgs {
@@ -85,6 +92,14 @@ impl SetupArgs {
             config_out: dir.join("coord.toml"),
             db: Some(format!("sqlite:{url_dir}/coord.db?mode=rwc")),
             blobs: Some(dir.join("blobs").display().to_string()),
+            // A double-click gets the browser wizard. That is the whole point of
+            // W2: the person doing this is an IT administrator who was handed an
+            // executable, and a terminal full of prompts is what they should not
+            // have to meet. `chapr-coord setup` still gives the prompts, so the
+            // rule is discoverable without a flag to turn anything off:
+            // double-click → browser, named subcommand → terminal, `--ui` →
+            // browser on purpose.
+            ui: true,
             ..Default::default()
         }
     }
@@ -146,7 +161,13 @@ fn config_from_args(args: &SetupArgs) -> Config {
     cfg
 }
 
-pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>> {
+    // No `--ui` branch here, deliberately. The browser front end calls *this*
+    // function, so a redirect the other way would make the two mutually
+    // recursive — and a recursive `async fn` whose other arm owns an HTTP server
+    // has a future that can never be `Send`, which stops the wizard's own handler
+    // from being a valid axum handler. The front end is chosen in `main`, which
+    // is where a choice between front ends belongs.
     println!("── Chaperone coordination service — setup ──\n");
 
     // Said up front, not discovered at the service-registration step. Reaching
@@ -279,7 +300,14 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
              so anyone who can read these directories can read that history."
         );
     }
-    Ok(())
+    // Returned rather than dropped: the browser front end renders the same
+    // handover from these values, and re-reading them from a directory setup has
+    // just hardened is a failure that does not need to exist.
+    Ok(Applied {
+        cfg,
+        admin_token: token,
+        endpoint_token,
+    })
 }
 
 fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>> {
@@ -860,14 +888,16 @@ fn best_effort_self_test(cfg: &Config) {
         return;
     }
     std::thread::sleep(Duration::from_millis(500));
-    match http_healthz(&cfg.addr) {
+    match probe_healthz(&cfg.addr) {
         Ok(true) => println!("Self-test: /healthz OK ✔"),
         Ok(false) => println!("Self-test: coord reachable but /healthz not OK yet — check the logs"),
         Err(e) => println!("Self-test: could not reach coord ({e}) — check the service status"),
     }
 }
 
-fn http_healthz(addr: &str) -> Result<bool, String> {
+/// Also used by `chapr-coord status`, which asks the same question of a running
+/// install that setup asks of a fresh one.
+pub(crate) fn probe_healthz(addr: &str) -> Result<bool, String> {
     let sa: SocketAddr = addr.parse().map_err(|e| format!("{e}"))?;
     let mut stream =
         TcpStream::connect_timeout(&sa, Duration::from_secs(2)).map_err(|e| format!("{e}"))?;
@@ -903,6 +933,250 @@ fn print_manual_start(config_path: &Path) {
 /// change necessary was a *wrong line in this text*, shipped and unnoticed
 /// because nothing could read it back. `handover_never_advertises_a_bind_address`
 /// is the test that could not exist while this function only called `println!`.
+/// The `mcpServers` block an MCP host can take directly, as pretty JSON.
+///
+/// ## Why this exists at all
+///
+/// The endpoint bundle ships **no defaults** — a default only ever reaches a
+/// first-time installer, so a wrong one is inherited invisibly by everyone who
+/// upgrades. That makes the values something an administrator has to distribute,
+/// and distribution by retyping is where a root typo'd as `charptest` came from.
+/// This is the same three values, in a form nothing has to retype.
+///
+/// ## The one field coord cannot know
+///
+/// `command` is the path to `chapr-endpoint` **on the user's machine**, and coord
+/// has never seen it. An MCPB bundle fills it itself (`${__dirname}/server/…`);
+/// a bare-binary install needs a real path. So it is emitted as a marked
+/// placeholder rather than a guess — a plausible-looking wrong path is worse than
+/// an obvious hole, which is the whole lesson of the defaults.
+///
+/// Contains the deployment token when auth is enforced. That is the point of the
+/// block and also its hazard: it is a credential, and it is now in a file or a
+/// clipboard. The caller says so out loud.
+pub(crate) fn mcp_servers_block(cfg: &Config, endpoint_token: Option<&str>) -> String {
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "CHAPR_COORD_URL".into(),
+        serde_json::Value::String(cfg.advertised_url()),
+    );
+    // When auth enforces and no token is present, the field is emitted as a
+    // visible hole rather than omitted. Omitting it produces a block that
+    // installs cleanly and then 401s on every call — a silent wrong answer,
+    // which is the failure mode the no-defaults rule exists to prevent.
+    match (endpoint_token, cfg.auth.as_str()) {
+        (Some(t), _) => {
+            env.insert(
+                "CHAPR_COORD_TOKEN".into(),
+                serde_json::Value::String(t.to_string()),
+            );
+        }
+        (None, "shared-secret") => {
+            env.insert(
+                "CHAPR_COORD_TOKEN".into(),
+                serde_json::Value::String(
+                    "<MISSING — this coordinator enforces auth and has no token file>".into(),
+                ),
+            );
+        }
+        // Genuinely not needed: an auth mode that authenticates nobody has no
+        // token to present, and inventing a field would imply otherwise.
+        (None, _) => {}
+    }
+    // Emitted even when unset, so the field is visibly *there to fill* rather
+    // than absent and forgotten — an unconfined endpoint is a deliberate choice,
+    // not a missing line.
+    env.insert(
+        "CHAPR_ROOT".into(),
+        serde_json::Value::String(
+            cfg.share_unc
+                .clone()
+                .unwrap_or_else(|| "<the share path, as UNC — setup recorded none>".to_string()),
+        ),
+    );
+
+    let block = serde_json::json!({
+        "mcpServers": {
+            "chaperone": {
+                "command": "<full path to chapr-endpoint on the user's machine>",
+                "args": [],
+                "env": serde_json::Value::Object(env),
+            }
+        }
+    });
+    serde_json::to_string_pretty(&block).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+/// What an applied setup produced, returned so a non-console caller can render
+/// the handover without going back to disk.
+///
+/// Going back to disk is not a theoretical problem: setup **hardens the data
+/// directory** before it finishes, and the config usually lives inside it, so an
+/// unelevated run cannot re-read the file it just wrote. The wizard's first
+/// version did exactly that and reported "the written config could not be
+/// re-read" on a run that had otherwise fully succeeded. Every value needed is
+/// already in hand at that point; passing it back removes the failure mode
+/// rather than handling it.
+pub struct Applied {
+    pub cfg: Config,
+    /// The admin token and where it is kept, or why neither exists.
+    pub admin_token: Result<(String, std::path::PathBuf), String>,
+    pub endpoint_token: Option<String>,
+}
+
+/// The handover as a string, from what setup already has in memory.
+pub(crate) fn handover_from(applied: &Applied) -> String {
+    let mut s = endpoint_snippet(
+        &applied.cfg,
+        applied
+            .admin_token
+            .as_ref()
+            .map(|(t, p)| (t.as_str(), p.as_path())),
+        applied.endpoint_token.as_deref(),
+    );
+    s.push_str("\n── Or paste this into the host's MCP config ──\n");
+    s.push_str("Fill in `command`; coord cannot know where the endpoint lives on a user's machine.\n\n");
+    s.push_str(&mcp_servers_block(
+        &applied.cfg,
+        applied.endpoint_token.as_deref(),
+    ));
+    s.push('\n');
+    s
+}
+
+/// `chapr-coord handover` — reprint what an administrator has to distribute.
+///
+/// Setup already prints this once. It exists as its own command because that one
+/// printing scrolls away, an install outlives the terminal it was run in, and the
+/// values are needed again every time a laptop is added — at which point the
+/// alternative is reading the token out of the data directory by hand and
+/// reconstructing the rest from memory.
+///
+/// Reads, never writes: no token is created here. A missing endpoint token is
+/// reported rather than minted, because minting one at handover time would be
+/// indistinguishable from rotating the deployment's credential.
+pub fn handover(
+    config: Option<&Path>,
+    out: Option<&Path>,
+    json_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = Config::load(config)?;
+    let dir = cfg.data_dir();
+
+    // `path_in` + read, not `load_or_create`: see the note above.
+    let endpoint_token = dir.as_deref().and_then(|d| {
+        std::fs::read_to_string(crate::endpoint_token::path_in(d))
+            .ok()
+            .map(|s| s.trim().to_string())
+    });
+    let admin = match dir.as_deref() {
+        Some(d) => std::fs::read_to_string(crate::admin_token::path_in(d))
+            .map(|s| (s.trim().to_string(), crate::admin_token::path_in(d)))
+            .map_err(|e| format!("could not read the admin token: {e}")),
+        None => Err("no data directory (an in-memory database?), so no admin token".to_string()),
+    };
+
+    let block = mcp_servers_block(&cfg, endpoint_token.as_deref());
+    let prose = endpoint_snippet(
+        &cfg,
+        admin.as_ref().map(|(t, p)| (t.as_str(), p.as_path())),
+        endpoint_token.as_deref(),
+    );
+
+    if json_only {
+        // D-035's discipline: the machine-readable thing to stdout alone, so
+        // `handover --json > .mcp.json` is a usable file, and everything a human
+        // needs to read on stderr beside it.
+        eprint!("{prose}");
+        println!("{block}");
+    } else {
+        print!("{prose}");
+        println!(
+            "\n── Or paste this into the host's MCP config ──\n\
+             Fill in `command`; coord cannot know where the endpoint lives on a user's\n\
+             machine. An .mcpb bundle sets it itself.\n\n{block}"
+        );
+    }
+
+    if let Some(path) = out {
+        std::fs::write(path, format!("{block}\n"))?;
+        // Restricting it is best-effort and its failure is reported, not
+        // swallowed: the file holds the deployment token, and an operator who
+        // thinks it was locked down when it was not is worse off than one who
+        // knows it is readable.
+        let restricted = restrict_handover_file(path);
+        eprintln!("\nWrote {} — it contains the deployment token.", path.display());
+        match restricted {
+            Ok(()) => eprintln!(
+                "  Readable only by you and by administrators. Delete it once distributed."
+            ),
+            Err(e) => eprintln!(
+                "  ! Could not restrict its permissions ({e}).\n  \
+                   Anyone who can read that path can read the token. Move it somewhere\n  \
+                   only administrators can reach, or delete it once distributed."
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Lock a written handover file down to its creator and administrators.
+///
+/// **Not** [`restrict_dir`], and the difference matters: that one grants
+/// Administrators and SYSTEM, which is right for a data directory a service
+/// account owns — and wrong here, because it locked the file against the very
+/// operator who asked for it. A handover file exists to be *distributed*; one its
+/// author cannot read is not a safer file, it is a broken feature.
+///
+/// The creator is named from the environment. That is the same ambient-identity
+/// assumption E-023/D-024 already make for the acting principal, so it introduces
+/// no new trust; if the variables are absent the grant is skipped and the caller
+/// is told the permissions could not be set.
+#[cfg(windows)]
+fn restrict_handover_file(path: &Path) -> Result<(), String> {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!("{d}\\{u}"),
+        (_, Ok(u)) if !u.is_empty() => u,
+        _ => return Err("could not determine the current user from the environment".into()),
+    };
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("{user}:F"),
+            "/grant:r",
+            // Administrators by SID, not by name: the group is localised, and
+            // this codebase has already been bitten by Danish Windows.
+            "*S-1-5-32-544:F",
+        ])
+        .output()
+        .map_err(|e| format!("running icacls: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "icacls exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn restrict_handover_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    // 0600: the creator only. A group grant would be guesswork here — unlike the
+    // data directory, whose group is the service account's by construction.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("setting mode 0600: {e}"))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn restrict_handover_file(_path: &Path) -> Result<(), String> {
+    Err("no file-restriction mechanism is implemented for this platform".into())
+}
+
 fn endpoint_snippet(
     cfg: &Config,
     token: Result<(&str, &Path), &String>,
@@ -965,9 +1239,13 @@ fn endpoint_snippet(
         ("shared-secret", None) => {
             let _ = write!(
                 s,
-                "  ! auth is \"shared-secret\" but no endpoint token could be created.\n    \
-                 This coordinator will refuse every endpoint. Fix the data directory's\n    \
-                 permissions and restart, or set auth = \"trusted-header\".\n"
+                // "is not present", not "could not be created": this snippet is
+                // printed by `handover` too, which only ever reads. A message
+                // that names an action the caller did not take sends the reader
+                // looking for a failure that did not happen.
+                "  ! auth is \"shared-secret\" but no endpoint token is present.\n    \
+                 This coordinator will refuse every endpoint. Check the data directory's\n    \
+                 permissions and restart setup, or set auth = \"trusted-header\".\n"
             );
         }
         _ => {

@@ -22,7 +22,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-const SERVICE_NAME: &str = "chapr-coord";
+pub(crate) const SERVICE_NAME: &str = "chapr-coord";
 const SERVICE_DISPLAY: &str = "Chaperone coordination service";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 /// The config path is handed to the SCM-launched service main via this env var
