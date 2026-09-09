@@ -126,11 +126,11 @@ Three properties that make it useful vs. a file that gets abandoned:
 
 | Document | Holds |
 |---|---|
-| `logbook/decisions/architecture.md` | 23 decision bodies — data model, protocol, read/write path, backends, invariants, coord internals |
+| `logbook/decisions/architecture.md` | 24 decision bodies — data model, protocol, read/write path, backends, invariants, coord internals |
 | `logbook/decisions/deployment.md` | 12 decision bodies — installer, service, packaging, releases, auth, admin authority, hosting |
 | `logbook/decisions/process.md` | 6 decision bodies — naming, licensing, repo posture, publication, agent/plugin behaviour |
 | `logbook/decisions/product.md` | 4 decision bodies — product scope, positioning, market boundaries (new 2026-08-21, D-037) |
-| `logbook/logs/2026-09.md` | 2 session entries (09-08, 09-07) |
+| `logbook/logs/2026-09.md` | 3 session entries (09-09a, 09-08, 09-07) |
 | `logbook/logs/2026-08.md` | 9 session entries (08-03 … 08-28) |
 | `logbook/logs/2026-07.md` | 18 session entries (07-21 … 07-22) |
 | `logbook/ISSUES.md` | all 16 issues in full, live and resolved |
@@ -147,222 +147,150 @@ Three properties that make it useful vs. a file that gets abandoned:
 
 **Phase:** implementation — v1 complete, installed at a customer, pilot-tested on
 real hardware (2026-08-14), phase 1 of the 0.2 plan delivered (2026-08-21) and
-corrected (2026-08-25), **Phase A "Truth" delivered (2026-09-07)**, and **Phase B's
-correctness core now four items in — B0, B1, B2, B8 (2026-09-08) and B3
-(2026-09-09)**. Multi-backend (SMB + POSIX); Windows, Linux and macOS all run the
-suite in CI.
+corrected (2026-08-25), **Phase A "Truth" (2026-09-07)**, **Phase B's correctness
+core B0/B1/B2/B8 (2026-09-08) and B3 (2026-09-09)**, and **the cowork-findings
+slice (2026-09-09, D-047)**. Multi-backend (SMB + POSIX); Windows, Linux and macOS
+all run the suite in CI.
 
-**Version `0.1.3`** (set by jok 2026-08-25), tagged `v0.1.3`. **No bump this
-session** — it stays 0.1.x until it is tested and true; the minor number is a claim
-about proven-ness, not a changelog of effort. Versioning is a human
+**Version `0.1.4`, set by jok 2026-09-09 — the tag is not pushed.** A patch bump
+again, deliberately, even though `chapr_restore` gains a required argument: it
+stays 0.1.x until it is tested and true, and the minor number is a claim about
+proven-ness rather than a changelog of effort. Versioning is a human
 responsibility; never fill in a bump.
 
-**Status:** three crates build clean; **420** tests pass (was 396); clippy
-`-D warnings` clean. **32** coord routes (was 29 — B3 added `/move/open`,
-`/move/clear`, `GET /move/dangling`) + the **11-tool** MCP surface (unchanged),
-plus the six-tab token-gated admin page. MSRV **1.88.0**. `cargo fmt` still drifts
-and remains jok's call.
+**Status:** three crates build clean; **440** tests pass (was 420); clippy
+`-D warnings` clean. **12** tools (was 11 — `chapr_mkdir`) against **32** coord
+routes, plus the six-tab token-gated admin page whose Audit tab now searches by
+path and detail. MSRV **1.88.0**. `cargo fmt` still drifts and remains jok's call.
+*Counts re-measured 2026-09-09 by grepping `#[tool(` and `.route(`; both moved
+this session, so do not carry them forward unread — that is what I-004 is for.*
 
-**CI run #16 is green, and it is the first run that executed anything since #14.**
-7 jobs on `fdbc2f8`, all success. Run **#15** on `074ab82` was a *failed run with no
-jobs* — `ci.yml` was invalid YAML (`run: net use Z: %SMOKE_DIR%`; a plain scalar
-cannot hold a colon-space), fixed in `107f844`. **All four changes that had never
-run anywhere are now proven:**
+**⚠ What has NOT been driven against a real share.** The whole cowork slice is
+verified by the unit suite, wiremock, and a live *local* coordinator — **not** by
+the rig. CI run **#16 on `fdbc2f8` was green across 7 jobs** and predates all of
+it. The plan's verification walkthrough is owed: rebuild the rig bundle *without*
+defaults, revert the `clean-share` checkpoint, and confirm the four
+misconfiguration states are distinguishable from the tool surface alone.
 
-- **B8's exit-code split, in both directions and on real infrastructure.** The
-  self-test step exited 0 on every leg that runs it. On the **smb** leg it ran
-  against `Z:\`, so E-022's mapped-drive check *verified* rather than reporting
-  `Unverified` — which would have exited 1 and turned the step red. On the two
-  **POSIX** legs the mandatory-lock check is `NotApplicable` and does not count, so
-  they exit 0 rather than going red. Had the two classifications been swapped
-  either way, this run would have failed.
-- **The `net use Z:` step ran** (step 14, smb leg) and is correctly `skipped` on
-  both POSIX legs by its `if: matrix.backend == 'smb'`.
-- **B3's `/move/open` is exercised against a real SMB share.** The smoke suite
-  named *"lifecycle, CAS conflict, sidecar, history, restore, **move**"* passed on
-  all three e2e legs. Every move now opens a move-intent first, and a route
-  registered or called under a different path would 404 into the
-  "older coordinator" refusal and take the step red. It did not.
-- **Invariant 3 keeps its automated evidence:** `mandatory_lock_check` is
-  `#[cfg(windows)]`, so on the smb leg it compiles in and can only pass or fail.
+**The cowork sessions' lesson, which is worth more than the fixes.** Driving all
+the tools against the rig showed **the engine behaving and not explaining
+itself**: every "works well" finding was boundary behaviour (fail-closed on a bad
+root, no damage after five failed operations, CAS under a real stale write,
+drive-letter resolution), and every failure was an explanation behaviour. jok's
+severity principle governs the order — **how long a user believes they are the
+problem**, not how broken a feature is. Configuration opacity consumed most of a
+session; the missing `mkdir` cost two tool calls.
 
-*Verified from step conclusions, i.e. exit codes — which is exactly what B8
-changed. The job **logs** need authentication (403 unauthenticated), so the
-self-test's printed counts are not readable from here; do not restate them as
-though they were.*
+**Restore can no longer overwrite what nobody read (Q13 CLOSED as option (a)).**
+It performed **no CAS at all**, by design — "a restore is a deliberate overwrite"
+— so an agent could destroy current content it had never seen. It now requires
+the caller to state what it observed (a version, or `absent`) and checks that
+under the exclusive handle. **A soft-deleted target plus `absent` recreates the
+file at its original name**, so `chapr_delete`'s promise of recoverability is kept
+in practice and not only technically. Concept §6.5 always described the full write
+path; spec and code now agree, in the spec's favour.
 
-**A number corrected while checking: it was never "five legs".** The self-test
-runs only in the three **e2e** jobs; the other four (ubuntu, windows, macos, MSRV)
-build, test and clippy and never invoke it. The 2026-09-08 entry and this file both
-said "all five CI legs", which was wrong when written — precisely the class of
-claim I-013 exists to catch.
+**`chapr_mkdir` exists, and its guard is deterministic on purpose.** The tool
+compares, never the model: normalise (case, separators, punctuation), then
+Damerau-Levenshtein within a length-scaled budget, refuse naming the candidates,
+`confirm_new` overrides and is audited. **Numbered siblings are exempt** — `2026`
+and `2027` are one edit apart and both deliberate, and a guard that refuses the
+second year of a deployment gets switched off, taking the typo protection with it.
+Parents are never created implicitly.
 
-**The 2026-09-08 session spent a day uncommitted, and the record said otherwise.**
-Current State claimed its CI-bound changes were "committed but unproven"; they were
-not committed at all, and GitHub's newest run was still **#14 on `cf25082`**.
-Nothing was lost — verified at 396 tests before committing — but for a day the
-project's newest correctness work had no copy anywhere. **`git status` now belongs
-in the session-end protocol, beside the logbook write.**
+**Every refusal is now audited, reads included**, as `AuditKind::Refused` with the
+cause as a greppable `refused[reason]` prefix in `detail`. Transport failures are
+excluded deliberately: a coordinator outage would write one row per read in a
+read-heavy workload, and it is not a decision anyone made. **Note for C4/Q4:
+§12's retention was sized before refusals existed.**
+
+**Two packaging failures were mine, found by handing jok a bundle.** "NOTE to
+packager" text rendered verbatim in his install dialog, and pre-filled defaults
+hid a stale stored value — a root typo'd as `charptest` survived several edits and
+a new build, because stored `user_config` is keyed by extension rather than
+version, so a *corrected* default never reaches an existing install. The template
+now ships **no defaults** and requires the root. **The binary stays permissive**
+and should: D-035(3) ships the bare executable for every OS, and one that refused
+to start until configured would be unusable for a Claude Code user.
 
 **B3 landed, so D-013's "stale-but-recoverable" is now true (D-046).** A
-`move_journal` row records the rename's intent beforehand, carrying everything the
-migration needs because whoever finishes it is usually not the session that started
-it. **`move_paths` deletes that row inside its own transaction** — the whole design
-rests on this: a surviving row *proves* the migration did not commit, so completion
-is exactly-once with no idempotency logic. `moverecover.rs` resolves them at
-endpoint start-up: `src` gone and `dst` hashing to the recorded version → complete;
-`src` still there → drop it, nothing happened; neither, or a `dst` written since →
-**leave it and say why**, because completing then would record a version the file no
-longer has. Verified against a live coordinator, not only wiremock; three guards
-mutation-checked.
+`move_journal` row records the rename's intent beforehand; **`move_paths` deletes
+that row inside its own transaction**, which is the whole design — a surviving row
+*proves* the migration did not commit, so completion is exactly-once with no
+idempotency logic. `moverecover.rs` resolves them at endpoint start-up: complete,
+abandon, or leave it and say why.
 
 **A constraint that outlives B3: `db::migrate` is `CREATE TABLE IF NOT EXISTS` and
-nothing else.** A new *table* reaches a database that already exists; a new *column*
-is **silently skipped**, after which an endpoint queries a column the live
-coordinator lacks. B3 needed a column on `journal`, could not have one, and used a
-separate table — which the record wanted anyway. **The next change that genuinely
-needs a column must land C0 first**, so C0 is no longer only Phase C's
-prerequisite. Its priority is raised on the board.
+nothing else.** A new *table* reaches an existing database; a new *column* is
+**silently skipped**, after which an endpoint queries a column the live
+coordinator lacks. **C0 is therefore blocking two things**: move provenance in
+history (2.4, where jok chose real columns over a side table) and the coord update
+path in W2.
 
-**Deployment ordering rule, new: update coord before endpoints.** A new endpoint
-against an older coordinator gets 404 on `/move/open` and refuses the move —
-fail-closed, because skipping the intent would restore the unrecoverable window
-while reporting success. The 404 is translated into an error naming that cause and
-that fix.
+**Next up is the coord setup epic (W2), as one piece of work (jok).** GUI wizard,
+`uninstall`, `status`, and the **handover output** — coord printing the endpoint
+values IT must distribute, which the no-defaults rule makes a prerequisite rather
+than a nicety. Update is backlogged behind C0. **Correction carried forward:**
+`setup` already installs an auto-start Windows service (`setup.rs:833`), so the
+fragility jok hit on the rig was my telling him to run `chapr-coord serve` in a
+terminal.
 
-**D-044's one unmeasured input is now measurable, and the measurement is owed.**
-`rmcp` 2.2 does surface `_meta` (the service loop swaps it into `RequestContext`
-before the handler runs; `ToolCallContext::new` then discards the params' copy), so
-`traceprobe.rs` logs once per distinct **trace id** — capped at 32, and covering all
-eleven tools via a hand-written `call_tool`. Proven over real stdio: two distinct
-ids reported once each, a repeat id with a different span stayed silent, an absent
-`_meta` reported absence. **What it will tell us:** one line per conversation is a
-conversation id and moves D-044's ceiling; one per tool call is a request id and
-does not; **no line at all means the hook did not run, not a negative.** The
-procedure is `docs/measuring-session-identity.md` and it needs a host, two
-conversations, one application run — **jok's to run.**
+**D-044's `traceparent` probe is in and the measurement is still owed.** `rmcp`
+2.2 surfaces `_meta`; `traceprobe.rs` logs once per distinct trace id, covering
+all tools via a hand-written `call_tool`. Proven over real stdio. **One line per
+conversation would make it a conversation id; one per tool call makes it a request
+id; no line at all means the hook did not run.** Procedure:
+`docs/measuring-session-identity.md`.
 
-**There is a local test rig, and it remains the most reusable output of last week.**
-A Hyper-V VM **`CHAPR-FS`** (Windows Server 2022) on an **Internal** switch:
-no physical NIC bound, **no default gateway on either side**, `192.168.221.0/24`
-(chosen not to collide with corp `172.16.43.0/24` or Hyper-V's NAT
-`172.19.176.0/20`). Reachable only from this workstation. **Share on `D:`,
-coordinator's db/blobs/audit on `C:`** — jok's correction, mirroring the pilot, and
-it converts **I-009**'s mitigation from behavioural to structural because there is
-no `..\..` path from `D:\` to `C:\`. Auth is a stored credential
-(`cmdkey /add:CHAPR-FS`), because the VM is a workgroup member with **no Kerberos
-realm** — which is itself one of the postures the product must handle. **Revert the
-`clean-share` checkpoint before using it.**
+**Read-path refusals still come in two kinds (D-039, I-015)** — a *container*
+refused by magic bytes with advice naming what to read instead, and *non-UTF-8
+text* refused as a different thing, naming the encoding and the human remedy.
+Chaperone coordinates files; it does not convert encodings or extract text
+(E-028). The classifier chooses **a message, never an outcome**.
+
+**Before touching the write path,** read the behaviour notes in
+`logbook/state-history.md` (2026-08-05): SQLite runs in **WAL** (10 s busy
+timeout); coord `PUT /blobs` is bounded at **256 MiB**, which is also the largest
+file Chaperone can write at all; `put_blob` runs **before** `journal_open`.
 
 **Three test environments, three jobs, none replacing another (D-045).**
 **CI** — every push, three OSes, regression; loopback share, no realm, no latency.
-**Local rig** — rapid development, install process, file integrity, kill-mid-write,
-mapped drives; zero RTT, no realm. **Azure VM fileserver** (demo tenant, available,
-not yet used) — the **auth path** (Kerberos/Negotiate/OIDC) and **timing under real
-network latency**, which nothing else covers. **E-015 is therefore no longer blocked
-on environment, only on priority.**
-
-**What Phase B closed earlier, and what it cost.** **I-007 is RESOLVED** — the last
-invariant-4 violation. The rename runs through the handle held since the source's
-CAS (`SetFileInformationByHandle(FileRenameInfo)` + `DELETE` in the access mask, the
-method D-027 settled empirically); the bug was a single `drop`. **The two-path
-`FsPrimitives::rename` was deleted**, with `winfs::move_file` and `posixfs::rename`,
-because it can only be reached by closing the handle first — renaming is now a
-method on the *held file*, so the safe order is the only expressible one.
-**`move_cas_core` went from zero tests to eight**, plus five Win32 tests, and the
-`DELETE` addition is **mutation-checked**.
-
-**B8: the self-test's exit code no longer contradicts its own output.**
-`Report::finish()` returned `failed` only, so a run that verified almost nothing
-exited 0 while *printing* D-032's SKIP-is-not-PASS rule. `Skip` split into
-**`Unverified`** (applies here, did not run → **counts**) and **`NotApplicable`**
-(cannot apply to this backend → does not). Demonstrated on identical
-infrastructure: `CHAPR_SELFTEST_DIR` as UNC → `8 passed, 1 unverified`, **exit 1**;
-as `Z:\` → `9 passed`, **exit 0**.
-
-**E-022 is fully verified and its live `HIGH` row is retired.** `Z:\` resolved to
-`\\CHAPR-FS\chaprtest\` through the real `WNetGetUniversalNameW` against a real
-server — the first execution of that branch outside a fake table, and the whole
-write path was then exercised through the letter. Covered permanently by an opt-in
-`#[ignore]`d test (`CHAPR_TEST_MAPPED_DRIVE`) and by CI, which now maps a drive.
-
-**Invariant 3 is now measured off-box.** `exclusive open is honoured by the server`
-passed against a **remote** Windows Server 2022, not only the 2026-08-14 pilot and
-CI's loopback share. B0's Windows e2e leg is green (run #14, `cf25082`) — all five
-scenarios, and its lock check is `#[cfg(windows)]` so it cannot have skipped.
-
-**I-016 is the open finding, and it has teeth (B4 / Q11).** An **overwrite-move**
-runs `DELETE FROM version_log / journal / conflicts WHERE path = src`. Open
-conflicts become **orphaned** — every reader needs the row, nothing scans for stray
-sidecars, so the loser's bytes survive as a file no query can reach and no
-`resolve_conflict` can name. And because `gc.rs` derives retention **solely** from
-`version_log`, the source's history blobs fall out of every retention set and are
-**permanently reclaimed**. *"src is consumed"* is true of the name, not of the
-content that just moved to `dst`. **Not fixed — it needs jok's semantics call.**
-
-**Q6 is settled and the answer is a limit, not a feature (D-044).** MCP gives a
-stdio server **nothing** that identifies a conversation — `transport/io.rs` has zero
-session references, `rmcp::SessionId` is a server-minted UUID for an HTTP header,
-and `Meta`'s eight reserved keys contain no conversation id. Desktop multiplexes
-every conversation over one process, so `sess-{pid}` spans an application run.
-Accepted as the ceiling; the concept gets **renamed** to stop overclaiming. The
-`traceparent` probe D-044 asked for now exists (above) — the code is in, the run
-is owed.
-**Consequence: Phase C can deliver a verifiable record that still cannot say which
-agent acted** — only which endpoint run did.
-
-**D-037 amended 2026-09-08 (jok): the criterion is classical fileserver
-semantics, not geography.** What Chaperone depends on is a mandatory lock, ACLs
-that survive, and an identity-preserving rename — properties of the *server*, not
-its location. A cloud-**hosted** Windows fileserver is inside the line; a
-cloud-**native** object store is outside it. **V3-cloud stays OUT**, reaffirmed.
-The line does not move; the 2027-02-21 review question gets better: *"has anyone
-built agent coordination for classical fileserver semantics?"*
-
-**Read-path refusals still come in two kinds (D-039, I-015)** — a *container* (PDF,
-Office, image, archive) refused by magic bytes with advice naming what to read
-instead, and *non-UTF-8 text* refused as a different thing, naming the encoding and
-the human remedy while a `NON_UTF8_TEXT` warning carries evidence to diagnostics.
-Chaperone coordinates files; it does not convert encodings or extract text (E-028).
-The classifier chooses **a message, never an outcome**.
-
-**Before touching the write path,** read the behaviour notes in
-`logbook/state-history.md` (2026-08-05): SQLite runs in **WAL** (10 s busy timeout);
-coord `PUT /blobs` is bounded at **256 MiB**, which is also the largest file
-Chaperone can write at all; `put_blob` runs **before** `journal_open`.
+**Local rig** (`CHAPR-FS`, Hyper-V, Server 2022, Internal switch, share on `D:`
+and coord state on `C:`) — rapid development, install process, file integrity, at
+zero RTT in a workgroup with **no Kerberos realm**. **Azure VM fileserver** (demo
+tenant, available, unused) — the **auth path** and **timing under real network
+latency**, which nothing else covers. **E-015 is blocked only on priority.**
 
 **Known and accepted (not a bug):** after setup hardens the data directory, an
-**unelevated** `chapr-coord serve --config <that file>` cannot read its own config.
-The real deployment runs as a service account with access.
+**unelevated** `chapr-coord serve --config <that file>` cannot read its own
+config. The real deployment runs as a service account with access.
 
 **Environment:** a Linux toolchain exists in WSL, building with an isolated
 `CARGO_TARGET_DIR=$HOME/chapr-target` so the Windows `target/` is never clobbered.
-**jok pushes** — the SSH key is passphrase-protected *by design*, not broken. But
-**`api.github.com` is readable unauthenticated for a public repo**, so CI results
-*are* reachable from here; last session recorded them as unknowable and that was an
-untested assumption.
-
+**jok pushes** — the SSH key is passphrase-protected *by design*. `api.github.com`
+is readable unauthenticated for a public repo, so CI results are reachable from
+here; **job logs are not** (403), so step conclusions are the available evidence.
+A YAML parser (`js-yaml` under node) validates the workflows locally, which is how
+run #15's invalid `ci.yml` should have been caught before the push.
 
 **What's next:**
-1. **B6 — the verb-uniformity sweep — is the top item, and nothing is waiting on a
-   push.** Phase B's other items all have CI behind them as of run #16 (B0, B1, B2,
-   B8, B3). The sweep: `create` alone skips the `~$F` preflight, `restore(copy)`
-   takes no lease or path lock, `delete`/`move` return `Conflict` with
-   `sidecar_path` pointing at the file itself and create **no** sidecar. Part
-   decision, part fix — findings first, then jok picks which are design.
-2. **C0 has a raised claim on attention** — not for Phase C's sake but because
-   `CREATE TABLE IF NOT EXISTS` is now a known constraint on every schema change,
-   and the next one needing a column cannot work around it the way B3 did.
-3. **I-016 needs jok's semantics call** before B4 can be built; **Q13** before B5.
-4. **Owed and cheap: run the `traceparent` measurement.** The code and the
-   procedure exist (`docs/measuring-session-identity.md`); it needs a host, two
-   conversations in one application run, and the log lines pasted back.
-5. **Phase C** stays gated on Q4; **Phase D** is the cheapest phase and partly
-   delivered.
+1. **W2, the coord setup epic** — wizard, uninstall, status, handover. The
+   handover is the load-bearing part: no-defaults means an installer must be told
+   the URL and the share path, and coord is the only thing holding all three
+   values.
+2. **The rig walkthrough for W1**, per the plan's verification section. Nothing in
+   the cowork slice has met a real share.
+3. **C0** — now blocking move provenance (2.4) and W2's update path, not only
+   Phase C.
+4. **I-016 needs jok's semantics call** before B4; **B7**'s three scenarios need a
+   fault-injecting proxy that does not exist.
+5. **Owed and cheap:** run the `traceparent` measurement; answer whether
+   uninstalling an MCPB clears stored `user_config` — if it does not,
+   "uninstall and reinstall" is not a recovery path we can offer.
 
 Deferred engineering (E-015, E-020, E-021, E-024b, E-028, V3-cloud) →
-`logbook/BACKLOG.md`. **E-022 is no longer on that list.** Note **E-021 ↔ V3-cloud
-is still circular as written** and wants untangling.
+`logbook/BACKLOG.md`. Note **E-021 ↔ V3-cloud is still circular as written** and
+wants untangling.
 
 ---
 
@@ -382,8 +310,8 @@ is still circular as written** and wants untangling.
 > **Index only** — one row per decision, most recent first. Bodies are in
 > `logbook/decisions/<theme>.md`; click an ID to jump to its entry.
 > **Threshold raised 8000 → 12000 by jok, 2026-09-07** (reasoning in the YAML).
-> The section is at **9088 bytes across 45 rows** — re-measured 2026-09-09, not
-> carried over — so there is room for roughly 20 more decisions before this needs
+> The section is at **9369 bytes across 46 rows** — re-measured 2026-09-09, not
+> carried over — so there is room for roughly 19 more decisions before this needs
 > another call. Re-measure rather than trusting that number; it has gone stale
 > three times, which is I-013's whole point.
 >
@@ -396,12 +324,13 @@ is still circular as written** and wants untangling.
 > `sections.decision_log.themes` in the YAML), then add one row here.
 > Never delete a row — mark `SUPERSEDED-BY-D-NNN` or `INVALIDATED`.
 >
-> **`D-009` was never issued.** D-001…D-008, D-010…D-046; nothing was deleted or
+> **`D-009` was never issued.** D-001…D-008, D-010…D-047; nothing was deleted or
 > retracted, so stop looking for it. (Recorded 2026-09-07 with the D-038 dedupe —
 > see that session's entry.)
 
 | ID | Decision | Date | Theme | Status |
 |----|----------|------|-------|--------|
+| [D-047](logbook/decisions/architecture.md#d-047) | The cowork-findings slice: **Q13 closed as (a)** so restore cannot overwrite unseen content; `chapr_mkdir` with a deterministic near-name guard; every refusal audited; B6 pulled in whole | 2026-09-09 | architecture | CURRENT |
 | [D-046](logbook/decisions/architecture.md#d-046) | The move journal is a separate table (a column cannot reach the live install until C0); interrupted moves are swept at start-up, not served from a read | 2026-09-09 | architecture | CURRENT |
 | [D-045](logbook/decisions/process.md#d-045) | Three test environments with separate jobs; an UNVERIFIED self-test check exits non-zero | 2026-09-08 | process | CURRENT |
 | [D-044](logbook/decisions/architecture.md#d-044) | Session identity is per endpoint *run*, not per conversation — MCP offers no alternative | 2026-09-08 | architecture | CURRENT |
@@ -462,7 +391,7 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 >
 > `/logbook end`: **move the entry below into its month file first**, then write
 > the new one here. Threshold: 10000; the section sits just inside it as of
-> 2026-09-09 at 9234 bytes, re-measured after run #16 was recorded.
+> 2026-09-09 at 8453 bytes, re-measured after the cowork-slice entry.
 > **Take the ~9 KB ceiling on a single entry literally**: it is the real limit,
 > and prose that feels essential while writing is usually already in a decision
 > body or a commit message. Headroom is thin by design — the entry here is
@@ -470,42 +399,40 @@ entries carried no `**Status:**` line. They all do, and did. Only **D-001** and
 
 | Month | Entries |
 |---|---|
-| `logbook/logs/2026-09.md` | 2 — 2026-09-08, 2026-09-07 |
+| `logbook/logs/2026-09.md` | 3 — 2026-09-09a, 2026-09-08, 2026-09-07 |
 | `logbook/logs/2026-08.md` | 9 — 2026-08-28, 08-25, 08-21b, 08-21, 08-19/20, 08-14, 08-06, 08-05, 08-03 |
 | `logbook/logs/2026-07.md` | 18 — 2026-07-22 (a–c), 2026-07-21 (base, b–o) |
 
-### Session 2026-09-09 — jok / Claude
-**Type:** engineering (commit the owed work, the `traceparent` probe, B3)
-**Focus:** jok's call was "1 + 6, then look at 2 and 3". Item 1 turned out to be larger than a chore: the work it was meant to push did not exist in git yet.
+### Session 2026-09-09b — jok / Claude
+**Type:** engineering (the cowork-findings slice, W1) + product decisions
+**Focus:** jok ran two cowork sessions against the rig — a setup session and a happy-path pass over all 11 tools plus 5 refusal paths — and wrote them up. Thirteen findings, every one reproduced in code, then decided interactively and built.
 
 **Worked on:**
-- [x] **The 2026-09-08 session was never committed, and Current State said it was.** It claimed the three CI-bound changes were *"committed but unproven"*; `HEAD` had no `Unverified` in `selftest.rs` and no `net use` in `ci.yml`, and GitHub's newest run was still **#14 on `cf25082`**. B1, B2, B8, E-022's verification, D-044, D-045, I-016 and every logbook entry sat in one uncommitted working tree for a day. Nothing was lost. **Verified before committing — 396 tests, 0 failed, clippy clean, re-measured — then committed as three coherent pieces.** The habit it costs: `git status` belongs in the session-end protocol, beside the logbook write.
-- [x] **The `traceparent` probe (D-044's one unmeasured input), and it works.** `rmcp` 2.2 *does* surface `_meta` — the service loop swaps it into `RequestContext` before the handler runs and `ToolCallContext::new` then discards the params' copy, so `context.meta` is the only place a stdio server can read it. `traceprobe.rs` logs once per distinct **trace id** (keyed on the id, not the header — the span changes per operation by design), with a cap at 32 so a per-request host cannot fill a log. `call_tool` is hand-written so all eleven tools are covered; `#[tool_handler]` only generates it when the impl does not.
-- [x] **Proven over real stdio, not just in tests.** Five `tools/call` requests into the built binary: two distinct trace ids reported once each, a third call reusing a trace id with a different span **stayed silent**, and a call with no `_meta` reported absence. That run also caught two of my own errors — requests are spawned as concurrent tasks so **line order is not call order** (the absence line printed before calls that arrived earlier, and the message no longer says "on the first tool call"), and the absence message contained the exact phrase the other line is grepped by.
-- [x] **`docs/measuring-session-identity.md`** — what the trail can attribute today, the procedure, and a table from each possible log output to its conclusion. Reader-facing per the `docs/`-versus-`specs/` split, and indexed from README. **The measurement itself is owed and is jok's**: it needs a host, two conversations, one application run.
-- [x] **`ci.yml` was left unparseable by B8's own step, jok caught it, and run #16 then came back green.** `run: net use Z: %SMOKE_DIR%` — a plain YAML scalar cannot hold a colon followed by a space, so it broke the *file*, not the step: run **#15** had **`total_count: 0` jobs** and its name showed as `.github/workflows/ci.yml`, the parser never having reached `name:`. Fixed in `107f844` with a block scalar; **#16 is 7/7 green and the first run since #14 to execute anything.** All four previously-unproven changes are proven — details and the exit-code reasoning in Current State. **The claim "only Actions can say whether the workflow is right" was simply false**: `js-yaml` under node found the fault at 264:23 and confirmed the pre-B8 file parsed. Second instance in two sessions of an untested assumption about what cannot be checked from this laptop. **Two numbers corrected on the way:** it was never "five legs" (the self-test runs in the three e2e jobs only), and job **logs need auth** (403), so the self-test's printed counts are not readable here and are not restated.
-- [x] **B3 landed — D-013's "stale-but-recoverable" is now true.** A `move_journal` row records the intent before the rename, carrying everything the migration needs because whoever finishes it is usually not the session that started it. **`move_paths` deletes that row inside its own transaction**, and that ordering is the whole design: a surviving row *proves* the migration did not commit, so completion is exactly-once with no idempotency logic and no state where both exist. `moverecover.rs` resolves them at endpoint start-up — `src` gone and `dst` hashing to the recorded version → complete; `src` still there → drop it, nothing happened; neither, or a `dst` written since → leave it and say why. Fail-closed both ways: a move that cannot record its intent does not touch the file, and a rename that fails clears the intent it opened.
+- [x] **The findings landed as a file first, and two of them needed correcting.** `specs/cowork-findings-0909.md`, merged from both reports under jok's numbering. **§4 was wrong**: leases *are* acquired by every mutating verb (five release sites) — they are invisible because their lifetime is one tool call, which is D-011's own note, so the fix is `chapr_stat`'s description not the field. **1.1's recommended fix already existed** and had not helped: the resolved root is logged at `info`, but stderr is not the tool surface, `instructions` reaches the model rather than the user, a fail-closed start announces nothing, and a *stale* config starts cleanly so there is nothing to log.
+- [x] **Every decision surfaced as a question rather than assumed** (jok's ask). Fourteen forks across four rounds. His answers overrode the roadmap once (**Q13 → option (a)**, where it leant (b)/(c)) and corrected my framing once: I offered "make the binary require a root", and he pointed out that would *"make the ship-exe-and-mcpb solution worthless"* — D-035(3) ships the bare executable, and one that refuses to start until configured is unusable for a Claude Code user. Config belongs after install.
+- [x] **Restore can no longer overwrite what nobody read.** jok's question — *does recreating a deleted file let an agent overwrite something?* — turned out to have a bigger answer than the case he asked about: **restore performed no CAS at all**, by design, so the bazooka already existed. It now requires the caller to state what it saw (a version, or `absent`) and checks it under the exclusive handle. Five outcomes, one test each. A soft-deleted target plus `absent` **recreates the file at its original name**, so `chapr_delete`'s promise of recoverability is kept in practice rather than technically.
+- [x] **`chapr_mkdir`, guarded deterministically.** jok took the tool over the refusal, with the reasoning that manual folder creation is friction and friction pushes work outside Chaperone. His own objection was non-determinism, which the design answers by putting the comparison in the **tool**: normalise, then Damerau-Levenshtein within a length-scaled budget, refuse naming the candidates, `confirm_new` overrides and is audited. **A test caught the failure that would have got it switched off** — `2026` and `2027` are one edit apart and both deliberate, so numbered siblings are exempt.
+- [x] **Every refusal is audited, reads included**, with the reason as a greppable prefix, plus path and detail search on `/admin`'s Audit tab. Transport failures are excluded deliberately: a coordinator outage would write one row per read in a read-heavy workload, and it is not a decision anyone made.
+- [x] **B6 pulled in whole rather than patched**, which was the right call and not obvious. `Conflict` carried only `sidecar_path` — that is *why* `delete` and `move` set it to the live file, since they park nothing and the message had to read correctly. Rewording the string alone would have fixed `write` and broken the other two. Both paths are fields now, and `create` gained the `~$F` preflight (B6a, an omission not design: Word holds `~$F` for an unsaved document).
+- [x] **Two failures were mine, from the bundle I handed jok yesterday.** "NOTE to packager" text rendered verbatim in his install dialog, and I pre-filled defaults so nothing had to be typed — which is exactly what hid a stale stored value. A root typo'd as `charptest` survived several edits and a new build, and that string appears nowhere in the source: stored `user_config` is keyed by extension, not version, so a *corrected* default never reaches anyone who already installed. Template now ships no defaults and requires the root.
 
-**The finding inside B3, and it outlives B3: `db::migrate` is `CREATE TABLE IF NOT EXISTS` and nothing else.** A new *table* appears on a database that already exists; a new *column* is silently skipped, after which the endpoint queries a column the live coordinator does not have. B3 wanted a column on `journal` and could not have one — so it got a separate table, which the record wanted anyway (different fields, and keyed by `src` while the file ends up at `dst`). **The next schema change that genuinely needs a column has no such escape.** C0's priority is raised on the board: it is no longer only Phase C's prerequisite, it is a constraint on every schema change.
+**The withdrawn appendix finding was real, and the lesson generalises.** jok reported the boundary refusal escaping the input path with two backslashes while the root showed one, then withdrew it as unreproducible. It was deterministic and on **every** refusal: `{out:?}` and `{raw:?}` are Debug formatting, which doubles backslashes, while the roots printed through `as_str()`. **"Did not reproduce" on a formatting complaint deserves a look at the format string.** This is the third time this session that an assumption about what could not be checked was simply untested — after "only Actions can validate the workflow" (a YAML parser did it in a second) and yesterday's "CI results are unreachable from this laptop".
 
-**Verified:** **420** tests (from 396), 0 failed; clippy `-D warnings` clean. Three of B3's guards are **mutation-checked** — dropping the in-transaction delete, the `src`-exists branch, and the destination version comparison each fail the test written for them. And B3 was driven **against a live coordinator**, not only wiremock: the three routes answer, the entry round-trips through the wire types, both discharge paths work, the row survives a coord restart, and the startup scan reports it. That last check exists because the unit tests mock each side separately and would not have caught a path-string mismatch between client and router.
+**Verified:** **440** tests (from 431 mid-session, 420 at its start), 0 failed; clippy `-D warnings` clean. **Four guards mutation-checked** — the restore CAS comparison, the near-name check, `create`'s preflight and the parent-missing branch. The `create` preflight is worth noting: removing it left all 216 endpoint tests green, so the test was written *because* the mutation check found nothing. `/admin`'s new filters were driven against a live coordinator, where a `detail_like` of `refused[outside_root]` discriminated between two refusal reasons.
 
-**One deployment consequence, stated because it is easy to get wrong: update coord before endpoints.** A new endpoint against the installed older coordinator gets 404 on `/move/open` and refuses the move — the right direction, since skipping the intent would restore the unrecoverable window while reporting success. The 404 is translated into an error naming that cause and that fix, rather than reporting "HTTP 404 Not Found" on a file operation.
+**State changes:** **v0.1.4**, set by jok — tag not pushed. Tool surface **11 → 12** (`chapr_mkdir`); coord routes **32** (unchanged by this slice); tests 420 → 440. New: `chapr-endpoint/src/nearname.rs`, `ChaprError::{OutsideRoot, ParentMissing, NearDuplicateName}`, `VersionEvent::WriteForced`, `AuditKind::{Refused, DirCreate}`, `EntryType`, `RestoreBase`, `MoveResponse.version`. **Q13 CLOSED.** D-047 written. CHANGELOG restructured so the previously-unreleased Phase A and correctness-core work sits inside 0.1.4 rather than reading as newer than it.
 
-**State changes:** **B3 DONE**; coord routes **29 → 32** (`/move/open`, `/move/clear`, `GET /move/dangling`); tests 396 → 420; new modules `chapr-endpoint/src/traceprobe.rs` and `moverecover.rs`; new coord table `move_journal`; `docs/measuring-session-identity.md` added and indexed from README. **All commits pushed; `ci.yml` was invalid YAML so run #15 ran no jobs, and `107f844` fixed it — run #16 is green across 7 jobs and proves all four previously-unproven changes.** No version change — `0.1.3` stands; versioning is jok's.
+**Open questions:** **13 now** — Q13 closed by jok's restore decision, Q11 still open but no longer blocking anything I built. Still jok's: **Q4** (chain versus erasure, gates C3/C4), **Q11** (I-016, gates B4), **Q1** (5.1 chunked reads). New and small: does uninstalling an MCPB clear stored `user_config`? If not, "uninstall and reinstall" is not a recovery path we can offer anyone.
 
-**Open questions:** unchanged at 15, and none closed today. **Q10 is answered by B3** rather than still gating it. Still jok's: **Q11** (I-016, gates B4), **Q13** (gates B5), **Q4** (gates C3/C4), **Q1**. The `traceparent` question is now *runnable* rather than open-ended — the code and the recipe exist, the run does not.
+**Next session start from:** **the coord setup epic (W2), which jok chose as one piece of work** — GUI wizard, uninstall, status, handover output, with update backlogged behind C0. The handover is the load-bearing part: the no-defaults rule means an installer must be told the coordinator URL and share path, and coord is the only thing that knows all three values. Note the correction from this session: **`setup` already installs an auto-start Windows service** (`setup.rs:833`), so the fragility jok hit was my telling him to run `chapr-coord serve` in a terminal. **Also owed:** the rig walkthrough in the plan's verification section — nothing in W1 has been driven end-to-end against a real share, only against wiremock, a live local coordinator and the unit suite. Rebuild the rig bundle *without* defaults, revert the `clean-share` checkpoint first, and check that the four misconfiguration states are now distinguishable from the tool surface alone. **C0 remains the constraint** on move provenance (2.4) and on W2's update path.
 
-**Next session start from:** **B6, the verb-uniformity sweep — nothing is waiting on a push or a run.** Phase B's other items are done *and proven*: **CI run #16 on `fdbc2f8` is green across 7 jobs**, which is the first run to execute anything since #14 (run #15 parsed nothing). That run proved B8's exit-code split in both directions, the `net use Z:` step, the POSIX `N/A` classification, and **B3's `/move/open` against a real SMB share** via the move smoke suite. B6: `create` alone skips the `~$F` preflight, `restore(copy)` takes no lease or path lock, `delete`/`move` return `Conflict` with `sidecar_path` pointing at the file itself and create **no** sidecar — findings first, then jok picks which are design and which are omissions. **Also open:** **C0** (its `CREATE TABLE IF NOT EXISTS` constraint now bites every schema change), **I-016 → jok's semantics call** before B4, **Q13** before B5, and the owed `traceparent` measurement per `docs/measuring-session-identity.md`. The rig is unchanged and reproducible — revert the `clean-share` checkpoint before using it.
-
----
 
 
 ## Known Issues
 
 > **Live issues only** — full narrative for every issue, live and resolved, is in
 > `logbook/ISSUES.md`. Staleness rule: open > 30 days is flagged STALE at session
-> start. Threshold: 5000 chars; the section is at **3440** — measured 2026-09-09,
+> start. Threshold: 5000 chars; the section is at **3441** — measured 2026-09-09,
 > not carried over.
 >
 > **The rule was applied for the first time on 2026-09-07** — it had been in the

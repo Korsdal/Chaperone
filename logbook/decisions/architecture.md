@@ -10,6 +10,131 @@
 
 ---
 
+<a id="d-047"></a>
+### D-047 — The cowork-findings slice: what an agent is told, and what restore may destroy — 2026-09-09
+
+**Problem:** jok drove all eleven tools against the rig share in two cowork
+sessions and wrote up 13 findings (`specs/cowork-findings-0909.md`, raw report in
+`scratchpad/happypathfindings.md`). All 13 reproduced in code. The decisions below
+were taken interactively; findings without a fork are not listed.
+
+**The theme, which outlived the individual findings.** Every *"works well"* item
+was **boundary** behaviour — fail-closed on a bad root, no damage after five
+failed operations, CAS under a real stale write, drive-letter resolution. Every
+failure was an **explanation** behaviour. The engine behaves; it did not explain
+itself. That reframed the work from "fix seven bugs" to "make the tool surface
+answerable", and it is the lens to keep for the next such pass.
+
+**jok's severity principle, adopted:** severity tracks **how long a user believes
+they are the problem**, not how broken a feature is. The missing `mkdir` cost two
+tool calls and gave an unambiguous answer; configuration opacity consumed most of
+a session and repeatedly made the operator doubt a fix that was already correct.
+That ordering put error text and observability ahead of new capability.
+
+**Choices:**
+
+- **Q13 CLOSED as option (a): `restore(in_place)` requires a base and CAS-checks
+  it.** The roadmap leant to (b)/(c). jok's question settled it — *"does this
+  enable a file being overwritten technically by an agent? Data loss prevention is
+  the whole point of this solution, so giving the agent a bazooka to do that with
+  would be unfeasable"* — and the answer was that **the bazooka already existed**:
+  restore performed no CAS at all, by design ("a restore is a deliberate
+  overwrite"), so an agent could destroy current content it had never read.
+  Concept §6.5 always described the full write path; spec and code now agree, in
+  the spec's favour.
+  - The caller states what it observed: a version, or `absent`. Five outcomes,
+    one test each, and the version comparison is mutation-checked.
+  - **A soft-deleted target plus `absent` recreates the file at its original
+    name.** `chapr_delete` promises "recoverable via chapr_restore" and that was
+    only technically true while recovery landed at `F.restored-{ts}.ext` and
+    needed a follow-up move, which itself needed a read.
+  - `base` is `Option` in the proto because Copy mode has no target state to
+    describe; `in_place` without it is refused, so omission cannot become a
+    dangerous default. That is the *spirit* of §6.2's never-optional rule rather
+    than its letter, and the reasoning is here so the shape is not "corrected".
+- **`chapr_mkdir` exists, with a deterministic guard.** jok's call, and his
+  reasoning was that *"having to manually create directories for outputs or
+  artifacts creates friction. We want less friction with less data loss"* —
+  friction pushes work outside Chaperone, which is worse than the risk. His own
+  objection was that a similar-name check sounds non-deterministic, and that is
+  what the design answers: the **tool** compares, not the model. Normalise (strip
+  case, separators, punctuation), then Damerau-Levenshtein within a length-scaled
+  budget; refuse naming the candidates; `confirm_new` overrides and is audited.
+  - **Case is not the axis.** The SMB grammar already casefolds (invariant 5) and
+    NTFS will not hold `Reports` and `reports` at once. The real targets are
+    transpositions (`Repotrs`), spacing (`Q1 Reports` vs `Q1-Reports`) and
+    near-identical plurals.
+  - **Numbered siblings are exempt**, and this one is load-bearing: `2026` and
+    `2027` are one edit apart and both deliberate, as are `Q1`/`Q2` and
+    `Reports2025`/`Reports2026`. A guard that refuses the second year of a
+    deployment gets switched off, and the typo protection goes with it. Found by
+    a test, not by review.
+  - **No auto-created parents**, from jok's own argument: implicit creation is how
+    a share acquires `Reports`, `reports` and `Repotrs` side by side.
+- **Refusal enrichment, not a `chapr_config` tool.** Four misconfigurations were
+  byte-identical from the tool surface and took six exchanges to separate. jok's
+  proposed fix — log the effective config at start-up — **already existed**
+  (`main.rs`, one line per resolved root) and had not helped, for three reasons
+  worth recording: stderr is not the tool surface; `instructions` reaches the
+  model rather than the user, and a fail-closed start announces nothing at all;
+  and a *stale* config starts cleanly, so there is nothing to log. The fix had to
+  travel in a **refusal**. Boot time is what does the work — an older boot time
+  than your last edit says your fix has not loaded. A twelfth tool answering
+  "what is my config" was weighed and deferred: it is the only shape that covers
+  stale-but-working, and it grows a surface D-035 keeps deliberately small.
+- **Every refusal is audited, reads included** (jok's call, volume accepted
+  explicitly). One `AuditKind::Refused` with the reason as a greppable
+  `refused[reason]` prefix in `detail`; `/admin` gains path and detail substring
+  search. A structured reason column would query better and cannot be added until
+  C0. **Transport failures are excluded** — a coordinator outage would write one
+  row per read in a read-heavy workload, and it is not a decision anyone made.
+  The rule: audit a refusal when it records a **decision Chaperone made**.
+  - Note for **C4/Q4**: §12's retention was sized before refusals existed.
+- **B6 pulled in whole rather than patched.** `ChaprError::Conflict` carried only
+  `sidecar_path`, which is *why* `delete` and `move` set it to the live file —
+  they park nothing, and the message had to read correctly. Rewording the string
+  alone would have fixed `write` and broken the other two. Both paths are now
+  fields. **B6a: `create`'s missing `~$F` preflight is an omission, not design**
+  (jok) — `CREATE_NEW` cannot overwrite, but Word holds `~$F` for an unsaved
+  document, so creating underneath one collides when the person saves. "Humans
+  always win" with a per-verb exception is a rule the next author reintroduces.
+- **Packaging: no defaults in any shared bundle, and the root is required.** Both
+  failures were mine, from the bundle handed to jok. A `default` reaches only a
+  first-time installer, so a root typo'd as `charptest` survived several edits and
+  a new build — the string appears nowhere in the source. And "NOTE to packager"
+  text rendered verbatim in his install dialog.
+  - **The binary stays permissive**, and jok's framing is the one to keep: making
+    it require a root *"would make the ship-exe-and-mcpb solution worthless"*.
+    D-035(3) ships the bare executable for every OS; one that refused to start
+    until configured would be unusable for a Claude Code or Cursor user. Config
+    belongs after install, and a misconfiguration that fails closed is cheaper
+    than an unshippable binary. The manifest is a different audience and may
+    demand more.
+- **The withdrawn appendix finding was real.** jok reported the boundary refusal
+  escaping the input path with two backslashes while the root showed one, then
+  withdrew it as unreproducible. It was deterministic and present on every
+  refusal: `{out:?}` and `{raw:?}` are Debug formatting, which doubles
+  backslashes, while the roots printed through `as_str()`. **Lesson: "did not
+  reproduce" on a formatting complaint deserves a look at the format string, not
+  a shrug.**
+
+**Deferred with reasons:** move provenance in `chapr_history` needs real columns
+and therefore **C0** — jok chose correct columns over a side table, so this waits
+rather than being worked around. The **coord setup epic** (UI wizard, uninstall,
+update, handover output) is jok's *"whole epic as one piece of work"* and is
+specified, not built; until it exists an installer must be told the URL and share
+path by hand, which is the honest cost of the no-defaults rule. `chapr_config`
+stays a question. **§4 of jok's report was corrected**: leases *are* acquired by
+every mutating verb, five release sites — they are invisible because their
+lifetime is one tool call, which is D-011's own recorded note, so the fix is
+`chapr_stat`'s description rather than the field.
+
+**Made by:** jok (every fork above) / Claude (mechanism, and the corrections to
+jok's own diagnoses noted inline) | **Review date:** N/A
+**Status:** CURRENT
+
+---
+
 <a id="d-046"></a>
 ### D-046 — The move journal is a separate table, and interrupted moves are swept rather than served — 2026-09-09
 
