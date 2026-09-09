@@ -13,8 +13,9 @@ Extensions): a zip of a `manifest.json` + the compiled `chapr-endpoint` binary.
 Because Chaperone derives identity from the OS logon (D-024), a user configures only
 **two** things: the coordinator URL, and the **coordinated location** — the share
 path the endpoint is allowed to act on, which is also announced to the model so it
-routes writes through Chaperone (E-025). A packager can set defaults for both so
-users type nothing.
+routes writes through Chaperone (E-025). Both are asked for at install time and
+**neither has a default** — see *Configuring a bundle* below for why that is
+deliberate rather than an omission.
 
 > Spec: <https://github.com/modelcontextprotocol/mcpb> · manifest reference:
 > `MANIFEST.md` in that repo. CLI: `npm i -g @anthropic-ai/mcpb`.
@@ -36,8 +37,8 @@ has never been run.
 ## Build
 
 The builder takes either an already-instantiated `manifest.json` (`-Manifest`) or the template
-plus the values to fill it with (`-Template`). CI uses the second form; a customer deployable that
-keeps a hand-tuned manifest with pre-filled defaults uses the first.
+plus the values to fill it with (`-Template`). CI uses the second form; the first exists for a
+bundle built for one machine, which is the only place pre-filled defaults belong.
 
 ```powershell
 # From the template — what the release workflow runs:
@@ -85,10 +86,41 @@ public directory — expected, not an error.
 > Desktop's actual requirements before investing in a code-signing cert. Managed
 > fleets can pre-approve the `.mcpb` via Intune/GPO instead.
 
+## Configuring a bundle — read this before adding a `default`
+
+**The template ships no defaults, and `coordinated_root` is required.** Both came
+out of a cowork session against a live share, and the reasoning matters more than
+the rule:
+
+- **A `default` only ever reaches a first-time installer.** Stored `user_config`
+  is keyed by extension, not by version, so anyone who installed an earlier
+  bundle keeps their old value — and a *corrected* default never reaches them.
+  During that session a root typo'd as `charptest` survived several edits and a
+  new bundle, and the string appeared nowhere in the build. Nothing in the
+  endpoint can fix this; only not shipping a wrong value can.
+- **A wrong-but-plausible default installs cleanly and coordinates nothing**,
+  which is a quieter failure than an empty required field. Hence
+  `coordinated_root` is `required: true`: an unconfined endpoint should be a
+  deliberate choice, not a blank nobody noticed.
+- **Deliberate asymmetry with the binary.** `chapr-endpoint` itself still *warns
+  and continues* with no `CHAPR_ROOT`, and should: the bare executable ships for
+  every OS (D-035) and a binary that refused to start until configured would be
+  unusable for a Claude Code or Cursor user. The manifest is a different
+  audience — someone installing a one-click bundle — and can demand more.
+
+So where do the values come from? **The coordinator.** IT runs coord's setup and
+distributes what it prints; that handover is the supported path, and it is why
+this template asks rather than guesses.
+
+**A private, single-machine bundle may set defaults** — a rig or a demo laptop
+where the bundle is never handed to anyone else. Do not do it in anything you
+distribute, and never put a real `coord_token` in a bundle you publish: that
+publishes the credential.
+
 ## Notes
-- The user-facing `coord_url` field has **no default** (so a non-technical user
-  can't click past it onto localhost). A packager MAY set `default` to the *real*
-  coordinator URL to pre-fill it — never localhost.
+- Keep guidance for packagers **here, not in a `description`**. The host renders
+  `description` verbatim in the install dialog, so notes addressed to ourselves
+  were read by whoever installed the bundle.
 - `manifest_version` is set to `0.3` (the value in the upstream MANIFEST.md
   example, and it passes `mcpb validate`). If a newer CLI reports otherwise, bump it.
 - **No comment keys in the manifest.** The template used to carry a `"//"` note and

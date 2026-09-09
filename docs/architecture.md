@@ -136,9 +136,19 @@ happened.
 | Coord unreachable, **write** | **Fail closed**, refuse | Writes are rare; refusing costs a retry, guessing costs data |
 | Coord unreachable, **read** | **Degrade open**: serve with `integrity = "unverified"`, version omitted | Reads mutate nothing and are the core capability |
 | Torn file (dangling journal) on read | **Recover, then serve** the pre-image | A reader must never see torn bytes |
-| CAS conflict | Loser's bytes to a `.conflict-{user}-{ts}` sidecar, registered, surfaced on next touch | Never lose either party's bytes; never fake-merge an Office binary |
-| Office lock (`~$F`) present | **Refuse the write** | Humans always win. Leases are advisory with respect to Excel |
+| CAS conflict, **write** | Loser's bytes to a `.conflict-{user}-{ts}` sidecar, registered, surfaced on next touch | Never lose either party's bytes; never fake-merge an Office binary |
+| CAS conflict, **delete / move / restore** | **Refuse**, and say nothing was parked | Those verbs submit no content, so there is nothing to park; claiming a sidecar names a file that does not exist |
+| Office lock (`~$F`) present | **Refuse the write** — every mutating verb, `create` included | Humans always win. Leases are advisory with respect to Excel |
+| Restore in place, target not as the caller described it | **Refuse** | A restore may not overwrite content nobody has read; the caller states what it saw and the CAS checks it |
+| Directory name resembles a sibling | **Refuse**, naming the candidates | Coordination is keyed by exact path, so near-duplicate folders split a share permanently |
+| Parent directory missing | **Refuse**, naming the *parent* | Chaperone never creates parents implicitly; naming the file sends the reader to the one path they got right |
 | Retry storm | Bounded retries, exponential backoff + jitter, per-file budget, terminal "ask the human" state | An LLM will otherwise retry forever |
+
+Every refusal above is **recorded in the audit trail**, reads included, as a
+`refused` event whose detail carries the reason (`refused[outside_root] …`). A
+trail that held only committed changes could not answer whether an agent had been
+stopped at the boundary, which is the question a boundary exists to make
+answerable.
 
 ## Read limits, and what a model can write back
 

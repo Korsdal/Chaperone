@@ -95,8 +95,8 @@ writes to a host's config file. Full environment contract:
 
 ## Status
 
-- **Tool surface complete and live-verified:** read, write, create, list, stat,
-  delete, move/rename, history, restore, conflicts, resolve_conflict.
+- **Tool surface complete and live-verified:** read, write, create, mkdir, list,
+  stat, delete, move/rename, history, restore, conflicts, resolve_conflict.
 - **Proven on real hardware.** SMB mandatory locking is honoured by an actual Windows
   Server 2022 share, so invariant 3's foundation is measured, not assumed. The audit
   trail and the diagnostics pipeline both worked on first contact.
@@ -115,9 +115,10 @@ writes to a host's config file. Full environment contract:
   applies no ACL check to an authenticated caller. Real **Kerberos/Negotiate** (or
   OIDC) is what makes identity verified, and needs a domain to develop against. See
   [security notes](docs/security.md).
-- **Mapped drive letters** resolve to UNC via `WNetGetUniversalNameW`, but that path
-  is unconfirmed against a real server. The self-test reports it as SKIP rather than
-  pass, which is the point.
+- **The audit trail records refusals, and its retention was not sized for them.**
+  Every refused operation now lands in the trail, reads included, so "did an agent
+  probe outside the share" is answerable. The retention window in the spec was
+  written when only committed changes were recorded.
 - **DFS resolution is not implemented.** It was not needed for the first deployment;
   a DFS namespace would need it before rollout.
 - **MCPB signing is broken upstream**, so bundles ship unsigned and Claude Desktop
