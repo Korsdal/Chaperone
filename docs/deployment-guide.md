@@ -37,7 +37,12 @@ touches coord.
    build it with `cargo build --release -p chapr-coord`. The result is one self-contained
    `.exe`: no Visual C++ redistributable, no Rust on the target host, no script.
 2. Copy it to the coordinator host and run it **elevated** with no arguments. That
-   *is* the installer: a bare invocation runs the setup wizard. See
+   *is* the installer: a bare invocation opens the setup wizard **in your browser**
+   — on `127.0.0.1`, on a link that works once, printed to the console as well as
+   opened, so a server with no default browser is not a dead end. Prefer prompts?
+   `chapr-coord setup` gives you the terminal version, and `--non-interactive` with
+   flags is the unattended path for a fleet. All three collect the same values and
+   run the same install. See
    [`../packaging/coord/service-install.md`](../packaging/coord/service-install.md);
    [`../packaging/coord/config.template.toml`](../packaging/coord/config.template.toml)
    documents every field if you would rather write the config by hand.
@@ -58,7 +63,14 @@ touches coord.
    trusted on the laptops, and an internal CA is the better answer if you have one.
 6. Read the handover it prints. It is the whole set of things to pass on: the admin
    token, the coordinator URL, the coordinated share, where both logs live, and what
-   to back up.
+   to back up. It ends with an `mcpServers` block you can paste into a host's MCP
+   config — one field, `command`, is left as a placeholder because coord cannot know
+   where the endpoint lives on a user's machine.
+   **You do not have to catch it the first time.** `chapr-coord handover` reprints
+   all of it from the config whenever a laptop is added; `--json` puts only the
+   block on stdout (so `handover --json > .mcp.json` is a usable file), and `--out
+   <file>` writes it for distribution. That file contains the deployment token, so
+   the command restricts it to you and to administrators, and says so.
 7. Verify: `GET /healthz` → `ok`, **from a laptop** rather than from the coordinator
    itself. Loopback working proves nothing about what a user will experience.
 
@@ -179,11 +191,37 @@ surface as conflict and lease state instead. If the diagnostics list is empty,
 that is the intended steady state.
 
 ## Operations
+
+| Command | What it answers |
+| --- | --- |
+| `chapr-coord status` | Is the config loadable, is the service installed, is it running, does the port answer — reported separately, because they fail separately. Exit code 0 only when all four hold, so a monitor needs no parsing. |
+| `chapr-coord handover` | What do I give the next user? Reprints the URL, token and share, plus an `mcpServers` block. `--out <file>` to distribute. |
+| `chapr-coord uninstall` | Remove the service. **Keeps the database, blob store and audit log**, and prints where they are. |
+
 - **Availability:** coord availability == write availability. Run it as a service,
-  monitor `/healthz`.
+  monitor `/healthz` — or `status`, which also notices a service that is
+  registered but stopped.
 - **Backup:** the SQLite DB **and** the blob store, together (audit + history).
+  Restoring history needs both from the same moment, which is also why
+  `uninstall` will not delete them for you.
 - **Storage:** history retention defaults (90 d / last-10 / 50 GiB) are tunable;
-  validate against real write volume after a pilot.
+  validate against real write volume after a pilot. Note that **refusals are now
+  audited too**, including reads, which the original retention numbers did not
+  account for.
+- **Upgrading:** there is no in-place update command yet, deliberately — see
+  below.
+
+> [!IMPORTANT]
+> **Update the coordinator before the endpoints.** A newer endpoint refuses a move
+> against a coordinator that lacks the move-intent route, and says so. The reverse
+> — newer coord, older endpoints — is fine.
+>
+> There is **no `chapr-coord update`**. Running a newer binary over an existing
+> install is not yet supported, because the schema is applied with
+> `CREATE TABLE IF NOT EXISTS` and nothing else: a new *table* reaches an existing
+> database, a new *column* is silently skipped. Until migration machinery lands, an
+> upgrade means `uninstall`, replace the binary, and `setup` again pointed at the
+> **same** data directory — which keeps every version and the whole audit trail.
 
 ## Per-customer checklist
 - [ ] Backend type (SMB / POSIX) → coord `backend`
