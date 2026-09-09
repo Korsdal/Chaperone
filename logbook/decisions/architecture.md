@@ -10,6 +10,65 @@
 
 ---
 
+<a id="d-046"></a>
+### D-046 — The move journal is a separate table, and interrupted moves are swept rather than served — 2026-09-09
+
+**Problem:** B3 had to make D-013's "stale-but-recoverable" true. Three sub-choices
+were not obvious, and one of them was forced by something nobody had noticed.
+
+**Choices:**
+
+- **A separate `move_journal` table, not nullable columns on `journal`.** The
+  roadmap said "reuse the journal and `scan_dangling` shape rather than inventing a
+  mechanism", which reads as "extend the journal row". It cannot be done:
+  `db::migrate` is `CREATE TABLE IF NOT EXISTS` and nothing else — the E-002
+  stand-in for real migrations — so a new table appears on a database that already
+  exists while **a new column is silently skipped**, after which the endpoint
+  queries a column the live coordinator does not have. Until C0 lands,
+  additive-by-table is the only schema change that reaches an install that already
+  ran. The modelling agrees independently: a write journal answers *what bytes do I
+  reinstate here*, a move journal answers *which two paths belong together and what
+  migration is owed*, and it is keyed by `src` while the file ends up at `dst`. The
+  *shape* was reused — lease liveness as the live-versus-dangling signal, a
+  `dangling_moves` scan mirroring `scan_dangling` — which is what the instruction
+  was actually protecting.
+- **The migration discharges its own intent, inside its own transaction.** The
+  alternative was to delete the row in a second call after `move_paths` returned,
+  which is simpler to write and wrong: it opens a window where both the row and the
+  migration exist, and a recovering session that saw that row would migrate twice.
+  Deleting in-transaction makes completion exactly-once **by construction** — a
+  surviving row *proves* the migration did not commit — so `move_paths` needs no
+  idempotency logic at all. That property is mutation-checked.
+- **Recovery is swept at endpoint start-up, not triggered from a read.** A dangling
+  *write* is served from the read path because the reader would otherwise see torn
+  bytes. A dangling *move* is not comparable: the bytes are intact under one name or
+  the other, and only coord's bookkeeping is behind. Putting it in the read path
+  would add a decision to the hot path of a read-heavy workload and make a read
+  perform coord writes, against the "keep the write path boring" guardrail. Start-up
+  is also when it matters — the run most likely to owe a migration is the one after
+  the run that died. The cost is accepted and named: a stale move can persist until
+  an endpoint restarts, which is *recoverable*, the claim D-013 actually made.
+- **Three outcomes, one of them deliberately terminal.** `src` gone and `dst`
+  hashing to the recorded version → complete; `src` present → drop the intent,
+  nothing happened; neither, or a `dst` that has been written since → **leave it and
+  say why.** Completing that last case would append a version-log entry naming a
+  version the file no longer has. This is the bounded-retry rule applied to
+  bookkeeping: reach a terminal state and surface it rather than improvise.
+
+**Consequence for deployment, and it is an ordering rule:** **update coord before
+endpoints.** A new endpoint against an older coordinator gets 404 on `/move/open`
+and refuses the move. Fail-closed is right — skipping the intent would restore the
+unrecoverable window while reporting success, the "green by omission" pattern B8
+had just removed from the self-test — so the 404 is instead translated into an
+error naming the cause and the fix.
+
+**Made by:** Claude (design + impl), within jok's instruction to take B3 |
+**Review date:** N/A — but the first clause is a **standing constraint until C0**:
+any future change needing a new *column* must land C0 first.
+**Status:** CURRENT
+
+---
+
 <a id="d-044"></a>
 ### D-044 — Session identity is per endpoint *run*, not per conversation: MCP does not offer the alternative — 2026-09-08
 
