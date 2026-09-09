@@ -261,7 +261,11 @@ jobs:
       - name: Map a drive letter at the share (exercises E-022)
         if: matrix.backend == 'smb'
         shell: cmd
-        run: net use Z: %SMOKE_DIR%
+        # A block scalar, not `run: net use Z: %SMOKE_DIR%` — a plain YAML scalar
+        # cannot contain a colon followed by a space, so that form makes the whole
+        # workflow unparseable rather than failing this one step.
+        run: |
+          net use Z: %SMOKE_DIR%
 
       - name: Self-test — contention and the mandatory lock, via the shipped binary
         shell: bash
