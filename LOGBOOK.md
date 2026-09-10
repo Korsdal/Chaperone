@@ -547,6 +547,7 @@ Resolved and moved out: I-001, I-006, I-008, I-010, **I-012** → `logbook/ISSUE
 
 | ID | Task | Priority | Est. Sessions | Status |
 |----|------|----------|---------------|--------|
+| E-029 | **Re-evaluate CI and release building** — nothing from 2026-09-10 has run in CI, and the MSI and the MCPB are both release artifacts built by hand | HIGH | 1 | TODO |
 | E-015 | Enforced control-plane auth (pluggable): `negotiate` (on-prem) / **generic OIDC** validator + `TokenSource` (cloud/hybrid) | MED | 2–3 | DEFERRED |
 | E-028 | **File-extraction MCP for Chaperone** — separate deployable: documents and legacy-encoded text → UTF-8 mirrors Chaperone can serve | MED | large | TODO |
 | E-020 | SQLite backend-registry table + admin API (runtime-mutable routing) | LOW | 1–2 | TODO |
