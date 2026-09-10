@@ -102,6 +102,15 @@ pub struct SetupArgs {
 /// can act on the answer; a service starting at boot has nobody to tell, and
 /// refusing to start over an unreachable share would turn a warning into an
 /// outage.
+///
+/// Windows-only in practice, and the `allow` says so rather than hiding it: the
+/// caller is `run-service`, which the SCM invokes. A systemd unit cannot reach
+/// this state — the Linux wizard writes the config *before* it installs the unit,
+/// so a Linux coordinator always starts against a config that exists. The MSI is
+/// the only installer that registers a service before one has been written.
+///
+/// The tests below exercise it on every platform, because the logic is pure.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn provision_if_missing(args: &SetupArgs) -> Result<bool, String> {
     if args.config_out.exists() {
         return Ok(false);
@@ -1849,26 +1858,48 @@ mod tests {
         assert!(!args.config_out.exists(), "nothing is written when the values are refused");
     }
 
+    /// What makes the MSI a single property instead of four (I-017, D-049).
+    ///
+    /// Split by platform for the reason `hardening_refuses_shared_and_top_level_directories`
+    /// gives a few tests down, and it is not tidiness: `PathBuf::join` uses the
+    /// **host's** separator, so a Windows-shaped literal asserted on Linux
+    /// produces `C:\ProgramData\Chaperone/blobs` — which is not a bug in the
+    /// coordinator, only a test written on one platform for three.
     #[test]
     fn one_data_dir_places_the_database_and_the_blob_store() {
-        // What makes the MSI a single property instead of four (I-017, D-049).
+        let dir = if cfg!(windows) { r"C:\ProgramData\Chaperone" } else { "/var/lib/chaperone" };
+        let args = SetupArgs {
+            data_dir: Some(std::path::PathBuf::from(dir)),
+            ..Default::default()
+        };
+        let cfg = config_from_args(&args);
+
+        // The database URL is the platform-independent half, and the half that
+        // matters: forward slashes on every host, and the `sqlite:` prefix that
+        // tells the rest of coord this names a file at all (I-017).
+        assert!(cfg.db_url.starts_with("sqlite:"), "{}", cfg.db_url);
+        assert!(!cfg.db_url.contains('\\'), "SQLite wants forward slashes: {}", cfg.db_url);
+        assert!(cfg.db_url.ends_with("/coord.db?mode=rwc"), "{}", cfg.db_url);
+
+        // The blob root is a filesystem path, so it is spelled the host's way.
+        assert_eq!(cfg.blob_root, std::path::Path::new(dir).join("blobs").display().to_string());
+        assert_eq!(cfg.data_dir(), Some(std::path::PathBuf::from(dir)));
+        cfg.validate().expect("the derived database URL must satisfy the strict reading");
+    }
+
+    /// The Windows spelling in full, because the deployment that shipped it is a
+    /// Windows one and an assertion about `C:/ProgramData/...` is worth making
+    /// literally rather than by construction.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_data_dir_produces_the_url_the_installer_relies_on() {
         let args = SetupArgs {
             data_dir: Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone")),
             ..Default::default()
         };
         let cfg = config_from_args(&args);
-        assert_eq!(
-            cfg.db_url,
-            "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc",
-            "SQLite wants forward slashes, and the sqlite: prefix is what tells the rest of \
-             coord this names a file"
-        );
+        assert_eq!(cfg.db_url, "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc");
         assert_eq!(cfg.blob_root, r"C:\ProgramData\Chaperone\blobs");
-        assert_eq!(
-            cfg.data_dir(),
-            Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone"))
-        );
-        cfg.validate().expect("the derived database URL must satisfy the strict reading");
     }
 
     #[test]
