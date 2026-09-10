@@ -491,7 +491,7 @@ fn auth_usage_view(st: &AppState) -> AuthUsageView {
         .unwrap_or(false);
 
     let blocked_reason = if recent.is_empty() {
-        Some("no requests seen yet — let the endpoints talk to coord first".to_string())
+        Some("no requests seen yet - let the endpoints talk to coord first".to_string())
     } else if fallback_in_recent {
         Some("the fallback is still admitting requests".to_string())
     } else if recent_rejection {
@@ -627,7 +627,7 @@ async fn rotate_admin_token(
     tracing::warn!("admin token rotated; the previous one no longer works");
     Ok(Json(serde_json::json!({
         "token": token,
-        "note": "Copy this now — it is not shown again. The previous token stopped working."
+        "note": "Copy this now - it is not shown again. The previous token stopped working."
     })))
 }
 
@@ -812,7 +812,11 @@ async fn register_conflict(
 
 async fn query_conflicts(
     State(st): State<AppState>,
-    _auth: crate::auth::Authenticated,
+    // Both, because both call it: an endpoint for `chapr.conflicts`, and the
+    // admin page's Conflicts tab for the same rows. Under `shared-secret` the
+    // page holds the admin token and not the deployment token, so the connection
+    // auth alone made this route - and therefore the whole page - unreachable.
+    _auth: crate::auth::AdminOrAuthenticated,
     Json(req): Json<ConflictsQuery>,
 ) -> Result<Json<ConflictsResponse>, ApiError> {
     let conflicts = crate::conflict::list(&st.pool, &req.scope).await?;
@@ -1211,7 +1215,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(resolved.cached_version.is_none(), "changed → cache miss");
+        assert!(resolved.cached_version.is_none(), "changed -> cache miss");
     }
 
     #[tokio::test]
@@ -1276,7 +1280,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(r.cached_version.is_none(), "overflow → whole index cleared");
+            assert!(r.cached_version.is_none(), "overflow -> whole index cleared");
         }
     }
 
@@ -1668,6 +1672,93 @@ mod tests {
         }
     }
 
+    /// Every route the admin page loads, with only the admin token, on a
+    /// coordinator that actually authenticates.
+    ///
+    /// This is the shape the page really has: six requests in one `Promise.all`,
+    /// so **one** of them refusing takes the whole sign-in down. `/conflicts/query`
+    /// was guarded by the connection auth, which under `shared-secret` wants the
+    /// deployment's *endpoint* token - a credential the admin page does not have
+    /// and should not have. The page therefore could not sign in at all on the
+    /// mode the installer now defaults to, and said nothing, because that
+    /// rejection carried no body.
+    #[tokio::test]
+    async fn the_admin_page_loads_with_only_the_admin_token_under_shared_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(db::test_pool().await)
+            .with_blob_root(tmp.path().to_path_buf())
+            .with_admin_token(TEST_TOKEN)
+            .with_auth(std::sync::Arc::new(crate::auth::SharedSecretAuth {
+                expected: "the-endpoint-token-the-page-does-not-have".to_string(),
+            }));
+        let app = router(state);
+
+        for (method, uri, body) in [
+            ("GET", "/admin/overview", Body::empty()),
+            ("GET", "/admin/settings", Body::empty()),
+            ("POST", "/diagnostics/query", Body::from("{}")),
+            ("POST", "/conflicts/query", Body::from(r#"{"scope":""}"#)),
+            ("POST", "/leases/query", Body::from("{}")),
+            ("POST", "/audit/query", Body::from(r#"{"limit":200}"#)),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .header("authorization", bearer())
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must answer the admin page, which holds the admin token and not the \
+                 deployment token"
+            );
+        }
+    }
+
+    /// A refusal with an empty body renders as no message at all, which is how a
+    /// sign-in came to clear the box and report nothing.
+    #[tokio::test]
+    async fn a_refusal_always_carries_something_to_read() {
+        let state = AppState::new(db::test_pool().await)
+            .with_admin_token(TEST_TOKEN)
+            .with_auth(std::sync::Arc::new(crate::auth::SharedSecretAuth {
+                expected: "s".repeat(64),
+            }));
+        let app = router(state);
+        for (uri, body) in [
+            ("/conflicts/query", Body::from(r#"{"scope":""}"#)),
+            ("/leases/query", Body::from("{}")),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer wrong")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            assert!(
+                !bytes.is_empty(),
+                "{uri} refused with an empty body; a client can only render that as silence"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_wrong_token_is_refused() {
         let app = router(admin_state().await);
@@ -1814,7 +1905,7 @@ mod tests {
         );
         assert!(
             !html.contains("Read-only view"),
-            "the page is no longer read-only — the Settings tab writes the config"
+            "the page is no longer read-only - the Settings tab writes the config"
         );
     }
 
@@ -1875,7 +1966,7 @@ mod tests {
         assert_eq!(v["diagnostics_open_errors"], 1);
         assert_eq!(v["diagnostics_open_warnings"], 0);
         assert_eq!(v["conflicts_open"], 1);
-        assert!(v["db_bytes"].as_i64().unwrap() > 0, "page_count × page_size");
+        assert!(v["db_bytes"].as_i64().unwrap() > 0, "page_count x page_size");
         assert!(v["uptime_s"].as_i64().is_some());
         // The deployment half: the first question in any support call.
         assert_eq!(v["auth_mode"], "trusted-header");

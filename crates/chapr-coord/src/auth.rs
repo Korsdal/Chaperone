@@ -225,7 +225,7 @@ pub fn from_config(
 pub struct Caller(pub Option<Principal>);
 
 impl FromRequestParts<AppState> for Caller {
-    type Rejection = StatusCode;
+    type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -244,7 +244,7 @@ impl FromRequestParts<AppState> for Caller {
                 // here. Without this number, "no fallback use" is ambiguous between
                 // "the cutover worked" and "everyone is failing".
                 state.auth_usage.record_failure();
-                Err(StatusCode::UNAUTHORIZED)
+                Err(unauthorized())
             }
         }
     }
@@ -269,7 +269,7 @@ impl FromRequestParts<AppState> for Caller {
 pub struct Authenticated;
 
 impl FromRequestParts<AppState> for Authenticated {
-    type Rejection = StatusCode;
+    type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -282,10 +282,65 @@ impl FromRequestParts<AppState> for Authenticated {
             }
             Err(_) => {
                 state.auth_usage.record_failure();
-                Err(StatusCode::UNAUTHORIZED)
+                Err(unauthorized())
             }
         }
     }
+}
+
+/// A route both an endpoint and the administrator legitimately call.
+///
+/// `POST /conflicts/query` is the one that matters: an endpoint reads it for
+/// `chapr.conflicts`, and the admin page's Conflicts tab reads exactly the same
+/// thing. Guarded by the connection auth alone, the page could not call it at all
+/// on a coordinator that actually authenticates - the page holds the admin token,
+/// which is deliberately *not* the deployment's endpoint token. The symptom was a
+/// sign-in that cleared the box and said nothing, because the one failing request
+/// in six rejected with a bare status code and no body.
+///
+/// Accepting either is not a widening: the admin token is the stronger
+/// credential of the two, and this route only reads.
+pub struct AdminOrAuthenticated;
+
+impl FromRequestParts<AppState> for AdminOrAuthenticated {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // The admin token first, and its failures are not reported: a 503 here
+        // means "this coordinator has no admin token", which is true and
+        // irrelevant to an endpoint presenting a perfectly good deployment token.
+        if AdminAuth::from_request_parts(parts, state).await.is_ok() {
+            return Ok(AdminOrAuthenticated);
+        }
+        Authenticated::from_request_parts(parts, state)
+            .await
+            .map(|_| AdminOrAuthenticated)
+            .map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "neither this deployment's endpoint token nor the coordinator's admin \
+                     token was presented. Endpoints send CHAPR_COORD_TOKEN; the admin page \
+                     sends the admin token from the coordinator's data directory.",
+                )
+            })
+    }
+}
+
+/// The rejection every connection-auth failure returns.
+///
+/// A bare `StatusCode` produces a 401 with an **empty body**, and an empty body
+/// is what a client renders as nothing at all. Every refusal says what was
+/// missing - that is the same rule the tool surface follows.
+fn unauthorized() -> (StatusCode, &'static str) {
+    (
+        StatusCode::UNAUTHORIZED,
+        "this coordinator requires a deployment token. Send it as \
+         `Authorization: Bearer <token>` - it is the `endpoint-token` file in the \
+         coordinator's data directory, and `chapr-coord handover` prints it.",
+    )
 }
 
 /// A separate extractor from [`Caller`] because it answers a different question.

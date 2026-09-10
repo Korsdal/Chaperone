@@ -402,7 +402,14 @@ class Unauthorized extends Error {}
 async function request(path, init) {
   const r = await fetch(path, { ...init, headers: headers() });
   if (r.status === 401 || r.status === 503) {
-    throw new Unauthorized(await r.text());
+    // Never an empty message. A rejection with no body used to reach showLogin()
+    // as "", which hides the error element - so Continue cleared the box, said
+    // nothing, and did not sign in. The refusal must always name something, even
+    // when the coordinator forgot to.
+    const body = (await r.text()).trim();
+    throw new Unauthorized(body || (r.status === 503
+      ? "This coordinator has no admin token, so the administrative surface is closed. Check that its data directory is writable, then restart it."
+      : "That token was not accepted (" + path + " answered 401). It is the `admin-token` file in the coordinator's data directory; `chapr-coord handover` prints it."));
   }
   if (!r.ok) throw new Error(path + " → HTTP " + r.status + " " + (await r.text()).slice(0, 300));
   return r.status === 204 ? null : r.json();
