@@ -14,6 +14,109 @@
 
 ## Live
 
+<a id="i-018"></a>
+### I-018 — The endpoint cannot use TLS at all, and trusting the certificate does not help
+**Severity:** HIGH | **Since:** 2026-09-10 | **Status:** OPEN — one-line fix known
+
+Found while chasing jok's report that the admin page was "unsafe — not https, have
+to bypass by Advanced → Continue to page". **That browser interstitial is the
+small half.** Certificate *generation* is sound: `rcgen`, real CN and SANs
+(hostname + `localhost` + `127.0.0.1`), 5-year validity, deliberately not
+`generate_simple_self_signed`.
+
+**The large half:** `Cargo.toml:89` builds reqwest with `rustls-tls`, which
+resolves to **webpki-roots — Mozilla's *public* CA bundle**. Confirmed in
+`Cargo.lock`: `webpki-roots 1.0.9` is linked, `rustls-native-certs` is absent.
+The endpoint therefore never reads the Windows certificate store, and the
+workspace has **no** `add_root_certificate`, **no** `danger_accept_invalid_certs`,
+**no** CA-bundle config or env var, and **no test driving the endpoint against an
+HTTPS coordinator**.
+
+| Coordinator certificate | Browser | Endpoint |
+|---|---|---|
+| Self-signed (`--tls-generate`) | warning, click through | **refused** |
+| Self-signed, imported to Trusted Root on the laptop | fine | **still refused** |
+| Customer's internal CA | fine on a domain-joined box | **still refused** |
+| Public CA | fine | works — unobtainable for an on-prem hostname |
+
+**TLS has been on by default since phase 1 (2026-08-21), so the default
+configuration is one no endpoint can talk to.** Only plain-HTTP deployments work
+today.
+
+**Why HIGH, by jok's severity rule (how long a user believes they are the
+problem):** an administrator who does everything right — generates the
+certificate, installs it into Trusted Root, confirms the browser is happy — still
+gets refused endpoints, with nothing anywhere naming the reason. Setup itself
+prints *"install this certificate as trusted on the laptops, or they will refuse
+the connection"*, and that advice is **currently false**.
+
+**Fix:** `features = ["json", "rustls-tls-native-roots"]`, so the OS trust store
+is honoured and a root distributed by GPO/Intune does what everyone expects.
+Optionally an explicit CA-bundle path for pinning. **And add the test whose
+absence hid this** — every smoke suite and CI leg uses HTTP, which is how five
+months of TLS work never met a client.
+
+Detail: `specs/rig-findings-0910.md` §F2. Trust-model ordering: **D-049** / §D3 of
+`specs/coord-windows-packaging-0910.md`.
+
+---
+
+<a id="i-017"></a>
+### I-017 — A bare-path `db_url` silently disables both the admin and endpoint tokens
+**Severity:** MED | **Since:** 2026-09-10 | **Status:** OPEN — fix chosen, not built
+
+Reported as *"the generated admin page does not authenticate with the generated
+token"*. It is neither the page nor the token: **no `admin-token` file is ever
+created**, and every admin route answers 503.
+
+`config.rs:489`:
+
+```rust
+pub(crate) fn db_file_path(db_url: &str) -> Option<std::path::PathBuf> {
+    let rest = db_url.strip_prefix("sqlite:")?;   // None for a bare path
+```
+
+`Config::data_dir()` is built on it, and **both** credentials live in that
+directory. So a `db_url` that is a plain filesystem path means no data directory,
+therefore no tokens. `db::connect` disagrees — `SqliteConnectOptions::from_str`
+accepts a bare path — so the database is created, the service runs and the page
+loads. **Two functions hold different definitions of `db_url`, and the lenient one
+is the one that visibly works.** Setup takes the value verbatim (`setup.rs:142`),
+so it arrives unchecked from `--db`, the wizard's "SQLite URL" field, or
+`CHAPR_COORD_DB_URL`.
+
+Reproduced on v0.1.4: bare path + `trusted-header` → serves, admin routes 503, no
+token file; bare path + `shared-secret` → refuses to start (**fails closed,
+correct** — that arm already guards this); `sqlite:` prefix → token generated.
+
+**Two messages misdirect**, which is what made it expensive rather than a
+one-minute check: setup says *"no data directory (an in-memory database?)"* of a
+`db_url` that is plainly a file path, and the 503 says *"check the data directory
+is writable"*, sending the operator to ACLs that are correct.
+
+**Fix chosen:** make `db_file_path` lenient (no scheme ⇒ a file path — the
+`:memory:` pseudo-target is already caught by the leading-colon test), and
+normalise in setup so the written config stays canonical. **Not** rejection at
+load: that agrees at the strict end and would stop an existing bare-path install
+from starting after an upgrade. **Fold in the structural fix**: add an explicit
+`data_dir` config field and derive db, blobs, tokens and TLS under it — today
+there are **four** independent locations (`db_url`, `blob_root`, the inferred
+token directory, and the TLS directory placed beside `config_out` at
+`setup.rs:193`). That kills the class, not the instance, and makes the MSI a
+single property instead of four.
+
+**Test gap:** `config.rs:829 data_dir_is_the_database_directory` covers
+`sqlite:`-prefixed and `:memory:` only. The bare path — the one form a human types
+— has no test.
+
+Workaround with no rebuild: set `db_url` to
+`sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc` and restart; same file, so
+history and the audit trail survive.
+
+Detail: `specs/rig-findings-0910.md` §F1.
+
+---
+
 <a id="i-016"></a>
 ### I-016 — An overwrite-move silently discards the source's open conflicts **and** its recoverable history.
 **Severity:** MED | **Since:** 2026-09-08 | **Status:** OPEN — needs a semantics call (B4 / Q11)

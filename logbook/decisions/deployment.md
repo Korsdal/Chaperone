@@ -10,6 +10,90 @@
 
 ---
 
+<a id="d-049"></a>
+### D-049 — The Windows coordinator is installed by an MSI; the wizard leaves, the admin page stays — 2026-09-10
+
+**Problem:** jok reopened D-048 one day after it shipped: *"the backend is itself
+packaged as vendor specific. We chose the html solution to avoid a windows native
+installer — but every Coord file is packaged for the system it handles. Making
+vendor specific installation is therefore on the table."* Plus a placement
+question: does the data have to live in `%ProgramData%`?
+
+**The premise needed correcting first, and it changed the frame but not the
+conclusion.** Coord's compile-time variation is **host OS, not backend vendor**:
+SMB vs POSIX is a runtime config value (`backend`, `backend_routes`) announced to
+endpoints — D-019/D-020 and the north star's environment-aware coordinator.
+What *is* compiled in is 25 `cfg(windows)`/`cfg(unix)` sites across 8 files
+(elevation, console ownership, SCM, share enumeration, `ReadDirectoryChangesW`,
+ACL hardening). So the frame is **host-OS-specific installation** — and the
+Windows coord binary is already exactly that, so a Windows-only install
+experience costs nothing it had not already spent.
+
+**D-048's three objections to a native installer, re-checked:** the GUI-toolkit
+objection **stands** (but an MSI is a separate artifact, not a linked
+dependency); "Windows-only UI" **falls**; and *"coord holds no Windows
+primitives"* **was already false** — `host.rs`, `shares.rs`, `watch_win` and
+`service_win` all call windows-rs, and `CLAUDE.md` still asserts the rule (I-004).
+Two of three do not hold, which is enough to reopen honestly rather than defend.
+
+**Options:** **(a)** keep D-048 — the executable is the installer, browser wizard
+on Windows. **(b)** MSI (WiX) as the Windows install path. **(c)** a native
+dialog replacing the HTML wizard.
+
+**Chosen (jok): (b)**, with the wizard deferred and the admin page kept.
+
+**What MSI buys that is currently hand-rolled and untested:** unattended fleet
+install with properties (`msiexec /i ... /qn`, Intune/GPO — which is how software
+reaches an SME's server, and it removes the browser-on-a-fileserver problem);
+Add/Remove Programs plus versioned upgrade and rollback; and authored placement,
+service registration and directory ACLs, replacing code (`install_service`,
+`remove_service`, hardening) that **has never executed outside compilation**.
+
+**The shape that matters, and the part not to lose: the MSI is a third front end
+to `SetupArgs`, not a reimplementation.** It owns placement, service and ACLs,
+then invokes `chapr-coord setup --non-interactive` with its properties as a
+deferred custom action, so probe / config write / handover exist once. That is
+D-048's own best idea applied a second time — prompts, browser page and MSI
+properties all funnel into `setup::run`.
+
+**Placement (jok: "keep the data in programdata — I can live with that").**
+Binary → `%ProgramFiles%\Chaperone`. Data → `%ProgramData%\Chaperone`, which is
+what D-029's hardening is written for. **Not Program Files for data**: an
+uninstall or an MSI *repair* can remove that tree, taking the audit trail with it,
+against D-048's "uninstall keeps every byte". **Not `C:\`**: its default ACL lets
+Authenticated Users create subdirectories, and backup policy does not target it.
+**The gap this closes is the binary's, not the data's** — data already had a
+convention; the executable lived wherever it was double-clicked.
+
+**The two HTML surfaces separate, and the arguments do not transfer.** The
+**setup wizard** leaves this package (deferred to the later one, where the Linux
+coordinator and a developer double-click still want it); jok confirms the
+objection was the visual representation, not the 63 KB. The **admin page stays
+HTML by design**, and the reason is load-bearing: *"that service can be reached
+from an external admin host."* A native dialog would only work while sitting at
+the fileserver's console — the machine an administrator is least encouraged to
+sit at. **Rule: install is local and belongs to the platform's installer;
+operations are remote and belong on the web surface.**
+
+**Scope narrowed the same day (jok):** Windows rig + Azure VM are the only test
+targets; Windows *and* Linux **endpoints** do the testing; the **coordinator** is
+Windows only for now; **POSIX is parked**, with its own rig, until the SMB story
+is good.
+
+**Consequences.** Reverses **D-032**'s "the executable is the installer" for
+Windows only — the bare executable must keep working for the Linux coord and for
+a Claude Code user. Costs a WiX toolchain in CI and a second release artifact.
+**Does not remove the need for C0's successors**: an MSI upgrades a binary and a
+service, it cannot add a column. **Sequenced after C0 by jok** — *"we need to do
+the basics here"* — because an MSI that upgrades a binary but not a schema is a
+partial update path that reads as a complete one.
+
+**Made by:** jok | **Review date:** N/A
+**Status:** CURRENT — **AMENDS D-048** (its browser wizard is deferred out of the
+Windows package; its uninstall-keeps-data and single-front-end principles stand)
+
+---
+
 <a id="d-048"></a>
 ### D-048 — The coordinator's install experience: a browser wizard, and an uninstall that keeps the data — 2026-09-09
 
