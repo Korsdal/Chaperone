@@ -26,20 +26,20 @@
     "coord_url": {
       "type": "string",
       "title": "Coordinator URL",
-      "description": "The address of the Chaperone coordinator, from your IT administrator — for example http://coord-host:8787, or https:// if TLS is enabled. If you were not given one, ask before continuing: without it Chaperone can still read files but will refuse every write.",
+      "description": "From your IT administrator, e.g. http://coord-host:8787",
       "required": true
     },
     "coord_token": {
       "type": "string",
       "title": "Coordinator token",
-      "description": "The shared secret for this coordinator, given to you by your IT administrator. Required if the coordinator enforces authentication; leave empty if you were not given one. It proves this laptop is one of the deployment's endpoints — it is not a personal password, and it is the same value for everyone here.",
+      "description": "From your IT administrator. Leave empty if you were not given one.",
       "sensitive": true,
       "required": false
     },
     "coordinated_root": {
       "type": "string",
       "title": "Coordinated location",
-      "description": "The shared location Chaperone coordinates, as a UNC path — for example \\FILESRVAICollab. Separate several with commas. This does two things: the endpoint refuses to act on anything outside it, and it is announced to Claude so it knows which files must go through Chaperone rather than an ordinary write. A mapped drive letter is accepted and resolved to its UNC form, so colleagues with different letters still agree on which file is which.",
+      "description": "The fileserver drive letter as X:\\ or the full path to the share",
       "required": true
     },
     "log_level": {

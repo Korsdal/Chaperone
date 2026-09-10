@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 SerenIT ApS
+  Copyright 2026 Prompted EV
+
+  The Windows coordinator's installer (D-049).
+
+  This package is **entirely declarative**. It places the binary, registers the
+  service with this deployment's values on its command line, opens the port, and
+  starts it. There is no custom action.
+
+  That is a correction, not an aesthetic. It used to run `chapr-coord setup` as a
+  deferred custom action to write the config before registering the service. On an
+  interactive install that action did not run and did not say so, leaving a
+  registered service pointing at a config nobody had written: the installer sat on
+  "Starting services" while the service failed, correctly, on a missing file.
+  A step that can be skipped in silence is the wrong place for the one piece of
+  work everything else depends on.
+
+  So the work moved into the service. On its FIRST start it writes the config from
+  those arguments, creates the data directory and restricts it, using the same
+  `config_from_args` the prompts and the browser page use - so there is still one
+  definition of a valid config, and the three front ends still cannot drift. An
+  existing config is never touched.
+
+      front ends:   prompts  ·  browser page  ·  service arguments
+                          \        |        /
+                            \-> SetupArgs -> config_from_args
+
+  What this package deliberately does NOT do:
+
+  - **ACLs.** `harden_data_dirs` already exists and runs as the service identity.
+    `util:PermissionEx` *replaces* a directory's ACL rather than adding to it,
+    which on ProgramData is a foot-gun, and two implementations of the same
+    hardening is the drift this file exists to avoid.
+  - **Migrate anything.** It upgrades a binary and a service; the schema is the
+    binary's own job at start-up (C0).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="Chaperone coordination service"
+           Manufacturer="SerenIT ApS"
+           Version="$(Version)"
+           UpgradeCode="DF8C1634-2A55-43B2-A539-2DAA59E2479C"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of the Chaperone coordination service is already installed. Uninstall it first; the data directory is not touched by either operation." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Nothing here is optional, so there is nothing to customise.
+         WixUI_Minimal already sets ARPNOMODIFY; setting it here as well is a
+         duplicate-identifier error rather than a redundancy. -->
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!-- ================================================================
+         Properties — the MSI's whole configuration surface.
+
+         `Secure="yes"` is what lets these be passed on an `msiexec /qn` command
+         line and still survive into the elevated execute sequence, which is how
+         this reaches a server through Intune or GPO.
+         ================================================================ -->
+
+    <!-- The one property that places this coordinator: config, database, blob
+         store, both tokens and the TLS material all live under it.
+
+         It does NOT live under Program Files: an uninstall or an MSI repair can
+         remove that tree, and it would take the audit trail with it. D-048's
+         "uninstall keeps every byte" is kept structurally here, by never
+         authoring a component under this path. -->
+    <Property Id="COORD_DATA_DIR" Value="C:\ProgramData\Chaperone" Secure="yes" />
+
+    <!-- Optional split-volume overrides: state has a home above, and the database
+         or the blob store live somewhere else — the shape the pilot deployment
+         runs. Given neither, both default under COORD_DATA_DIR, which is what
+         makes this package a single property. COORD_DB must be a `sqlite:` URL
+         with forward slashes; setup refuses anything else rather than starting a
+         coordinator with no tokens (I-017). -->
+    <Property Id="COORD_DB" Secure="yes" />
+    <Property Id="COORD_BLOBS" Secure="yes" />
+
+    <!-- The port laptops connect to. One property, because the bind address and
+         the firewall rule must agree — a coordinator listening on a port nothing
+         may reach is the same class of dead default as TLS nothing trusts. -->
+    <Property Id="COORD_PORT" Value="8787" Secure="yes" />
+
+    <!-- Bind address. Defaults to every interface, NOT to the config crate's
+         127.0.0.1 default: this package installs onto a fileserver whose whole
+         job is to be reached from the laptops. Override it to pin one NIC — and
+         then keep COORD_PORT in step, because the firewall rule follows it. -->
+    <Property Id="COORD_ADDR" Secure="yes" />
+    <SetProperty Id="COORD_ADDR" Action="SetCoordAddrDefault"
+                 Value="0.0.0.0:[COORD_PORT]"
+                 Before="CostFinalize" Sequence="both" Condition="NOT COORD_ADDR" />
+
+    <!-- Optional. Omitted → setup derives it from the machine's hostname and the
+         bind port, which is right more often than the bind address ever was. -->
+    <Property Id="COORD_URL" Secure="yes" />
+    <Property Id="COORD_SHARE" Secure="yes" />
+    <Property Id="COORD_WATCH_DIR" Secure="yes" />
+    <Property Id="COORD_AUTH" Value="shared-secret" Secure="yes" />
+    <Property Id="COORD_BACKEND" Value="smb" Secure="yes" />
+
+    <!-- generate | none. `generate` produces a self-signed certificate that every
+         laptop must then be made to trust, through the same fleet channel that
+         delivers the endpoint bundle — name that step or it does not happen.
+         Supply COORD_TLS_CERT + COORD_TLS_KEY instead if there is an internal CA,
+         which is the better answer (D3). -->
+    <Property Id="COORD_TLS" Value="none" Secure="yes" />
+    <Property Id="COORD_TLS_CERT" Secure="yes" />
+    <Property Id="COORD_TLS_KEY" Secure="yes" />
+    <Property Id="COORD_TLS_HOSTNAME" Secure="yes" />
+
+    <!-- Set to 0 to skip the inbound firewall rule. -->
+    <Property Id="COORD_FIREWALL" Value="1" Secure="yes" />
+
+    <SetProperty Id="COORD_CONFIG" Action="SetCoordConfigPath"
+                 Value="[COORD_DATA_DIR]\coord.toml"
+                 Before="CostFinalize" Sequence="both" />
+
+    <!-- ================================================================
+         What the administrator is left with
+
+         A silent install produced a working coordinator and told nobody the URL
+         or either token: setup writes them to stdout, and the custom action
+         below is a SYSTEM process with no console, so they were computed and
+         discarded. Setup now also writes them to handover.txt in the data
+         directory, and the finish dialog offers to open it.
+
+         The exit dialog appears only in an interactive install. A `/qn` fleet
+         rollout shows nothing and launches nothing, which is what `/qn` means -
+         there the administrator reads the same file, or runs `chapr-coord
+         handover`.
+         ================================================================ -->
+
+    <SetProperty Id="COORD_HANDOVER" Action="SetCoordHandoverPath"
+                 Value="[COORD_DATA_DIR]\handover.txt"
+                 Before="CostFinalize" Sequence="both" />
+    <!-- [ComputerName] rather than the bind address, for the reason the config
+         has two fields at all: 0.0.0.0 is a correct bind and a useless URL. -->
+    <SetProperty Id="COORD_ADMIN_URL" Action="SetAdminUrlDerived"
+                 Value="http://[ComputerName]:[COORD_PORT]/admin"
+                 Before="CostFinalize" Sequence="both" Condition="NOT COORD_URL" />
+    <SetProperty Id="COORD_ADMIN_URL" Action="SetAdminUrlFromProperty"
+                 Value="[COORD_URL]/admin"
+                 Before="CostFinalize" Sequence="both" Condition="COORD_URL" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)license.rtf" />
+
+    <!-- The dialog STATES the values rather than offering to open them, and that
+         is a constraint rather than a preference. `setup` restricts the data
+         directory to administrators and the service account (D-029), and an
+         MSI's impersonated custom action runs as the *client* msiexec token -
+         for a double-click under UAC that is the filtered token, in which
+         Administrators is deny-only. A "show me" button would therefore open an
+         access-denied error on a file that is exactly where it should be.
+         `chapr-coord handover` from an elevated console is the way in, and the
+         dialog says so. -->
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALTEXT" Action="SetExitText"
+                 Value="Admin page: [COORD_ADMIN_URL] - The sign-in token, and the URL and token every laptop needs, are in [COORD_HANDOVER]. That directory is restricted to administrators, so read it from an elevated console with: chapr-coord handover"
+                 Before="CostFinalize" Sequence="both" />
+
+    <UI>
+      <ui:WixUI Id="WixUI_Minimal" />
+      <!-- No settings page, and it was attempted rather than assumed. Splicing a
+           dialog into WixUI_Minimal means publishing a control event on
+           WelcomeEulaDlg, which pulls that dialog's fragment in a second time and
+           fails the build on a duplicate CheckBox key. WiX's supported route is
+           to copy the whole dialog set into this project and edit it, and the set
+           ships as a compiled wixlib with no source to copy. Asking here would
+           therefore mean authoring a UI set from scratch.
+
+           So the values are properties. An unattended install passes them; a
+           double-click installs a running coordinator with defaults, and the
+           share is set afterwards on the admin page's Settings tab, which
+           already has the field. That is D-049's rule read literally: install is
+           local, operations are remote. -->
+    </UI>
+
+    <!-- ================================================================
+         Payload
+         ================================================================ -->
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Chaperone" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="CoordComponents" Directory="INSTALLFOLDER">
+      <Component Id="CoordExe">
+        <File Id="chapr_coord.exe" Name="chapr-coord.exe" Source="$(CoordExe)" KeyPath="yes" />
+
+        <!-- binPath matches `service_win::install` exactly: same subcommand, same
+             flag, an absolute config path. The SCM branch of lifecycle.rs stays
+             in the binary for the standalone and Linux cases; this package simply
+             does not use it. -->
+        <ServiceInstall Id="CoordService"
+                        Name="chapr-coord"
+                        DisplayName="Chaperone coordination service"
+                        Description="Coordinates concurrent agent access to a shared fileserver: leases, versions, intent journal, history and audit."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Vital="yes"
+                        Arguments="run-service --config &quot;[COORD_CONFIG]&quot; --data-dir &quot;[COORD_DATA_DIR]&quot; --addr &quot;[COORD_ADDR]&quot; --public-url &quot;[COORD_URL]&quot; --share-unc &quot;[COORD_SHARE]&quot; --watch-dir &quot;[COORD_WATCH_DIR]&quot; --auth &quot;[COORD_AUTH]&quot; --backend &quot;[COORD_BACKEND]&quot; --db &quot;[COORD_DB]&quot; --blobs &quot;[COORD_BLOBS]&quot;" />
+        <ServiceControl Id="CoordServiceControl"
+                        Name="chapr-coord"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <Component Id="CoordFirewall" Condition="COORD_FIREWALL = &quot;1&quot;">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Chaperone" Name="FirewallRule"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <fw:FirewallException Id="CoordPort"
+                              Name="Chaperone coordination service"
+                              Description="Inbound TCP for the Chaperone coordinator's control channel."
+                              Port="[COORD_PORT]"
+                              Protocol="tcp"
+                              Scope="any" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Chaperone coordination service" Level="1">
+      <ComponentGroupRef Id="CoordComponents" />
+    </Feature>
+
+    <!-- ================================================================
+         There is no custom action, and that is the design.
+
+         There used to be one: a deferred action that ran `chapr-coord setup` to
+         write the config before the service was registered. It was skipped on an
+         interactive install without saying so, and left a registered service
+         pointing at a config nobody had written - which presents as an installer
+         hung on "Starting services" and gives an administrator nothing to act on.
+
+         So the work moved to where it cannot be skipped. The service is
+         registered with these values on its command line, and on its FIRST start
+         - and only then - it writes the config, creates the data directory and
+         restricts it. An existing config is never touched, so an upgrade or a
+         restart cannot overwrite what an administrator has edited.
+
+         Empty values are the reason `set()` exists in setup.rs: a formatted
+         argument string cannot leave a flag out, so an unanswered field arrives
+         as an empty share-unc flag, and that has to mean "unset" rather than
+         "the share whose name is the empty string".
+         ================================================================ -->
+  </Package>
+</Wix>
