@@ -992,7 +992,8 @@ impl IntoResponse for ApiError {
             | InvalidPath { .. }
             | OutsideRoot { .. }
             | NearDuplicateName { .. }
-            | ParentMissing { .. } => StatusCode::BAD_REQUEST,
+            | ParentMissing { .. }
+            | IsADirectory { .. } => StatusCode::BAD_REQUEST,
 
             PermissionDenied { .. } => StatusCode::FORBIDDEN,
 

@@ -242,6 +242,26 @@ pub enum ChaprError {
     #[error("permission denied: {path}")]
     PermissionDenied { path: CanonicalPath },
 
+    /// A file tool was pointed at a directory.
+    ///
+    /// Its own variant rather than an `Io` or a `PermissionDenied`, because that
+    /// is what it used to be: opening a directory as a file returns
+    /// `ERROR_ACCESS_DENIED` on Windows, so `chapr_stat` on a folder reported
+    /// **permission denied** — sending an operator to inspect NTFS ACLs and share
+    /// permissions on a share that was working perfectly. The wrong error class
+    /// costs more than a missing one.
+    ///
+    /// Directories became first-class with `chapr_mkdir`, and the file tools were
+    /// not given a story about them: `list` worked, `history` answered `[]` as
+    /// though a directory simply had no history, and `stat` blamed permissions.
+    /// One answer now: refuse, and name the tool that does apply.
+    #[error("{path} is a directory, and {tool} is for files. Use chapr_list to see what is in it")]
+    IsADirectory {
+        path: CanonicalPath,
+        /// The tool that was called, so the refusal names the caller's own verb.
+        tool: String,
+    },
+
     /// `history`/`restore` named a version not in the file's version log.
     #[error("version {version} not found for {path}")]
     VersionNotFound {

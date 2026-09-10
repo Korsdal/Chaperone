@@ -187,7 +187,11 @@ pub fn classify(e: &ChaprError) -> Option<DiagnosticReport> {
         // to the caller, fully explained in the tool result. Neither indicates
         // anything wrong with the share or the deployment.
         | E::ParentMissing { .. }
-        | E::NearDuplicateName { .. } => return None,
+        | E::NearDuplicateName { .. }
+        // A file tool pointed at a folder. An answer to the caller, and nothing
+        // wrong with the share - which is the whole reason it stopped being
+        // reported as a permissions failure.
+        | E::IsADirectory { .. } => return None,
         // Caller mistakes, already answered inline by the tool result.
         E::BaseVersionNotRecorded { .. }
         | E::BaseVersionRequired { .. }

@@ -1025,6 +1025,7 @@ impl FileSource for SmbBackend {
         Ok(FileStat {
             mtime: system_time_to_utc(md.modified()?),
             size: md.len(),
+            is_dir: md.is_dir(),
         })
     }
     fn read(&self, path: &CanonicalPath) -> io::Result<Vec<u8>> {
@@ -1148,6 +1149,7 @@ impl FileSource for PosixBackend {
         Ok(FileStat {
             mtime: system_time_to_utc(md.modified()?),
             size: md.len(),
+            is_dir: md.is_dir(),
         })
     }
     fn read(&self, path: &CanonicalPath) -> io::Result<Vec<u8>> {

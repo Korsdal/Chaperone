@@ -46,6 +46,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct FileStat {
     pub mtime: DateTime<Utc>,
     pub size: u64,
+    /// Free from the metadata both backends already fetch for `size` and
+    /// `mtime`, and the only way a file tool can tell it was handed a folder
+    /// before it opens one as a file - which on Windows returns
+    /// ERROR_ACCESS_DENIED and reads as a permissions problem on a healthy share.
+    pub is_dir: bool,
 }
 
 /// One raw directory entry from [`FileSource::list`] — backend-native metadata
@@ -115,6 +120,16 @@ pub async fn read(
 ) -> Result<ReadResponse, ChaprError> {
     let path = canonicalize(raw_uri, grammar_for(local_backend))?;
     let stat = fs.stat(&path).map_err(|e| map_os_err(&path, e))?;
+    // Same refusal as `stat`, for the same reason and one line earlier than the
+    // open that would otherwise report a directory as a permissions failure.
+    // Not in the round-two findings only because nobody pointed `chapr_read` at a
+    // folder; the trap is identical.
+    if stat.is_dir {
+        return Err(ChaprError::IsADirectory {
+            path,
+            tool: "chapr_read".into(),
+        });
+    }
 
     // Phase one: cheap metadata. Coord unreachable → degrade-open (§8.3).
     let resolved = match coord
@@ -385,6 +400,12 @@ pub async fn stat(
 ) -> Result<StatResponse, ChaprError> {
     let path = canonicalize(raw_uri, grammar_for(kind))?;
     let st = fs.stat(&path).map_err(|e| map_os_err(&path, e))?;
+    if st.is_dir {
+        return Err(ChaprError::IsADirectory {
+            path,
+            tool: "chapr_stat".into(),
+        });
+    }
     let mtime = st.mtime;
     let size = st.size;
 
@@ -518,6 +539,7 @@ mod tests {
                 None => Ok(FileStat {
                     mtime: self.mtime,
                     size: self.size,
+                    is_dir: false,
                 }),
             }
         }

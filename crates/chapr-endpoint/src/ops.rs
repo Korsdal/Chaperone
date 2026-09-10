@@ -170,6 +170,27 @@ pub async fn mkdir(
         .filter(|e| e.entry_type == chapr_proto::EntryType::Dir)
         .map(|e| e.name.as_str())
         .collect();
+    // An exact match is not a near-duplicate, and it has to be caught first:
+    // `similar_names` matches an identical string too, so the existing directory
+    // was reported as one that "closely resembles" itself, naming the same string
+    // as the candidate. The advice that came with it - set `confirm_new` if the
+    // new name is deliberate - cannot be followed, because no flag creates a
+    // directory that already exists; and the tool description tells the agent to
+    // interrupt a person to confirm the name first. `chapr_create` has always got
+    // this right for files, so this also makes the two consistent.
+    //
+    // `confirm_new` does not override it. It means "this new name is deliberate",
+    // which says nothing about a name that is not new.
+    let exists = dir_names.iter().any(|n| {
+        grammar
+            .normalize(n)
+            .map(|normalised| normalised == leaf)
+            .unwrap_or(*n == leaf)
+    });
+    if exists {
+        return Err(ChaprError::AlreadyExists { path });
+    }
+
     let similar = crate::nearname::similar_names(leaf, dir_names);
     if !similar.is_empty() && !confirm_new {
         return Err(ChaprError::NearDuplicateName {

@@ -521,6 +521,23 @@ person edited outside it).")]
     ) -> Result<CallToolResult, McpError> {
         let path = canonicalize(&uri, grammar_for(self.backend.kind()))
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // A directory has no version history, and answering `[]` said the
+        // opposite: it reads as "this exists and nothing has happened to it".
+        // Checked here rather than in coord, which has no view of the share.
+        if let Ok(st) = self.backend.as_file_source().stat(&path) {
+            if st.is_dir {
+                return Ok(self
+                    .tool_failure(
+                        "chapr_history",
+                        &uri,
+                        ChaprError::IsADirectory {
+                            path,
+                            tool: "chapr_history".into(),
+                        },
+                    )
+                    .await);
+            }
+        }
         match self.coord.history(&HistoryQuery { path }).await {
             Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&resp.entries).unwrap_or_else(|_| "[]".into()),
@@ -609,6 +626,20 @@ if the file is not in the state you describe, so it cannot destroy contents nobo
         } else {
             RestoreMode::Copy
         };
+        // Refused here, at the tool's own boundary, rather than eight layers down.
+        // Without this the write path's precondition surfaced raw and asked for
+        // `base_version` - which is `chapr_write`'s parameter name, not this
+        // tool's. A caller went looking for a parameter that does not exist on the
+        // tool it had just called, and had no next move at all.
+        if in_place && base.is_none() {
+            return Err(McpError::invalid_params(
+                "in_place=true needs `base`: the state of this file as you last saw it, so the \
+                 restore can refuse rather than overwrite content you have not read. Pass the \
+                 version from chapr_stat or chapr_read, or \"absent\" if the file is \
+                 soft-deleted. To write a new copy beside the file instead, leave in_place unset.",
+                None,
+            ));
+        }
         // Parse before doing anything: a `base` we cannot interpret must not fall
         // back to either meaning, since one of them overwrites a file.
         let base = match base.as_deref() {
@@ -1070,6 +1101,7 @@ fn refusal_reason(e: &ChaprError) -> Option<&'static str> {
         | E::VersionNotFound { .. }
         | E::ConflictNotFound { .. }
         | E::InvalidPath { .. }
+        | E::IsADirectory { .. }
         | E::LeaseExpired { .. }
         | E::LeaseLost { .. }
         | E::MaxLeaseLifetimeExceeded { .. }
@@ -1130,6 +1162,12 @@ fn tool_error(e: ChaprError) -> CallToolResult {
         // failure this replaces sent callers into a filename-permutation loop:
         // `create` reporting `not found` on the path it was asked to create named
         // the one path the caller had right.
+        ChaprError::IsADirectory { path, tool } => format!(
+            "\n\nNOTHING WAS CHANGED and nothing is wrong with the share — {path} is a folder, \
+             and {tool} works on files. This used to be reported as a permissions problem, \
+             which sent people to check ACLs that were fine. Use chapr_list to see what is in \
+             the folder, then call {tool} on one of the files it names."
+        ),
         ChaprError::ParentMissing { parent, .. } => format!(
             "\n\nNOTHING WAS CHANGED, and the file you asked for is not the problem — the \
              directory {parent} does not exist. Do NOT retry with a different file name. \
@@ -1726,6 +1764,109 @@ mod tests {
     /// happily while `chapr_read` → `chapr_write` destroys the file. This drives
     /// the real tool methods against a real file and asserts the only property
     /// that matters — the bytes on disk are unchanged.
+    /// R1, round two. `in_place` without `base` fell through to the write path,
+    /// whose precondition asked for `base_version` - `chapr_write`'s parameter
+    /// name, which does not exist on `chapr_restore`. The caller went looking for
+    /// a parameter the tool it had just called does not accept, and had no next
+    /// move at all.
+    #[tokio::test]
+    async fn restore_in_place_without_base_names_the_parameter_this_tool_has() {
+        let coord = permissive_coord().await;
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("inplace.txt");
+        std::fs::write(&file, b"v1").unwrap();
+
+        let err = srv
+            .chapr_restore(Parameters(RestoreArgs {
+                uri: file.to_string_lossy().to_string(),
+                version: VersionToken::hash(b"v1").as_str().to_string(),
+                in_place: true,
+                base: None,
+            }))
+            .await
+            .expect_err("in_place with no base must be refused at the tool boundary");
+
+        let msg = format!("{err:?}");
+        assert!(msg.contains("`base`"), "must name this tool's parameter: {msg}");
+        assert!(
+            !msg.contains("base_version"),
+            "must not name chapr_write's parameter, which chapr_restore does not accept: {msg}"
+        );
+        assert!(msg.contains("absent"), "must state both accepted values: {msg}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v1", "and change nothing");
+    }
+
+    /// R2, round two. `similar_names` matches an identical string, so an existing
+    /// directory was reported as one that "closely resembles" itself - with advice
+    /// to set `confirm_new`, which cannot create a directory that already exists,
+    /// and which the tool description says to interrupt a person about first.
+    #[tokio::test]
+    async fn mkdir_on_an_existing_directory_says_it_already_exists() {
+        let coord = permissive_coord().await;
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("reports");
+        std::fs::create_dir(&existing).unwrap();
+        // Forward slashes: this harness drives the POSIX backend on both
+        // platforms, and `mkdir` is the one tool that has to find a parent - which
+        // the POSIX grammar cannot do in a path separated by backslashes. std::fs
+        // opens it either way on Windows.
+        let uri = existing.to_string_lossy().replace('\\', "/");
+
+        for confirm_new in [false, true] {
+            let out = tool_text(
+                &srv.chapr_mkdir(Parameters(MkdirArgs { uri: uri.clone(), confirm_new }))
+                    .await
+                    .expect("tool call itself succeeds"),
+            );
+            assert!(out.contains("already exists"), "confirm_new={confirm_new}: {out}");
+            assert!(
+                !out.contains("closely resembles"),
+                "an identical name is not a near-duplicate (confirm_new={confirm_new}): {out}"
+            );
+        }
+    }
+
+    /// R3 and R4, round two. One object, three answers: `list` worked, `history`
+    /// returned `[]` as though a directory had no history, and `stat` reported
+    /// **permission denied** - because opening a directory as a file returns
+    /// ERROR_ACCESS_DENIED, which sent an operator to inspect ACLs on a healthy
+    /// share. Refuse and redirect, the same way, from every file tool.
+    #[tokio::test]
+    async fn the_file_tools_refuse_a_directory_and_name_the_one_that_applies() {
+        let coord = permissive_coord().await;
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("uxt2-dir");
+        std::fs::create_dir(&folder).unwrap();
+        let uri = folder.to_string_lossy().to_string();
+
+        for (tool, out) in [
+            ("chapr_stat", srv.chapr_stat(Parameters(UriArgs { uri: uri.clone() })).await),
+            ("chapr_history", srv.chapr_history(Parameters(UriArgs { uri: uri.clone() })).await),
+            (
+                "chapr_read",
+                srv.chapr_read(Parameters(ReadArgs { uri: uri.clone(), allow_binary: false }))
+                    .await,
+            ),
+        ] {
+            let text = tool_text(&out.expect("tool call itself succeeds"));
+            assert!(text.contains("is a directory"), "{tool}: {text}");
+            assert!(text.contains("chapr_list"), "{tool} must redirect: {text}");
+            assert!(
+                !text.contains("permission denied"),
+                "{tool} must not blame permissions on a healthy share: {text}"
+            );
+        }
+
+        // The one tool that does apply still works, which is what makes the
+        // redirect honest rather than a shrug.
+        srv.chapr_list(Parameters(UriArgs { uri }))
+            .await
+            .expect("chapr_list still lists a directory");
+    }
+
     #[tokio::test]
     async fn mcp_round_trip_preserves_binary_bytes() {
         let coord = permissive_coord().await;
