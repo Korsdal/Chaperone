@@ -17,47 +17,24 @@ Versions appear here only once a human has set them; work in flight sits under
 
 ## Unreleased
 
-**The release asset set changes.** On Windows the coordinator ships as
-`chapr-coord-<ver>-windows-x86_64.msi` and the bare `.exe` is gone; **there is no
-macOS coordinator** at all. Endpoints are unchanged: a `.mcpb` bundle and a bare
-binary on all three platforms. Eight artifacts instead of nine.
-
-### What was the problem
-
-The coordinator had no defined way to reach a Windows server — the executable
-went wherever it was double-clicked, and service registration and ACL hardening
-had never executed outside compilation. Separately, both packages were built by
-hand: packaging ran for the first time when a tag was pushed, so a broken
-manifest surfaced as a broken release, and the installer's only test was one
-person's elevated shell.
-
-### What was changed
-
-A WiX 6 MSI: placement, service, firewall rule, licence and finish dialogs,
-uninstall that keeps every byte of the data directory. It carries no custom
-action — the service writes its own config on first start from the values it was
-registered with, and never touches one that already exists.
-
-CI now builds both packages on every push and **installs the MSI and verifies
-it** — service, both tokens, firewall rule, `/healthz`, and data surviving
-uninstall. The release checks its staged set by name rather than by count.
-
-The endpoint reads the machine's certificate store, so an HTTPS coordinator with
-a private certificate finally works. `data_dir` is one explicit config value
-instead of four inferred locations. Console output is ASCII.
-
-### What was deferred
-
-**Nothing is code-signed**, the MSI included, so Windows asks before running the
-installer. The MSI does not adopt a coordinator service installed by hand — an
-older install must be removed first.
+*(nothing in flight)*
 
 ---
 
-## 0.1.4 — 2026-09-09
+## 0.1.4 — 2026-09-10
 
-Set by jok. Note for upgraders: **`chapr_restore` gains a required argument** —
-an in-place restore must now state the version it expects to find (or `absent`).
+Set by jok. Four things to know before upgrading:
+
+- **`chapr_restore` gains a required argument** — an in-place restore must now
+  state the version it expects to find (or `absent`).
+- **`chapr_stat` and `chapr_history` refuse a directory** and name `chapr_list`
+  instead. `stat` used to report `permission denied` on a healthy share, and
+  `history` used to answer `[]` as though a folder simply had no history.
+- **The Windows coordinator is an MSI**, and the bare `chapr-coord.exe` is no
+  longer published. There is no macOS coordinator. Endpoints are unchanged.
+- **Upgrading an existing coordinator:** stop and remove the old service first
+  (`sc.exe delete chapr-coord`), then install the MSI. It does not adopt a
+  service installed by hand. Your data directory and config are untouched.
 
 ### What was the problem
 
@@ -88,6 +65,43 @@ specified and unbuilt, which leaves an installer dependent on being told the URL
 and share path by hand. No `chapr_config` tool: refusal enrichment covers three
 of the four misconfiguration states, and the fourth is a decision about growing
 the tool surface.
+
+### Also in this release: the installer, TLS, and the CI that proves them
+
+**The release asset set changes.** On Windows the coordinator ships as
+`chapr-coord-<ver>-windows-x86_64.msi` and the bare `.exe` is gone; **there is no
+macOS coordinator** at all. Endpoints are unchanged: a `.mcpb` bundle and a bare
+binary on all three platforms. Eight artifacts instead of nine.
+
+#### What was the problem
+
+The coordinator had no defined way to reach a Windows server — the executable
+went wherever it was double-clicked, and service registration and ACL hardening
+had never executed outside compilation. Separately, both packages were built by
+hand: packaging ran for the first time when a tag was pushed, so a broken
+manifest surfaced as a broken release, and the installer's only test was one
+person's elevated shell.
+
+#### What was changed
+
+A WiX 6 MSI: placement, service, firewall rule, licence and finish dialogs,
+uninstall that keeps every byte of the data directory. It carries no custom
+action — the service writes its own config on first start from the values it was
+registered with, and never touches one that already exists.
+
+CI now builds both packages on every push and **installs the MSI and verifies
+it** — service, both tokens, firewall rule, `/healthz`, and data surviving
+uninstall. The release checks its staged set by name rather than by count.
+
+The endpoint reads the machine's certificate store, so an HTTPS coordinator with
+a private certificate finally works. `data_dir` is one explicit config value
+instead of four inferred locations. Console output is ASCII.
+
+#### What was deferred
+
+**Nothing is code-signed**, the MSI included, so Windows asks before running the
+installer. The MSI does not adopt a coordinator service installed by hand — an
+older install must be removed first.
 
 ### Also released here: the truth pass and the correctness core
 
