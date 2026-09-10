@@ -289,6 +289,126 @@ jobs:
         shell: bash
         run: tail -n 100 "$COORD_DIR"/coord*.log || true
 
+  packaging:
+    # The two things a customer actually downloads, built on every push.
+    #
+    # Before this, packaging ran for the first time when a tag was pushed — so a
+    # broken `.wxs` or a manifest the spec rejects surfaced as a broken release.
+    # The Windows leg goes one further and INSTALLS the MSI: "the MSI built" and
+    # "the MSI works" are different claims, and only the second one is worth
+    # anything. Everything it asserts — service registration, both tokens, the
+    # firewall rule, /healthz, uninstall keeping the data — had never executed
+    # outside compilation until it was run by hand on a rig.
+    name: packaging (${{ matrix.os }})
+    # Same reasoning `e2e` records: restore the cache `check` just saved rather
+    # than racing it with a cold fetch, and do not spend runners on packaging
+    # while the unit suite is red.
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32
+            coord: msi
+          - os: ubuntu-latest
+            platform: linux
+            coord: none
+          - os: macos-latest
+            platform: darwin
+            coord: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Deliberately NOT `check`'s key. That job saves a debug-only target
+          # directory and wins the save race, so sharing it would mean this job
+          # recompiles the release profile from cold on every run, forever.
+          shared-key: packaging-${{ matrix.os }}
+
+      # For `npx @anthropic-ai/mcpb` in the pack step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # The same read the msrv job and the release version-gate both do.
+      - name: Version from Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          [ -n "$v" ] || { echo "::error::no version in [workspace.package]"; exit 1; }
+          echo "CHAPR_VERSION=$v" >> "$GITHUB_ENV"
+
+      # `-Pack` is required, not decorative: without it this assembles a directory
+      # and the only manifest check is the script's leftover-placeholder guard.
+      # `mcpb validate` is the one thing that checks the manifest against the
+      # spec, and it is exactly the step the release depends on.
+      - name: Endpoint bundle — assemble, validate, pack
+        shell: pwsh
+        run: |
+          ./packaging/mcpb/build-mcpb.ps1 `
+            -Template ./packaging/mcpb/manifest.template.json `
+            -Version $env:CHAPR_VERSION `
+            -Platform ${{ matrix.platform }} `
+            -OutDir ./build/bundle `
+            -Output ./build/chaperone-endpoint-$env:CHAPR_VERSION-${{ matrix.platform }}.mcpb `
+            -Pack
+
+      # Release profile, not debug: this job exists to make the shipped package's
+      # mechanism true, and a debug binary is not the one that ships.
+      - name: Build the coordinator (release)
+        if: matrix.coord == 'msi'
+        run: cargo build --release -p chapr-coord
+
+      - name: Install the WiX toolchain
+        if: matrix.coord == 'msi'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          # GITHUB_PATH only affects LATER steps, so the two `wix` calls below
+          # need PATH fixed in this shell as well as for the build step.
+          $tools = "$env:USERPROFILE\.dotnet\tools"
+          $env:PATH = "$tools;$env:PATH"
+          $tools | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          wix extension add --global WixToolset.Firewall.wixext/6.0.2
+          wix extension add --global WixToolset.UI.wixext/6.0.2
+          wix --version
+
+      - name: Build the MSI
+        if: matrix.coord == 'msi'
+        shell: pwsh
+        run: |
+          ./packaging/msi/build-msi.ps1 `
+            -Version $env:CHAPR_VERSION `
+            -CoordExe ./target/release/chapr-coord.exe `
+            -Output ./build/chapr-coord-$env:CHAPR_VERSION-windows-x86_64.msi
+
+      # Install it and check what it produced. A hosted Windows runner is a clean
+      # machine that runs elevated — which is exactly what this script needs and
+      # refuses to proceed without. `-Port 18899` rather than the default proves
+      # COORD_PORT drives the bind address and the firewall rule together, which
+      # is the coupling that keeps a coordinator from listening where nothing may
+      # reach it. `-DataDir` stays default, so the customer's path is the one
+      # exercised.
+      - name: Install the MSI and verify what it produced
+        if: matrix.coord == 'msi'
+        shell: pwsh
+        run: |
+          ./packaging/msi/verify-msi.ps1 `
+            -Msi ./build/chapr-coord-$env:CHAPR_VERSION-windows-x86_64.msi `
+            -Port 18899 `
+            -Uninstall
+
+      - name: Installer log
+        if: always() && matrix.coord == 'msi'
+        shell: pwsh
+        run: Get-Content "$env:TEMP\chapr-msi-install.log" -Tail 80 -ErrorAction SilentlyContinue
+
   msrv:
     # Builds with exactly the toolchain Cargo.toml declares, read FROM Cargo.toml
     # rather than pinned here. Hardcoding it created a second place for the number

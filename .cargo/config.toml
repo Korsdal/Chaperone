@@ -15,7 +15,7 @@
 # would fail the same way, and that is a latent fault we have not ruled out rather
 # than one we have not met.
 #
-# The trade, which INSTALL.md states rather than hides: CRT security fixes no
+# The trade, which docs/deployment-guide.md states rather than hides: CRT security fixes no
 # longer arrive via Windows Update, because the runtime is inside our binary. For
 # two self-contained programs delivered as single files, being able to run at all
 # on an untouched server wins.

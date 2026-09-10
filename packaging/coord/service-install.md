@@ -5,7 +5,24 @@ wizard and native service integration (E-016). Exactly one runs per environment,
 on-prem beside the fileserver. **Coord availability == write availability**, so
 run it as a managed service and monitor `/healthz`.
 
-## Windows (this project)
+## Windows — the MSI
+
+`chapr-coord-<version>-windows-x86_64.msi` from the Releases page does all of it:
+placement, service registration and start, and the inbound firewall rule. The
+coordinator writes its own config on first start from the values the installer was
+given, and never touches one that already exists.
+
+```powershell
+msiexec /i chapr-coord-<version>-windows-x86_64.msi `
+        COORD_SHARE=\\FS01\Sales COORD_URL=http://FS01:8787 /qn
+```
+
+Every property, the split-volume overrides and the uninstall behaviour are in
+[`../msi/README.md`](../msi/README.md).
+
+## Windows — from a source build
+
+Only when there is no MSI to hand: the executable is still a complete installer.
 
 1. **Place the binary**, e.g. `C:\Program Files\Chaperone\chapr-coord.exe`.
 2. **Configure** — right-click the executable → **Run as administrator**.
@@ -45,9 +62,12 @@ run it as a managed service and monitor `/healthz`.
 3. **Service** — the wizard installs it via the Windows SCM; or manually:
 
    ```powershell
-   chapr-coord run-service   # invoked by the SCM; not run directly
-   sc.exe start Chaperone     # start the installed service
+   chapr-coord run-service    # invoked by the SCM; not run directly
+   sc.exe start chapr-coord   # start the installed service
    ```
+
+   The service is named `chapr-coord`; `Chaperone coordination service` is its
+   display name. This line said `sc.exe start Chaperone`, which starts nothing.
 
    (SCM install needs an elevated shell.)
 4. **Verify**: `curl http://<host>:8787/healthz` → `ok`.

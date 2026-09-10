@@ -57,17 +57,23 @@ toolchain on a fileserver.
 
 **[Releases →](https://github.com/Korsdal/Chaperone/releases)**
 
-| Artifact | What it is |
-| --- | --- |
-| `chapr-coord-<ver>-<os>` | The coordinator. Run it with **no arguments**: the executable *is* the installer, and a bare invocation runs the setup wizard. |
-| `chaperone-endpoint-<ver>-<os>.mcpb` | The endpoint as a one-click **Claude Desktop** bundle (Settings → Extensions). |
-| `chapr-endpoint-<ver>-<os>` | The same endpoint as a bare binary, for any other MCP host. |
-| `SHA256SUMS` | `sha256sum -c SHA256SUMS`, or `Get-FileHash` on Windows. |
+| Artifact | Platforms | What it is |
+| --- | --- | --- |
+| `chapr-coord-<ver>-windows-x86_64.msi` | Windows | The coordinator's installer. Places the binary, registers and starts the service, opens the port. |
+| `chapr-coord-<ver>-linux-x86_64` | Linux | The coordinator. Run it with **no arguments**: the executable *is* the installer, and a bare invocation runs the setup wizard. |
+| `chaperone-endpoint-<ver>-<os>.mcpb` | all three | The endpoint as a one-click **Claude Desktop** bundle (Settings → Extensions). |
+| `chapr-endpoint-<ver>-<os>` | all three | The same endpoint as a bare binary, for any other MCP host. |
+| `SHA256SUMS` | — | `sha256sum -c SHA256SUMS`, or `Get-FileHash` on Windows. |
 
-Each is built for `windows-x86_64`, `linux-x86_64` and `macos-arm64`. The
-coordinator's OS and the endpoints' OS are **independent**: a Linux coord with Windows
-laptops is ordinary, and so is the reverse. Releases are built by GitHub Actions from
-a tag, not from someone's laptop, and are provenance-attested.
+Endpoints build for `windows-x86_64`, `linux-x86_64` and `macos-arm64`. **The
+coordinator does not ship for macOS** — a Mac fronting a shared fileserver is a
+deployment nobody runs and nothing tests, and an artifact whose only claim is that
+it compiled is worse than an absent one.
+
+The coordinator's OS and the endpoints' OS are otherwise **independent**: a Linux
+coord with Windows laptops is ordinary, and so is the reverse. Releases are built by
+GitHub Actions from a tag, not from someone's laptop, and are provenance-attested.
+Nothing is code-signed, so Windows will ask before running the installer.
 
 **[Deployment guide →](docs/deployment-guide.md)**
 

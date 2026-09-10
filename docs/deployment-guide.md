@@ -32,10 +32,30 @@ touches coord.
   from a tag, with `SHA256SUMS` alongside them.
 
 ## Step 1. Coordinator
-1. Get the binary: download `chapr-coord-<version>-<os>` from the project's
+
+**On Windows, download `chapr-coord-<version>-windows-x86_64.msi` and run it.** It
+places the binary in `%ProgramFiles%\Chaperone`, registers and starts the service,
+and opens the port. For a fleet, the same package installs unattended:
+
+```powershell
+msiexec /i chapr-coord-<version>-windows-x86_64.msi `
+        COORD_SHARE=\\FS01\Sales COORD_URL=http://FS01:8787 /qn
+```
+
+Data lives in `%ProgramData%\Chaperone` and **no uninstall removes it**. A silent
+install prints nothing, so the values every laptop needs are written to
+`handover.txt` there; `chapr-coord handover` reprints them at any time. The
+coordinator writes its config on first start and never touches one that already
+exists, so an upgrade keeps your settings. Full property list:
+[`../packaging/msi/README.md`](../packaging/msi/README.md).
+
+**On Linux**, and for anyone building from source on either platform, the
+executable is the installer:
+
+1. Get the binary: download `chapr-coord-<version>-linux-x86_64` from the project's
    [Releases](https://github.com/Korsdal/Chaperone/releases) page (checksums in `SHA256SUMS`), or
    build it with `cargo build --release -p chapr-coord`. The result is one self-contained
-   `.exe`: no Visual C++ redistributable, no Rust on the target host, no script.
+   binary: no Visual C++ redistributable, no Rust on the target host, no script.
 2. Copy it to the coordinator host and run it **elevated** with no arguments. That
    *is* the installer: a bare invocation opens the setup wizard **in your browser**
    — on `127.0.0.1`, on a link that works once, printed to the console as well as

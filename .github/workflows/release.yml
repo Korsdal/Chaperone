@@ -43,6 +43,19 @@ jobs:
           set -euo pipefail
           workspace=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
           if [ -z "$workspace" ]; then echo "::error::could not read version from Cargo.toml"; exit 1; fi
+
+          # New constraint, and it belongs here rather than 10 minutes downstream:
+          # the Windows package is an MSI, and MSI's ProductVersion accepts only
+          # numeric `x.y.z(.b)`. A perfectly reasonable `0.2.0-rc1` would build,
+          # test and pack on three runners and then fail inside `wix build`.
+          case "$workspace" in
+            *[!0-9.]*|*..*|.*|*.)
+              echo "::error::version \"$workspace\" is not numeric x.y.z."
+              echo "::error::The Windows coordinator ships as an MSI, and MSI product versions"
+              echo "::error::cannot carry a pre-release suffix. Pick a numeric version."
+              exit 1 ;;
+          esac
+
           echo "version=$workspace" >> "$GITHUB_OUTPUT"
 
           if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
@@ -67,14 +80,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `coord` says how this platform ships a coordinator, and it is the
+          # only axis the three legs actually differ on:
+          #   msi     — the MSI, and NOT the bare executable. On Windows the
+          #             installer is the delivery, and shipping both invites the
+          #             question of which one is meant.
+          #   binary  — the bare executable, which on Linux *is* the installer
+          #             (D-032): a bare invocation runs the setup wizard.
+          #   none    — no coordinator at all. Nobody runs a macOS coordinator in
+          #             front of a fileserver and nothing tests one, so publishing
+          #             it would be an artifact whose only claim is that it
+          #             compiled.
           - os: windows-latest
             platform: win32
             slug: windows-x86_64
             exe: ".exe"
+            coord: msi
           - os: ubuntu-latest
             platform: linux
             slug: linux-x86_64
             exe: ""
+            coord: binary
           # Exercised on the POSIX path since 2026-08-21 (I-012): CI now runs the
           # unit suite and the end-to-end job on macos-latest, so this is no longer
           # a build-only artifact. Nothing in the endpoint is Linux-specific — no
@@ -88,6 +114,7 @@ jobs:
             platform: darwin
             slug: macos-arm64
             exe: ""
+            coord: none
     steps:
       - uses: actions/checkout@v4
 
@@ -125,13 +152,44 @@ jobs:
             -Output ./dist/chaperone-endpoint-${{ needs.version-gate.outputs.version }}-${{ matrix.slug }}.mcpb `
             -Pack
 
+      # Windows only, and only the pieces `wix build` actually needs. `dotnet` is
+      # preinstalled on the runner; the two extensions are not optional — the
+      # package uses the Firewall extension for the inbound rule and the UI
+      # extension for the licence and finish dialogs.
+      - name: Install the WiX toolchain
+        if: matrix.coord == 'msi'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          # GITHUB_PATH only affects LATER steps, so the two `wix` calls below
+          # need PATH fixed in this shell as well as for the build step.
+          $tools = "$env:USERPROFILE\.dotnet\tools"
+          $env:PATH = "$tools;$env:PATH"
+          $tools | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          wix extension add --global WixToolset.Firewall.wixext/6.0.2
+          wix extension add --global WixToolset.UI.wixext/6.0.2
+          wix --version
+
+      - name: Build the coordinator MSI
+        if: matrix.coord == 'msi'
+        shell: pwsh
+        run: |
+          ./packaging/msi/build-msi.ps1 `
+            -Version ${{ needs.version-gate.outputs.version }} `
+            -CoordExe ./target/release/chapr-coord.exe `
+            -Output ./dist/chapr-coord-${{ needs.version-gate.outputs.version }}-${{ matrix.slug }}.msi
+
       - name: Stage binaries
         shell: bash
         run: |
           set -euo pipefail
           v="${{ needs.version-gate.outputs.version }}"
-          cp "target/release/chapr-coord${{ matrix.exe }}" \
-             "dist/chapr-coord-$v-${{ matrix.slug }}${{ matrix.exe }}"
+          # The coordinator only where this platform ships one as a bare binary.
+          # Windows ships the MSI built above instead; macOS ships none.
+          if [ "${{ matrix.coord }}" = "binary" ]; then
+            cp "target/release/chapr-coord${{ matrix.exe }}" \
+               "dist/chapr-coord-$v-${{ matrix.slug }}${{ matrix.exe }}"
+          fi
           # Both endpoint forms, on every platform. The `.mcpb` is a one-click
           # install for Claude Desktop — but `.mcpb` is *Desktop's* install format,
           # not a cross-vendor one, and the endpoint is a plain MCP stdio server
@@ -184,18 +242,50 @@ jobs:
       # empty file.
       - name: Sanity-check the staged set
         shell: bash
+        env:
+          VERSION: ${{ needs.version-gate.outputs.version }}
         run: |
           set -euo pipefail
           cd staged
           ls -l
-          n=0
-          for f in *; do
-            [ -s "$f" ] || { echo "::error::$f is empty"; exit 1; }
-            n=$((n+1))
+
+          # The set is named, not counted. A count says "8 things are here" and
+          # is satisfied by eight wrong things — it cannot tell a missing MSI
+          # from a stray file that took its place, which is a failure this
+          # asymmetric set now makes possible. Name them, and a leg that silently
+          # stopped producing its artifact fails here instead of shipping.
+          # Stated here rather than derived from what the build produced: a check
+          # that reads its expectations from the thing it is checking proves
+          # nothing. The matrix and this list are meant to be maintained
+          # independently — the check earns its keep precisely when they disagree.
+          expected=(
+            "chapr-coord-$VERSION-windows-x86_64.msi"
+            "chaperone-endpoint-$VERSION-windows-x86_64.mcpb"
+            "chapr-endpoint-$VERSION-windows-x86_64.exe"
+            "chapr-coord-$VERSION-linux-x86_64"
+            "chaperone-endpoint-$VERSION-linux-x86_64.mcpb"
+            "chapr-endpoint-$VERSION-linux-x86_64"
+            "chaperone-endpoint-$VERSION-macos-arm64.mcpb"
+            "chapr-endpoint-$VERSION-macos-arm64"
+          )
+
+          bad=0
+          # `-s` keeps the zero-byte coverage: an empty binary uploads cleanly,
+          # checksums cleanly, and fails only on the machine that runs it.
+          for f in "${expected[@]}"; do
+            [ -s "$f" ] || { echo "::error::missing or empty artifact: $f"; bad=1; }
           done
-          echo "$n artifacts staged"
-          # 3 platforms x (coord + .mcpb bundle + bare endpoint binary).
-          [ "$n" -eq 9 ] || { echo "::error::expected 9 artifacts, staged $n"; exit 1; }
+          # And nothing else — an extra file is a rename nobody updated here, or
+          # a leg producing something it should not.
+          for f in *; do
+            case " ${expected[*]} " in
+              *" $f "*) ;;
+              *) echo "::error::unexpected artifact staged: $f"; bad=1 ;;
+            esac
+          done
+
+          [ "$bad" -eq 0 ] || exit 1
+          echo "${#expected[@]} artifacts staged, all named and non-empty."
 
       # Attest BEFORE the checksum file exists, so the subjects are exactly the
       # things a user runs. Tag-only: attesting a dry run would mint provenance
@@ -235,12 +325,29 @@ jobs:
 
           ## Install
 
-          **Coordinator** — one per site, on-prem beside the fileserver.
+          **Coordinator** — one per site, on-prem beside the fileserver. Note throughout that
+          \`addr\` (where the socket binds) and \`public_url\` (what a laptop connects to) are
+          different settings.
 
-          Download \`chapr-coord-$VERSION-windows-x86_64.exe\` (or the Linux build) and run it
-          with no arguments. The executable *is* the installer: a bare invocation runs the setup
-          wizard, and \`serve\` takes over once a \`coord.toml\` exists. Note that \`addr\` (where
-          the socket binds) and \`public_url\` (what a laptop connects to) are different settings.
+          *Windows:* download \`chapr-coord-$VERSION-windows-x86_64.msi\` and run it. It places the
+          binary, registers and starts the service, and opens the port. For a fleet:
+
+          \`\`\`
+          msiexec /i chapr-coord-$VERSION-windows-x86_64.msi COORD_SHARE=\\\\FS01\\Sales COORD_URL=http://FS01:8787 /qn
+          \`\`\`
+
+          A silent install prints nothing, so the values every laptop needs are written to
+          \`handover.txt\` in the data directory; \`chapr-coord handover\` reprints them. The
+          coordinator configures itself on its first start, and never touches a \`coord.toml\` that
+          already exists — so an upgrade keeps your settings.
+
+          *Linux:* download \`chapr-coord-$VERSION-linux-x86_64\` and run it with no arguments. The
+          executable *is* the installer: a bare invocation runs the setup wizard, and \`serve\`
+          takes over once a \`coord.toml\` exists.
+
+          *macOS:* there is no coordinator build, deliberately. A Mac fronting a shared fileserver
+          is a deployment nobody runs and nothing tests, and an artifact whose only claim is that
+          it compiled is worse than an absent one. The macOS **endpoint** is unaffected.
 
           **Endpoint** — one per user machine. Two forms, same binary.
 
@@ -270,10 +377,13 @@ jobs:
 
           ## Worth knowing
 
-          - **The .mcpb bundles are unsigned.** Signing is broken upstream in the mcpb CLI
-            (\`node-forge\`: "PKCS#7 signature verification not yet implemented"), so Claude Desktop
-            reports every bundle as unsigned regardless. Accountability rests on the audit trail;
-            managed fleets can pre-approve the bundle via Intune/GPO.
+          - **Nothing here is code-signed — the MSI included.** Windows will show a SmartScreen
+            prompt on the installer, and an administrator has to choose to continue past it. That
+            is a deliberate open decision, not an oversight. The \`.mcpb\` bundles cannot be signed
+            even in principle: signing is broken upstream in the mcpb CLI (\`node-forge\`: "PKCS#7
+            signature verification not yet implemented"), so Claude Desktop reports every bundle as
+            unsigned regardless. Accountability rests on the audit trail; managed fleets can
+            pre-approve both via Intune/GPO. Verify what you downloaded with \`SHA256SUMS\`.
           - **Windows binaries link the CRT statically**, so no Visual C++ redistributable is
             needed — the trade is that CRT security fixes arrive with a Chaperone rebuild rather
             than via Windows Update.

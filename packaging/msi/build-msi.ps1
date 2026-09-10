@@ -43,6 +43,7 @@ param(
   [string]$CoordExe,
   [switch]$Build,
   [string]$OutDir,
+  [string]$Output,
   [string]$ChaperoneRoot
 )
 
@@ -67,7 +68,17 @@ if ($Build) {
   Write-Host "Building chapr-coord (release)..."
   & cargo build --release -p chapr-coord --manifest-path (Join-Path $ChaperoneRoot "Cargo.toml")
   if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-  $CoordExe = Join-Path $ChaperoneRoot "target\release\chapr-coord.exe"
+  # Asked for rather than assumed, the same way build-mcpb.ps1 does it: a
+  # hardcoded <root>\target\release is wrong the moment CARGO_TARGET_DIR is set,
+  # and this repo sets it for the WSL toolchain so the two builds do not clobber
+  # each other. The failure would be packaging a stale binary, not an error.
+  $targetDir = Join-Path $ChaperoneRoot "target"
+  $meta = & cargo metadata --format-version 1 --no-deps --manifest-path (Join-Path $ChaperoneRoot "Cargo.toml") 2>$null
+  if ($LASTEXITCODE -eq 0 -and $meta) {
+    $parsed = $meta | ConvertFrom-Json
+    if ($parsed.target_directory) { $targetDir = $parsed.target_directory }
+  }
+  $CoordExe = Join-Path $targetDir "release\chapr-coord.exe"
 }
 
 if (-not (Test-Path $CoordExe)) { throw "coordinator binary not found: $CoordExe (pass -CoordExe, or -Build)" }
@@ -75,8 +86,19 @@ if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
   throw "the wix CLI is not on PATH. Install it with: dotnet tool install --global wix --version 6.0.2"
 }
 
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$out = Join-Path $OutDir "chapr-coord-$Version.msi"
+# -Output names the file outright; -OutDir names its directory and takes the
+# conventional name. The release needs the first, because a published artifact
+# carries a platform slug (`chapr-coord-<v>-windows-x86_64.msi`) that a local
+# build has no use for. Same parameter, same reason, as build-mcpb.ps1 - two
+# sibling packaging scripts with different interfaces is drift that costs later.
+if ($Output) {
+  $out = $Output
+  $dir = Split-Path -Parent $out
+  if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+} else {
+  New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+  $out = Join-Path $OutDir "chapr-coord-$Version.msi"
+}
 $wxs = Join-Path $PSScriptRoot "chapr-coord.wxs"
 
 Write-Host "Packaging $CoordExe -> $out"

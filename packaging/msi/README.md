@@ -111,6 +111,14 @@ and every laptop refuses the connection.
 
 ## Verify
 
+**CI runs this on every push.** The `packaging` job installs the MSI on a hosted
+Windows runner — a clean machine that runs elevated, which is exactly what this
+script needs — and runs the whole thing with `-Port 18899 -Uninstall`. So the
+installer is exercised on every commit rather than whenever someone has an
+elevated shell free. The residual gap, stated rather than hidden: the *exact* MSI
+that gets published is never installed before publication. It is a fresh compile
+of a verified commit, and the release is a draft a human reviews.
+
 `./verify-msi.ps1 -Uninstall` installs on the current machine, asserts the things
 that had never executed outside compilation — service registered, auto-start,
 running, both tokens on disk, firewall rule, `/healthz` answering, bound to all

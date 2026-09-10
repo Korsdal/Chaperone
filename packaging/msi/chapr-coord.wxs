@@ -194,6 +194,7 @@
       <Component Id="CoordExe">
         <File Id="chapr_coord.exe" Name="chapr-coord.exe" Source="$(CoordExe)" KeyPath="yes" />
 
+
         <!-- binPath matches `service_win::install` exactly: same subcommand, same
              flag, an absolute config path. The SCM branch of lifecycle.rs stays
              in the binary for the standalone and Linux cases; this package simply
@@ -214,6 +215,25 @@
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
+      </Component>
+
+      <!-- Apache-2.0 sections 4(a) and 4(d): a redistribution carries the licence
+           and the NOTICE. The licence on the welcome dialog does not satisfy
+           that - it is shown once and never lands on disk, so an administrator
+           who installs this would hold neither. Every other artifact in a release
+           carries both, which made the release notes' claim that they all do
+           quietly false for this one.
+
+           One file per component because WiX will not auto-generate a GUID for a
+           multi-file component whose keypath is unversioned, and a Rust binary
+           carries no version resource. -->
+      <Component Id="CoordLicense">
+        <File Id="LICENSE.txt" Name="LICENSE.txt"
+              Source="$(sys.SOURCEFILEDIR)..\..\LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="CoordNotice">
+        <File Id="NOTICE.txt" Name="NOTICE.txt"
+              Source="$(sys.SOURCEFILEDIR)..\..\NOTICE" KeyPath="yes" />
       </Component>
 
       <Component Id="CoordFirewall" Condition="COORD_FIREWALL = &quot;1&quot;">
