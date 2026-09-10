@@ -86,7 +86,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Added for chapr-endpoint (E-005). `rustls-tls` (E-016) lets it reach an HTTPS
 # coord; Negotiate/Kerberos on top is still deferred (E-015).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+#
+# `rustls-tls-native-roots` is load-bearing and was missing (I-018): `rustls-tls`
+# alone links **webpki-roots**, Mozilla's public CA bundle, and nothing else. The
+# machine's own certificate store was never consulted, so a private certificate
+# was refused no matter where it was installed — and setup's advice to "install
+# this certificate as trusted on the laptops" was false for the whole time TLS
+# has been on by default. The two features are additive: public CAs still work.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "rustls-tls-native-roots",
+] }
 unicode-normalization = "0.1"
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"

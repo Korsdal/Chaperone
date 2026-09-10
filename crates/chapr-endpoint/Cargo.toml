@@ -55,3 +55,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # POSIX backend (exclusive open, CAS re-hash, in-place overwrite) rather than a
 # mock that would skip exactly the code the corruption bug lived next to.
 tempfile = "3"
+# I-018 / F2: a real HTTPS coordinator to drive the client against — the thing
+# that had never been tested. Same crates and versions coord serves TLS with, and
+# a certificate generated the same way `setup --tls-generate` generates one, so
+# the test exercises the shipped shape rather than a convenient approximation.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
+axum.workspace = true
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls.workspace = true

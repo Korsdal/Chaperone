@@ -72,12 +72,51 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// the file indefinitely for every other user, Excel and Explorer included.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// A PEM file holding an extra root certificate to trust, named by path.
+///
+/// The machine's own trust store is consulted first (`rustls-tls-native-roots`),
+/// which is the right answer wherever a certificate can be pushed to the laptops
+/// — a domain with an internal CA, or a fleet tool. This exists for the case that
+/// has neither: a workgroup, or a NAS with local accounts, where the coordinator's
+/// certificate is a file somebody was handed. It also makes the trust path
+/// testable, which the trust store is not.
+const CA_CERT_ENV: &str = "CHAPR_COORD_CA_CERT";
+
 impl CoordClient {
     /// Bind to `base_url`. A trailing slash is trimmed so path joins are clean.
     pub fn new(base_url: impl Into<String>) -> Self {
-        let http = Client::builder()
+        Self::build(base_url.into(), ca_pem_from_env())
+    }
+
+    /// Bind to `base_url`, additionally trusting the PEM certificate(s) in `pem`.
+    ///
+    /// The explicit form of [`CA_CERT_ENV`]. Tests use it because a test cannot
+    /// install a root certificate on the machine running it.
+    pub fn with_ca_pem(base_url: impl Into<String>, pem: Vec<u8>) -> Self {
+        Self::build(base_url.into(), Some(pem))
+    }
+
+    fn build(base_url: String, ca_pem: Option<Vec<u8>>) -> Self {
+        let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
+        if let Some(pem) = ca_pem {
+            match reqwest::Certificate::from_pem_bundle(&pem) {
+                Ok(certs) => {
+                    for c in certs {
+                        builder = builder.add_root_certificate(c);
+                    }
+                }
+                // Warn rather than refuse: without the extra root the connection
+                // fails anyway, and it now fails with a message that names trust
+                // as the cause. A hard error here would only move the complaint.
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "{CA_CERT_ENV} did not parse as PEM; continuing with the machine's trust store only"
+                ),
+            }
+        }
+        let http = builder
             .build()
             // Only fails if the TLS backend cannot initialise, which would make
             // every request fail anyway; fall back rather than poison `new`.
@@ -86,7 +125,7 @@ impl CoordClient {
                 Client::new()
             });
         CoordClient {
-            base: base_url.into().trim_end_matches('/').to_string(),
+            base: base_url.trim_end_matches('/').to_string(),
             http,
             principal: None,
             token: None,
@@ -234,7 +273,7 @@ impl CoordClient {
             .authed(self.http.get(self.url("/healthz")))
             .send()
             .await
-            .map_err(unreachable)?;
+            .map_err(probe_failure)?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -377,9 +416,81 @@ impl CoordClient {
     }
 }
 
+/// Read the extra root certificate named by [`CA_CERT_ENV`], if any.
+fn ca_pem_from_env() -> Option<Vec<u8>> {
+    let path = std::env::var(CA_CERT_ENV).ok().filter(|p| !p.trim().is_empty())?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            tracing::info!(path = %path, "trusting an extra root certificate");
+            Some(bytes)
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "{CA_CERT_ENV} could not be read");
+            None
+        }
+    }
+}
+
+/// The whole source chain of a transport error, flattened onto one line.
+///
+/// reqwest's own `Display` is "error sending request for url (...)" and says
+/// nothing about why; the sentence that identifies the problem is always further
+/// down the chain, in hyper or rustls. Throwing that away is what made a wrong
+/// port and an untrusted certificate the same event (I-018).
+fn transport_cause(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        parts.push(s.to_string());
+        src = s.source();
+    }
+    parts.join(": ")
+}
+
+/// Does this transport failure say the certificate itself was not accepted?
+///
+/// Matched on the chain's text rather than on a type, because rustls' error is
+/// erased behind `reqwest::Error` by the time it gets here. Over-matching is the
+/// safe direction: the worst case is advice about certificates attached to a
+/// failure that mentions one anyway.
+fn is_trust_failure(e: &reqwest::Error) -> bool {
+    let cause = transport_cause(e).to_ascii_lowercase();
+    cause.contains("certificate")
+        || cause.contains("unknownissuer")
+        || cause.contains("notvalidforname")
+}
+
 /// A transport failure means coord could not be reached at all.
-fn unreachable(_e: reqwest::Error) -> ChaprError {
+///
+/// The variant stays unit-typed — it is the wire contract, and every write-path
+/// caller only needs "fail closed". The *cause* is logged instead of carried,
+/// because the person who has to fix a refused certificate is not the code.
+fn unreachable(e: reqwest::Error) -> ChaprError {
+    tracing::warn!(cause = %transport_cause(&e), "coord transport failure");
     ChaprError::CoordUnreachable
+}
+
+/// Map a transport failure from the start-up probe, where a human is reading.
+///
+/// A refused certificate is **not** "the coordinator is unreachable": it is
+/// running, it answered, and this machine declined to trust it. Reporting that as
+/// unreachable sends an administrator to check a service that is fine — the
+/// explanation defect F2 named, and the reason this one call site does not use
+/// [`unreachable`].
+fn probe_failure(e: reqwest::Error) -> ChaprError {
+    if !is_trust_failure(&e) {
+        return unreachable(e);
+    }
+    ChaprError::Internal {
+        message: format!(
+            "the coordinator answered, but this machine does not trust its TLS certificate. \
+             Install that certificate — or the CA that issued it — in this machine's trusted \
+             root store, or set {CA_CERT_ENV} to the path of the certificate file. \
+             The service itself is running; nothing is wrong with the port or the URL. \
+             ({})",
+            transport_cause(&e)
+        ),
+    }
 }
 
 /// Turn an HTTP error response into the `ChaprError` coord encoded in the body,

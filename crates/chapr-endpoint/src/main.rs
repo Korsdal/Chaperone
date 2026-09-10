@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             tracing::error!(
                 %coord_url, error = %e,
-                "coordinator NOT reachable — reads will work, writes will be refused. \
+                "coordinator NOT reachable - reads will work, writes will be refused. \
                  Check the coordinator service is running, that this URL is right, and that \
                  nothing between this machine and it blocks the port."
             );
@@ -193,7 +193,7 @@ fn coordinated_roots(
         Ok(v) if !v.trim().is_empty() => v,
         _ => {
             tracing::warn!(
-                "CHAPR_ROOT is not set — this endpoint will act on any absolute path the \
+                "CHAPR_ROOT is not set - this endpoint will act on any absolute path the \
                  logged-in user can reach, bounded only by their own ACLs (I-010). Set it to \
                  the share that should be coordinated."
             );

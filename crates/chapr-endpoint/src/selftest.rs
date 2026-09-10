@@ -135,7 +135,7 @@ impl Report {
 
 /// Run the deployment self-test. Returns the process exit code.
 pub async fn run() -> u8 {
-    println!("── Chaperone endpoint — deployment self-test ──");
+    println!("-- Chaperone endpoint - deployment self-test --");
 
     let coord_url =
         std::env::var("CHAPR_COORD_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
@@ -177,7 +177,7 @@ pub async fn run() -> u8 {
                 "coordinator reachable",
                 format!(
                     "{coord_url}/healthz failed: {e}. Check the URL, the port, and \
-                     — if it is https — whether this laptop trusts the certificate."
+                     - if it is https - whether this laptop trusts the certificate."
                 ),
             );
             return r.finish().min(255) as u8;
@@ -198,7 +198,7 @@ pub async fn run() -> u8 {
     {
         Ok(_) => r.pass(
             "credentials accepted",
-            "an authenticated route answered — the coordinator token and principal are good"
+            "an authenticated route answered - the coordinator token and principal are good"
                 .to_string(),
         ),
         Err(e) => {
@@ -231,7 +231,7 @@ pub async fn run() -> u8 {
             format!(
                 "configured as {host:?}, which on a laptop means this laptop. Every user \
                  needs the coordinator's hostname. This is the defect D-032 fixed on the \
-                 coordinator side — a laptop configured before that fix still carries it."
+                 coordinator side - a laptop configured before that fix still carries it."
             ),
         );
     } else {
@@ -293,7 +293,7 @@ pub async fn run() -> u8 {
             match crate::mount::default_mounts().universal_name(&dir) {
                 Ok(Some(unc)) => r.pass(
                     "mapped drive resolves to UNC",
-                    format!("{dir} → {unc}; colleagues with a different letter agree on this key"),
+                    format!("{dir} -> {unc}; colleagues with a different letter agree on this key"),
                 ),
                 // `Ok(None)` is the trait's documented answer for "genuinely local, no
                 // UNC form" — a local disk, not a failure. Nothing was resolved, so
@@ -339,7 +339,7 @@ pub async fn run() -> u8 {
         r.unverified(
             what_confined,
             format!(
-                "CHAPR_ROOT is not set, so confinement is off and every path passes — \
+                "CHAPR_ROOT is not set, so confinement is off and every path passes - \
                  nothing was actually checked. The path canonicalises to {}. Set CHAPR_ROOT \
                  to the coordinated share to test this for real.",
                 canon_dir.as_str()
@@ -548,7 +548,7 @@ async fn contention_check(
     } else if winners == 1 && told == 1 {
         r.pass(
             what,
-            "exactly one writer won and the other was told — no silent lost update",
+            "exactly one writer won and the other was told - no silent lost update",
         );
     } else {
         r.fail(
@@ -593,7 +593,7 @@ fn mandatory_lock_check(r: &mut Report, dir: &str, stamp: u32, g: &'static dyn c
                     what,
                     format!(
                         "the FIRST exclusive open failed: {e}. Something else already holds \
-                         this file — most often antivirus or a backup agent scanning the \
+                         this file - most often antivirus or a backup agent scanning the \
                          share. Exclude the share from real-time scanning."
                     ),
                 )
@@ -602,7 +602,7 @@ fn mandatory_lock_check(r: &mut Report, dir: &str, stamp: u32, g: &'static dyn c
         match crate::winfs::ExclusiveFile::open_existing(path.as_str()) {
             Err(_) => r.pass(
                 what,
-                "a second exclusive open was refused while the first was held — \
+                "a second exclusive open was refused while the first was held - \
                  the lock is real, so the write path's correctness core holds",
             ),
             Ok(_second) => r.fail(
