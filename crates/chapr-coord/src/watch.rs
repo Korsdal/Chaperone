@@ -93,7 +93,7 @@ pub async fn apply(st: &AppState, event: &WatchEvent) -> Result<(), ChaprError> 
         WatchEvent::Removed(path) => on_removed(st, path).await,
         WatchEvent::Overflow => {
             let cleared = rescan(st).await?;
-            tracing::warn!(cleared, "change-notify overflow → version index rescan");
+            tracing::warn!(cleared, "change-notify overflow -> version index rescan");
             Ok(())
         }
     }
@@ -198,7 +198,7 @@ mod tests {
         seed_index(&st, &path()).await;
         assert!(is_cached(&st, &path()).await);
         apply(&st, &WatchEvent::Changed(path())).await.unwrap();
-        assert!(!is_cached(&st, &path()).await, "changed → cache miss");
+        assert!(!is_cached(&st, &path()).await, "changed -> cache miss");
     }
 
     #[tokio::test]
@@ -246,7 +246,7 @@ mod tests {
         seed_index(&st, &path()).await;
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.send(WatchEvent::Changed(path())).await.unwrap();
-        drop(tx); // closes the channel → run returns
+        drop(tx); // closes the channel -> run returns
         run(st.clone(), ChannelSource::new(rx)).await;
         assert!(!is_cached(&st, &path()).await);
     }

@@ -7,8 +7,19 @@
 # Generate interactively with `chapr-coord setup`, or copy + edit this file and
 # run `chapr-coord serve --config coord.toml`.
 
+# This coordinator's own home: the admin token, the endpoint token and the TLS
+# material live here, and the database and blob store default under it. Set this
+# and the three below can be left out entirely.
+#
+# It is explicit rather than derived. It used to be inferred from db_url's parent,
+# which meant a db_url missing its `sqlite:` prefix produced a coordinator with
+# neither token — running, serving, and answering 503 on every admin route.
+data_dir = "C:/ProgramData/Chaperone"
+
 # SQLite database (operational state: leases, index, journal, conflicts, audit).
-# Put it on a persistent, backed-up volume.
+# Put it on a persistent, backed-up volume. Defaults to coord.db under data_dir;
+# set it only to put the database somewhere else. It MUST start with `sqlite:`
+# and use forward slashes, on Windows too — coord refuses to start otherwise.
 db_url = "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc"
 
 # Listen address — where the SOCKET BINDS. 0.0.0.0 for a LAN-reachable service,

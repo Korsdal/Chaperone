@@ -79,6 +79,16 @@ enum Cmd {
     RunService {
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
+        /// Values used **only** if `--config` names a file that does not exist.
+        ///
+        /// This is what lets an installer be declarative. The MSI places the
+        /// binary and registers the service with these on its command line; the
+        /// service writes the config on its first start and never again. A
+        /// deferred custom action doing the same work is a step that can be
+        /// skipped without saying so, which is how a registered service ended up
+        /// pointing at a config nobody had written.
+        #[command(flatten)]
+        provision: setup::SetupArgs,
     },
     /// Reprint what to hand out to the users: coordinator URL, token, share path.
     ///
@@ -164,7 +174,22 @@ fn dispatch(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         #[cfg(windows)]
-        Cmd::RunService { config } => service_win::run(config),
+        Cmd::RunService { config, mut provision } => {
+            // Before `service_dispatcher::start`, so this is still an ordinary
+            // process: it can create directories and write files without any of
+            // the SCM's timing constraints, and a failure here is an exit code
+            // rather than a service that starts and stops.
+            provision.config_out = config.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
+            match setup::provision_if_missing(&provision) {
+                Ok(true) => tracing::info!(
+                    config = %provision.config_out.display(),
+                    "first start: wrote a config from the values this service was installed with"
+                ),
+                Ok(false) => {}
+                Err(e) => return Err(e.into()),
+            }
+            service_win::run(config)
+        }
         Cmd::Handover { config, out, json } => {
             setup::handover(config.as_deref(), out.as_deref(), json)
         }
@@ -293,6 +318,18 @@ pub(crate) async fn run_server_ready(
         None => None,
     };
 
+    // Now that both tokens exist, leave the values every laptop needs on disk.
+    // Rewritten on every start rather than only when missing, so a token rotated
+    // by deleting its file does not leave a handover quoting the old one.
+    //
+    // This is the only route to those values for a service nobody watched start:
+    // an installer's console does not exist, and `chapr-coord handover` needs
+    // somebody to think of running it.
+    if let Some(p) = setup::write_handover_file(&cfg, admin_token.as_deref(), endpoint_token.as_deref())
+    {
+        tracing::info!(path = %p.display(), "connection details written");
+    }
+
     let mut state = AppState::new(pool)
         .with_blob_root(cfg.blob_root.as_str())
         .with_auth(auth::from_config(&cfg, endpoint_token.as_deref()))
@@ -309,7 +346,7 @@ pub(crate) async fn run_server_ready(
     if let Some(fallback) = &cfg.auth_fallback {
         tracing::warn!(
             primary = %cfg.auth, %fallback,
-            "auth fallback active — a cutover is in progress; remove it once the primary is admitting everything"
+            "auth fallback active - a cutover is in progress; remove it once the primary is admitting everything"
         );
     }
     tracing::info!(auth = %cfg.auth, backend = %cfg.backend, "connection auth mode");
@@ -401,7 +438,7 @@ pub(crate) async fn run_server_ready(
             // of every write cross the same wire.
             tracing::warn!(
                 %addr,
-                "serving the control channel over PLAINTEXT HTTP — principal headers, \
+                "serving the control channel over PLAINTEXT HTTP - principal headers, \
                  control-plane credentials and file pre-images all cross the network \
                  unencrypted. Run `chapr-coord setup` to generate a certificate, or set \
                  [tls] cert_path/key_path in the config."

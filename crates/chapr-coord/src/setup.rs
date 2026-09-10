@@ -40,6 +40,15 @@ pub struct SetupArgs {
     /// port, which is right far more often than the bind address ever was.
     #[arg(long)]
     pub public_url: Option<String>,
+    /// Where this coordinator keeps everything of its own: database, blob store,
+    /// both tokens, TLS material.
+    ///
+    /// The one location an installer has to know. `--db` and `--blobs` still
+    /// override individually, for the split-volume case the pilot runs (share on
+    /// one volume, coordinator state on another); given neither, they default
+    /// under this. Omitted entirely → the platform's conventional directory.
+    #[arg(long, value_name = "DIR")]
+    pub data_dir: Option<std::path::PathBuf>,
     #[arg(long)]
     pub db: Option<String>,
     #[arg(long)]
@@ -77,6 +86,85 @@ pub struct SetupArgs {
     pub ui: bool,
 }
 
+/// Write a config, data directory and handover for a coordinator that has none.
+///
+/// The service calls this before it starts, and it is what lets an installer be
+/// purely declarative: place the binary, register the service with these values
+/// on its command line, start it. No custom action, and nothing that can be
+/// silently skipped and leave a registered service pointing at a config nobody
+/// wrote - which is exactly what a deferred custom action did.
+///
+/// **A config that already exists is never touched**, so this runs once in a
+/// deployment's life and an upgrade or a restart cannot overwrite an
+/// administrator's edits.
+///
+/// It deliberately does NOT probe. `setup` probes because a human is watching and
+/// can act on the answer; a service starting at boot has nobody to tell, and
+/// refusing to start over an unreachable share would turn a warning into an
+/// outage.
+pub(crate) fn provision_if_missing(args: &SetupArgs) -> Result<bool, String> {
+    if args.config_out.exists() {
+        return Ok(false);
+    }
+    let cfg = config_from_args(args);
+    cfg.validate().map_err(|e| format!("the values this service was installed with do not make a usable config: {e}"))?;
+
+    // Before the config, because SQLite cannot create a database in a directory
+    // that is not there, and because hardening an existing directory is the only
+    // order that leaves no window where the tokens are world-readable.
+    if let Some(dir) = cfg.data_dir() {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    // The blob store too, and before hardening rather than at bring-up: it is
+    // restricted the moment it exists, so there is no window in which file
+    // pre-images land in a world-readable directory. Bring-up still creates it if
+    // it is missing, which covers a config that points it somewhere else.
+    std::fs::create_dir_all(&cfg.blob_root)
+        .map_err(|e| format!("creating {}: {e}", cfg.blob_root))?;
+    if let Some(parent) = args.config_out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&args.config_out, cfg.to_toml())
+        .map_err(|e| format!("writing {}: {e}", args.config_out.display()))?;
+
+    // Tokens first, then the door. `run_server_ready` creates both with
+    // `load_or_create` a moment from now; doing it here as well would duplicate
+    // that, so this only makes the directory they will land in restricted.
+    let warnings = harden_data_dirs(&cfg);
+    for w in &warnings {
+        tracing::warn!("{w}");
+    }
+    Ok(true)
+}
+
+/// Write `handover.txt` for a coordinator that provisioned itself.
+///
+/// Separate from [`provision_if_missing`] because the tokens do not exist yet at
+/// that point - the server mints them during bring-up - so the values every
+/// laptop needs can only be stated once it is up.
+pub(crate) fn write_handover_file(
+    cfg: &Config,
+    admin_token: Option<&str>,
+    endpoint_token: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let dir = cfg.data_dir()?;
+    let admin_path = crate::admin_token::path_in(&dir);
+    let no_token = "no admin token was established; the admin page will refuse to serve data"
+        .to_string();
+    let admin = match admin_token {
+        Some(t) => Ok((t, admin_path.as_path())),
+        None => Err(&no_token),
+    };
+    let path = dir.join(HANDOVER_FILE);
+    match std::fs::write(&path, endpoint_snippet(cfg, admin, endpoint_token)) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not write the handover file");
+            None
+        }
+    }
+}
+
 impl SetupArgs {
     /// Defaults for a wizard run nobody passed flags to — i.e. a double-click.
     ///
@@ -86,12 +174,9 @@ impl SetupArgs {
     /// the PowerShell wrapper contributed that the exe did not do itself.
     pub fn default_for_wizard() -> Self {
         let dir = default_data_dir();
-        // SQLite wants forward slashes in its URL even on Windows.
-        let url_dir = dir.display().to_string().replace('\\', "/");
         SetupArgs {
             config_out: dir.join("coord.toml"),
-            db: Some(format!("sqlite:{url_dir}/coord.db?mode=rwc")),
-            blobs: Some(dir.join("blobs").display().to_string()),
+            data_dir: Some(dir.clone()),
             // A double-click gets the browser wizard. That is the whole point of
             // W2: the person doing this is an IT administrator who was handed an
             // executable, and a terminal full of prompts is what they should not
@@ -103,6 +188,23 @@ impl SetupArgs {
             ..Default::default()
         }
     }
+}
+
+/// Where setup leaves the values every laptop needs, inside the data directory.
+///
+/// Named here rather than inline because the installer's finish dialog opens this
+/// exact path, so the two must agree.
+pub(crate) const HANDOVER_FILE: &str = "handover.txt";
+
+/// The SQLite URL for a database inside `dir`.
+///
+/// One function, because the shape is easy to get subtly wrong and the failure is
+/// silent: SQLite wants forward slashes in its URL even on Windows, and the
+/// `sqlite:` prefix is what tells the rest of coord this URL names a file at all
+/// (I-017).
+pub(crate) fn default_db_url_in(dir: &Path) -> String {
+    let url_dir = dir.display().to_string().replace('\\', "/");
+    format!("sqlite:{url_dir}/coord.db?mode=rwc")
 }
 
 /// Where a coordinator's persistent state belongs on this platform.
@@ -134,31 +236,48 @@ fn config_from_args(args: &SetupArgs) -> Config {
         auth: "shared-secret".to_string(),
         ..Config::default()
     };
-    if let Some(v) = &args.addr {
-        cfg.addr = v.clone();
+    if let Some(v) = set(&args.addr) {
+        cfg.addr = v;
     }
-    cfg.public_url = args.public_url.clone();
-    if let Some(v) = &args.db {
-        cfg.db_url = v.clone();
+    cfg.public_url = set(&args.public_url);
+    // The data directory is written into the config even when `--db` and
+    // `--blobs` point elsewhere, because it is what the tokens and the TLS
+    // material follow. Deriving it from the database's parent is what I-017 was.
+    if let Some(dir) = &args.data_dir {
+        cfg.data_dir = Some(dir.display().to_string());
+        cfg.db_url = default_db_url_in(dir);
+        cfg.blob_root = dir.join("blobs").display().to_string();
     }
-    if let Some(v) = &args.blobs {
-        cfg.blob_root = v.clone();
+    if let Some(v) = set(&args.db) {
+        cfg.db_url = v;
     }
-    if let Some(v) = &args.auth {
-        cfg.auth = v.clone();
+    if let Some(v) = set(&args.blobs) {
+        cfg.blob_root = v;
     }
-    cfg.watch_dir = args.watch_dir.clone();
-    cfg.share_unc = args.share_unc.clone();
-    if let (Some(cert_path), Some(key_path)) = (&args.tls_cert, &args.tls_key) {
-        cfg.tls = Some(TlsConfig {
-            cert_path: cert_path.clone(),
-            key_path: key_path.clone(),
-        });
+    if let Some(v) = set(&args.auth) {
+        cfg.auth = v;
     }
-    if let Some(k) = args.backend.as_ref().and_then(|v| v.parse().ok()) {
+    cfg.watch_dir = set(&args.watch_dir);
+    cfg.share_unc = set(&args.share_unc);
+    if let (Some(cert_path), Some(key_path)) = (set(&args.tls_cert), set(&args.tls_key)) {
+        cfg.tls = Some(TlsConfig { cert_path, key_path });
+    }
+    if let Some(k) = set(&args.backend).and_then(|v| v.parse().ok()) {
         cfg.backend = k;
     }
     cfg
+}
+
+/// A flag that was given a real value, as opposed to given an empty one.
+///
+/// The installer is why this exists. An MSI's `ServiceInstall` arguments are one
+/// formatted string with no way to leave a flag out, so an unanswered field
+/// arrives as `--share-unc ""`. Treating that as "the share is the empty string"
+/// produced a config that validated and coordinated nothing. Empty means unset,
+/// everywhere, so the same flags work from a script, a service registration and a
+/// wizard.
+fn set(v: &Option<String>) -> Option<String> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>> {
@@ -168,7 +287,7 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
     // has a future that can never be `Send`, which stops the wizard's own handler
     // from being a valid axum handler. The front end is chosen in `main`, which
     // is where a choice between front ends belongs.
-    println!("── Chaperone coordination service — setup ──\n");
+    println!("-- Chaperone coordination service - setup --\n");
 
     // Said up front, not discovered at the service-registration step. Reaching
     // that step means the administrator has already answered every question and
@@ -177,7 +296,7 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
     if !args.no_service && !crate::host::is_elevated() {
         println!("  ! Not running as administrator, so registering the Windows service will fail.");
         println!("    Close this, right-click the executable and choose \"Run as administrator\".");
-        println!("    (Or continue anyway — the config is still written, and the wizard will");
+        println!("    (Or continue anyway - the config is still written, and the wizard will");
         println!("     print how to start the service by hand.)\n");
     }
 
@@ -190,23 +309,33 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
     // Before `probe`, which checks the certificate files exist — so a generated
     // pair is validated by the same check as a supplied one rather than trusted.
     if generate_tls && cfg.tls.is_none() {
-        let dir = args
-            .config_out
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
+        // Under the data directory, which is the fourth location I-017's fix
+        // collapses: the certificate and key are coordinator state like the
+        // tokens, and putting them beside `config_out` meant a config written to
+        // one place and its key material written to another whenever those
+        // differed. Falls back to the config's own directory for a config that
+        // names no data directory.
+        let dir = cfg
+            .data_dir()
+            .unwrap_or_else(|| {
+                args.config_out
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf()
+            })
             .join("tls");
         let host = args
             .tls_hostname
             .clone()
             .or_else(machine_hostname)
             .unwrap_or_else(|| "localhost".to_string());
-        println!("\nGenerating a self-signed certificate for {host}…");
+        println!("\nGenerating a self-signed certificate for {host}...");
         cfg.tls = Some(generate_self_signed(&dir, &host)?);
-        println!("  cert → {}", dir.join("coord.crt").display());
-        println!("  key  → {}", dir.join("coord.key").display());
+        println!("  cert -> {}", dir.join("coord.crt").display());
+        println!("  key  -> {}", dir.join("coord.key").display());
         println!(
-            "  valid until {} — note the date; TLS stops working that day.",
+            "  valid until {} - note the date; TLS stops working that day.",
             (chrono::Utc::now() + chrono::Duration::days(CERT_VALID_DAYS))
                 .format("%Y-%m-%d")
         );
@@ -220,10 +349,10 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
     // `--tls-generate` — and before `probe`, which is where `validate` refuses a
     // scheme that contradicts the TLS setting.
     if let Some(url) = reconcile_public_url_scheme(&mut cfg) {
-        println!("  → coordinator URL is now {url}");
+        println!("  -> coordinator URL is now {url}");
     }
 
-    println!("\nChecking the environment…");
+    println!("\nChecking the environment...");
     probe(&cfg).map_err(|e| format!("environment check failed: {e}"))?;
     println!("  ok");
 
@@ -231,7 +360,7 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&args.config_out, cfg.to_toml())?;
-    println!("Wrote config → {}", args.config_out.display());
+    println!("Wrote config -> {}", args.config_out.display());
 
     // The admin token is created **before** hardening, for the same reason the
     // self-signed certificate is (see `generate_self_signed`): hardening restricts
@@ -257,10 +386,35 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
         None => None,
     };
 
+    // Built here and printed at the end, so it can also be written to disk before
+    // the door is locked - the same rule the two tokens follow.
+    //
+    // The file is what makes an install that nobody watched still usable. Setup's
+    // stdout is the only place these values appear, and an installer runs it with
+    // no console at all: the MSI's custom action is a SYSTEM process, so the URL
+    // and both tokens were computed and discarded. It costs no new exposure -
+    // the same directory already holds `admin-token` and `endpoint-token` as
+    // plaintext, restricted to administrators and the service account.
+    let snippet = endpoint_snippet(
+        &cfg,
+        token.as_ref().map(|(t, p)| (t.as_str(), p.as_path())),
+        endpoint_token.as_deref(),
+    );
+    let handover_file = cfg.data_dir().map(|d| d.join(HANDOVER_FILE));
+    if let Some(path) = &handover_file {
+        match std::fs::write(path, &snippet) {
+            Ok(()) => println!("\nConnection details -> {}", path.display()),
+            // Not fatal: the same text is on stdout, and `chapr-coord handover`
+            // reprints it. Losing the file is an inconvenience, not a broken
+            // install, and refusing here would fail an otherwise good setup.
+            Err(e) => eprintln!("\n  ! could not write {}: {e}", path.display()),
+        }
+    }
+
     // Before the service starts, so SQLite's WAL and the first blobs are created
     // inside an already-restricted directory rather than being tightened after
     // the fact (D-029).
-    println!("\nRestricting the data directories…");
+    println!("\nRestricting the data directories...");
     let hardening_warnings = harden_data_dirs(&cfg);
 
     if args.no_service {
@@ -278,14 +432,7 @@ pub async fn run(args: SetupArgs) -> Result<Applied, Box<dyn std::error::Error>>
         }
     }
 
-    print!(
-        "{}",
-        endpoint_snippet(
-            &cfg,
-            token.as_ref().map(|(t, p)| (t.as_str(), p.as_path())),
-            endpoint_token.as_deref(),
-        )
-    );
+    print!("{snippet}");
 
     // Last, so it is the final thing on screen rather than scrolled away by the
     // endpoint snippet. Coord's blob store holds file content, so an unrestricted
@@ -336,9 +483,9 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
         .interact_text()?;
     let port = cfg.addr.rsplit(':').next().unwrap_or("8787").to_string();
     cfg.public_url = Some(format!("http://{}:{port}", host.trim()));
-    println!("  → coordinator URL: {}", cfg.public_url.as_deref().unwrap_or(""));
+    println!("  -> coordinator URL: {}", cfg.public_url.as_deref().unwrap_or(""));
     println!("    This is what goes on every laptop. It is deliberately not the listen");
-    println!("    address above — that binds a socket and is not something a client can use.");
+    println!("    address above - that binds a socket and is not something a client can use.");
 
     // 3. The coordinated share. Asked unconditionally, because it is the value
     //    the handover has to be able to state, and it is keyed by invariant 5 —
@@ -366,9 +513,9 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
         .interact()?;
     cfg.auth = auth_opts[sel].to_string();
     match cfg.auth.as_str() {
-        "shared-secret" => println!("  ✓ Endpoints must present this deployment's token; the handover prints it. The acting user is still asserted rather than proven (that is E-015)."),
-        "disabled" => println!("  ! warning: no connection auth — development / trusted-LAN only."),
-        "trusted-header" => println!("  ! warning: accepts ANY principal header from anyone who can reach the port. Accountability only, and not spoof-proof (concept §13.1)."),
+        "shared-secret" => println!(" Endpoints must present this deployment's token; the handover prints it. The acting user is still asserted rather than proven (that is E-015)."),
+        "disabled" => println!("  ! warning: no connection auth - development / trusted-LAN only."),
+        "trusted-header" => println!("  ! warning: accepts ANY principal header from anyone who can reach the port. Accountability only, and not spoof-proof (concept 13.1)."),
         "negotiate" => println!("  ! note: enforced Negotiate/OIDC is deferred (E-015, D-024); use shared-secret for now."),
         _ => {}
     }
@@ -423,7 +570,7 @@ fn interactive_fill(cfg: &mut Config) -> Result<bool, Box<dyn std::error::Error>
             cfg.tls = Some(TlsConfig { cert_path, key_path });
         }
     } else {
-        println!("  ! warning: serving plaintext HTTP — not for production.");
+        println!("  ! warning: serving plaintext HTTP - not for production.");
     }
 
     Ok(generate_tls)
@@ -475,7 +622,7 @@ fn prompt_for_share(host: &str) -> Result<String, Box<dyn std::error::Error>> {
                 }
             })
             .collect();
-        labels.push("Type a different path…".to_string());
+        labels.push("Type a different path...".to_string());
 
         let sel = Select::new()
             .with_prompt("Which share should Chaperone coordinate?")
@@ -486,7 +633,7 @@ fn prompt_for_share(host: &str) -> Result<String, Box<dyn std::error::Error>> {
             return Ok(found[sel].unc(host));
         }
     } else {
-        println!("  (no local shares found — this host may not be the fileserver)");
+        println!("  (no local shares found - this host may not be the fileserver)");
     }
 
     loop {
@@ -515,7 +662,7 @@ fn validate_share_path(raw: &str) -> Result<String, String> {
     if !raw.starts_with(r"\\") {
         return Err(format!(
             "'{raw}' is not a UNC path. Coordination state is keyed by the UNC form, so \
-             a drive letter here would not match what the endpoints report — use \\\\server\\share."
+             a drive letter here would not match what the endpoints report - use \\\\server\\share."
         ));
     }
     if raw.trim_start_matches('\\').split('\\').filter(|p| !p.is_empty()).count() < 2 {
@@ -523,7 +670,7 @@ fn validate_share_path(raw: &str) -> Result<String, String> {
     }
     if !Path::new(raw).exists() {
         println!(
-            "  note: {raw} is not reachable from this machine. That can be correct — \
+            "  note: {raw} is not reachable from this machine. That can be correct - \
              coord does no file I/O; the endpoints do, as each logged-in user."
         );
     }
@@ -732,6 +879,12 @@ fn is_unsafe_to_harden(p: &Path) -> bool {
 /// integration.
 fn harden_data_dirs(cfg: &Config) -> Vec<String> {
     let mut targets: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&cfg.blob_root)];
+    // First, because it is where both tokens go. With `db_url` and `blob_root`
+    // pointed at another volume — the split-volume deployment — this directory is
+    // named by nothing else in the list, and the tokens would sit unrestricted.
+    if let Some(dir) = cfg.data_dir() {
+        targets.push(dir);
+    }
     // The TLS directory belongs here for the same reason: a private key readable
     // by every user on the fileserver makes the certificate pointless.
     if let Some(tls) = &cfg.tls {
@@ -763,7 +916,7 @@ fn harden_data_dirs(cfg: &Config) -> Vec<String> {
 
         if is_unsafe_to_harden(&canonical) {
             warnings.push(format!(
-                "did NOT restrict {} — it is a shared or top-level directory. \
+                "did NOT restrict {} - it is a shared or top-level directory. \
                  Put coord's database and blob store in their own directory \
                  (e.g. {}) and re-run setup, or restrict it by hand.",
                 canonical.display(),
@@ -884,14 +1037,14 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
 /// Best-effort `/healthz` probe over plain HTTP after the service starts.
 fn best_effort_self_test(cfg: &Config) {
     if cfg.tls.is_some() {
-        println!("Self-test: TLS enabled — verify manually at https://{}/healthz", cfg.addr);
+        println!("Self-test: TLS enabled - verify manually at https://{}/healthz", cfg.addr);
         return;
     }
     std::thread::sleep(Duration::from_millis(500));
     match probe_healthz(&cfg.addr) {
-        Ok(true) => println!("Self-test: /healthz OK ✔"),
-        Ok(false) => println!("Self-test: coord reachable but /healthz not OK yet — check the logs"),
-        Err(e) => println!("Self-test: could not reach coord ({e}) — check the service status"),
+        Ok(true) => println!("Self-test: /healthz OK"),
+        Ok(false) => println!("Self-test: coord reachable but /healthz not OK yet - check the logs"),
+        Err(e) => println!("Self-test: could not reach coord ({e}) - check the service status"),
     }
 }
 
@@ -946,7 +1099,7 @@ fn print_manual_start(config_path: &Path) {
 /// ## The one field coord cannot know
 ///
 /// `command` is the path to `chapr-endpoint` **on the user's machine**, and coord
-/// has never seen it. An MCPB bundle fills it itself (`${__dirname}/server/…`);
+/// has never seen it. An MCPB bundle fills it itself (`${__dirname}/server/...`);
 /// a bare-binary install needs a real path. So it is emitted as a marked
 /// placeholder rather than a guess — a plausible-looking wrong path is worse than
 /// an obvious hole, which is the whole lesson of the defaults.
@@ -975,7 +1128,7 @@ pub(crate) fn mcp_servers_block(cfg: &Config, endpoint_token: Option<&str>) -> S
             env.insert(
                 "CHAPR_COORD_TOKEN".into(),
                 serde_json::Value::String(
-                    "<MISSING — this coordinator enforces auth and has no token file>".into(),
+                    "<MISSING - this coordinator enforces auth and has no token file>".into(),
                 ),
             );
         }
@@ -991,7 +1144,7 @@ pub(crate) fn mcp_servers_block(cfg: &Config, endpoint_token: Option<&str>) -> S
         serde_json::Value::String(
             cfg.share_unc
                 .clone()
-                .unwrap_or_else(|| "<the share path, as UNC — setup recorded none>".to_string()),
+                .unwrap_or_else(|| "<the share path, as UNC - setup recorded none>".to_string()),
         ),
     );
 
@@ -1034,7 +1187,7 @@ pub(crate) fn handover_from(applied: &Applied) -> String {
             .map(|(t, p)| (t.as_str(), p.as_path())),
         applied.endpoint_token.as_deref(),
     );
-    s.push_str("\n── Or paste this into the host's MCP config ──\n");
+    s.push_str("\n-- Or paste this into the host's MCP config --\n");
     s.push_str("Fill in `command`; coord cannot know where the endpoint lives on a user's machine.\n\n");
     s.push_str(&mcp_servers_block(
         &applied.cfg,
@@ -1092,7 +1245,7 @@ pub fn handover(
     } else {
         print!("{prose}");
         println!(
-            "\n── Or paste this into the host's MCP config ──\n\
+            "\n-- Or paste this into the host's MCP config --\n\
              Fill in `command`; coord cannot know where the endpoint lives on a user's\n\
              machine. An .mcpb bundle sets it itself.\n\n{block}"
         );
@@ -1105,7 +1258,7 @@ pub fn handover(
         // thinks it was locked down when it was not is worse off than one who
         // knows it is readable.
         let restricted = restrict_handover_file(path);
-        eprintln!("\nWrote {} — it contains the deployment token.", path.display());
+        eprintln!("\nWrote {} - it contains the deployment token.", path.display());
         match restricted {
             Ok(()) => eprintln!(
                 "  Readable only by you and by administrators. Delete it once distributed."
@@ -1190,10 +1343,10 @@ fn endpoint_snippet(
 
     let _ = write!(
         s,
-        "\n── Where to watch this ──\n  \
+        "\n-- Where to watch this --\n  \
          Admin page:   {base}/admin\n    \
          Overview, failures with what fixes them, conflicts, leases, audit trail,\n    \
-         and the settings — including how to change the connection auth mode safely.\n  \
+         and the settings - including how to change the connection auth mode safely.\n  \
          Health check: {base}/healthz\n"
     );
 
@@ -1201,9 +1354,9 @@ fn endpoint_snippet(
         Ok((token, path)) => {
             let _ = write!(
                 s,
-                "\n── Sign in to the admin page with this ──\n  \
+                "\n-- Sign in to the admin page with this --\n  \
                  {token}\n  \
-                 Kept in {} — a directory restricted to administrators, so the file\n  \
+                 Kept in {} - a directory restricted to administrators, so the file\n  \
                  itself is the safe place for it. Read it again any time.\n  \
                  It does not depend on the auth mode, which is deliberate: it is the\n  \
                  way back in if a change to the auth setting turns out to be wrong.\n",
@@ -1219,7 +1372,7 @@ fn endpoint_snippet(
         }
     }
 
-    let _ = write!(s, "\n── Give this to the users ──\n  Coordinator URL:      {base}\n");
+    let _ = write!(s, "\n-- Give this to the users --\n  Coordinator URL:      {base}\n");
     // The token belongs in *this* section, not with the admin token: it is not a
     // secret for the administrator to keep, it is a value every laptop needs. An
     // install whose handover omitted it would look complete and admit nobody.
@@ -1228,11 +1381,11 @@ fn endpoint_snippet(
             let _ = write!(
                 s,
                 "  Coordinator token:    {t}\n    \
-                 The same value for everyone here — it proves a laptop is one of this\n    \
+                 The same value for everyone here - it proves a laptop is one of this\n    \
                  deployment's endpoints, and is not a personal password. Without it this\n    \
                  coordinator answers 401. A packager can bake it into the .mcpb so users\n    \
                  type nothing; otherwise they paste it once, beside the URL.\n    \
-                 It does NOT make the acting user verified — that is E-015. What it stops\n    \
+                 It does NOT make the acting user verified - that is E-015. What it stops\n    \
                  is a stranger on the network acting as anyone at all.\n"
             );
         }
@@ -1251,7 +1404,7 @@ fn endpoint_snippet(
         _ => {
             let _ = write!(
                 s,
-                "  Coordinator token:    (none — auth is \"{}\", which authenticates nobody)\n    \
+                "  Coordinator token:    (none - auth is \"{}\", which authenticates nobody)\n    \
                  Anyone who can reach the port can act as any user. Acceptable only on a\n    \
                  network where that is already true; switch to \"shared-secret\" otherwise.\n",
                 cfg.auth
@@ -1269,7 +1422,7 @@ fn endpoint_snippet(
         None => {
             let _ = write!(
                 s,
-                "  Coordinated location: (not configured here — the share path, as UNC)\n    \
+                "  Coordinated location: (not configured here - the share path, as UNC)\n    \
                  Setup did not record one, so this is the one value you have to\n    \
                  supply from memory. Re-run setup to store it.\n"
             );
@@ -1278,9 +1431,9 @@ fn endpoint_snippet(
     let _ = write!(
         s,
         "    Both are fields in the endpoint bundle's own install dialog. A mapped\n    \
-         drive letter is fine — it is resolved to its UNC form, so users with\n    \
+         drive letter is fine - it is resolved to its UNC form, so users with\n    \
          different letters still agree on which file is which.\n  \
-         Listening on {} — that is where the socket binds, not what the\n    \
+         Listening on {} - that is where the socket binds, not what the\n    \
          laptops type. The URL above is the one to hand out.\n  \
          Identity is auto-derived from each user's OS logon (auth mode: {}). Nothing to type.\n  \
          Backend is auto-selected per endpoint OS and confirmed against coord's announcement ({}).\n",
@@ -1289,19 +1442,19 @@ fn endpoint_snippet(
 
     let _ = write!(
         s,
-        "\n── When something breaks ──\n  \
+        "\n-- When something breaks --\n  \
          Whole fleet:  the admin page's Errors tab.\n  \
          One laptop:   %LOCALAPPDATA%\\Chaperone\\diagnostics.jsonl on that machine.\n    \
          That second one matters: a laptop that cannot reach the coordinator\n    \
          cannot report it to the coordinator.\n  \
          Only unexpected faults appear there. A write that lost a compare-and-swap,\n  \
-         or a document someone has open in Word, is a designed outcome — look under\n  \
+         or a document someone has open in Word, is a designed outcome - look under\n  \
          Conflicts and Leases for those.\n"
     );
 
     let _ = write!(
         s,
-        "\n── Back up together ──\n  \
+        "\n-- Back up together --\n  \
          Database:   {}\n  \
          Blob store: {}\n    \
          History is only restorable if both are restored from the same moment.\n",
@@ -1415,7 +1568,7 @@ mod tests {
         let text = endpoint_snippet(&cfg, Ok(("tok-abc", path)), Some("endpoint-tok-xyz"));
 
         let handout = text
-            .split("── Give this to the users ──")
+            .split("-- Give this to the users --")
             .nth(1)
             .expect("the handout section exists");
         let url_line = handout
@@ -1596,7 +1749,7 @@ mod tests {
     fn probe_passes_on_a_free_port_and_writable_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = Config {
-            addr: "127.0.0.1:0".into(), // ephemeral → always bindable
+            addr: "127.0.0.1:0".into(), // ephemeral -> always bindable
             blob_root: tmp.path().join("blobs").display().to_string(),
             ..Config::default()
         };
@@ -1616,6 +1769,125 @@ mod tests {
             ..Config::default()
         };
         assert!(probe(&cfg).is_err());
+    }
+
+    #[test]
+    fn an_empty_flag_means_unset_rather_than_an_empty_value() {
+        // The installer's constraint, made a property of the flags themselves. An
+        // MSI's ServiceInstall arguments are one formatted string with no way to
+        // omit a flag, so every unanswered field arrives as `--flag ""`. Taken
+        // literally that is a coordinator fronting the share named "", which
+        // validates and coordinates nothing.
+        let args = SetupArgs {
+            addr: Some("0.0.0.0:8787".into()),
+            share_unc: Some(r"\\FILESRV01\Sales".into()),
+            public_url: Some("   ".into()),
+            watch_dir: Some(String::new()),
+            ..Default::default()
+        };
+        let cfg = config_from_args(&args);
+        assert_eq!(cfg.addr, "0.0.0.0:8787");
+        assert_eq!(cfg.share_unc.as_deref(), Some(r"\\FILESRV01\Sales"));
+        assert_eq!(cfg.public_url, None, "an empty URL flag must read as unset");
+        assert_eq!(cfg.watch_dir, None);
+    }
+
+    #[test]
+    fn a_service_provisions_a_config_it_does_not_have() {
+        // The installer's whole contract: it registers a service with these
+        // values and starts it, and nothing else writes the config. If this does
+        // not happen the service comes up against a file that does not exist,
+        // which is exactly the failure that removed the custom action.
+        //
+        // The written file is deliberately NOT read back here. Provisioning ends
+        // by restricting the directory to administrators and the service account
+        // (D-029), which an ordinary test process cannot then read - the same
+        // reason an unelevated `serve` cannot read its own config. The content is
+        // `config_from_args`, covered by the test above.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Chaperone");
+        let args = SetupArgs {
+            config_out: dir.join("coord.toml"),
+            data_dir: Some(dir.clone()),
+            addr: Some("0.0.0.0:8787".into()),
+            ..Default::default()
+        };
+        assert!(provision_if_missing(&args).unwrap(), "a missing config is written");
+        assert!(dir.exists(), "the data directory is created, or SQLite has nowhere to go");
+    }
+
+    #[test]
+    fn provisioning_never_touches_a_config_that_exists() {
+        // Every start after the first. An administrator's edits outlive the
+        // service that wrote the file, and an upgrade must not reset them.
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("coord.toml");
+        std::fs::write(&existing, "# edited by hand\ndb_url = \"sqlite::memory:\"\n").unwrap();
+        let args = SetupArgs {
+            config_out: existing.clone(),
+            addr: Some("0.0.0.0:9999".into()),
+            ..Default::default()
+        };
+        assert!(!provision_if_missing(&args).unwrap());
+        let after = std::fs::read_to_string(&existing).unwrap();
+        assert!(after.contains("edited by hand"), "{after}");
+        assert!(!after.contains("9999"), "{after}");
+    }
+
+    #[test]
+    fn provisioning_refuses_values_that_would_not_make_a_usable_config() {
+        // Fail at the point the values arrive, not four screens later as a
+        // coordinator with no tokens (I-017).
+        let tmp = tempfile::tempdir().unwrap();
+        let args = SetupArgs {
+            config_out: tmp.path().join("coord.toml"),
+            db: Some(r"C:\ProgramData\Chaperone\coord.db".into()),
+            ..Default::default()
+        };
+        let err = provision_if_missing(&args).unwrap_err();
+        assert!(err.contains("sqlite:"), "{err}");
+        assert!(!args.config_out.exists(), "nothing is written when the values are refused");
+    }
+
+    #[test]
+    fn one_data_dir_places_the_database_and_the_blob_store() {
+        // What makes the MSI a single property instead of four (I-017, D-049).
+        let args = SetupArgs {
+            data_dir: Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone")),
+            ..Default::default()
+        };
+        let cfg = config_from_args(&args);
+        assert_eq!(
+            cfg.db_url,
+            "sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc",
+            "SQLite wants forward slashes, and the sqlite: prefix is what tells the rest of \
+             coord this names a file"
+        );
+        assert_eq!(cfg.blob_root, r"C:\ProgramData\Chaperone\blobs");
+        assert_eq!(
+            cfg.data_dir(),
+            Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone"))
+        );
+        cfg.validate().expect("the derived database URL must satisfy the strict reading");
+    }
+
+    #[test]
+    fn explicit_locations_still_override_the_data_directory() {
+        // The split-volume deployment: state has a home, the database lives
+        // elsewhere, and the tokens follow the home rather than the database.
+        let args = SetupArgs {
+            data_dir: Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone")),
+            db: Some("sqlite:D:/coordstate/coord.db?mode=rwc".into()),
+            blobs: Some(r"D:\coordstate\blobs".into()),
+            ..Default::default()
+        };
+        let cfg = config_from_args(&args);
+        assert_eq!(cfg.db_url, "sqlite:D:/coordstate/coord.db?mode=rwc");
+        assert_eq!(cfg.blob_root, r"D:\coordstate\blobs");
+        assert_eq!(
+            cfg.data_dir(),
+            Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone"))
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ impl TlsConfig {
                     "TLS is configured but the {label} is not there: {path}\n\
                      Either run `chapr-coord setup` to generate a self-signed pair, point \
                      cert_path/key_path at your own PEM files, or remove the [tls] section to \
-                     serve plaintext HTTP (not recommended — the control channel carries \
+                     serve plaintext HTTP (not recommended - the control channel carries \
                      principal headers and file pre-images)."
                 ));
             }
@@ -70,6 +70,22 @@ pub struct BackendRoute {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// The coordinator's own home: database, blob store, both tokens, TLS.
+    ///
+    /// Explicit because the alternative was inference, and inference was wrong.
+    /// Before this field the token directory was derived from `db_url`'s parent,
+    /// which meant a `db_url` the loose parser accepted and the strict one did not
+    /// — a bare path with no `sqlite:` prefix — silently produced a coordinator
+    /// with **no admin token and no endpoint token**, running, serving, and
+    /// answering 503 on every admin route (I-017). One value now says where the
+    /// coordinator lives.
+    ///
+    /// `None` keeps the old behaviour for configs written before this existed:
+    /// fall back to the database's directory. `db_url` and `blob_root` stay
+    /// separately settable, because the pilot deployment genuinely splits them —
+    /// share on one volume, coordinator state on another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
     pub db_url: String,
     pub addr: String,
     /// The base URL laptops actually connect to — a hostname, not a bind address.
@@ -136,6 +152,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            data_dir: None,
             db_url: "sqlite:chapr-coord.db".into(),
             addr: "127.0.0.1:8787".into(),
             public_url: None,
@@ -250,13 +267,26 @@ impl Config {
         toml::to_string_pretty(self).unwrap_or_default()
     }
 
-    /// The coordinator's own data directory — where the database lives.
+    /// The coordinator's own data directory: both tokens and the TLS material.
     ///
-    /// Also where the admin token goes, which is the point: this directory is
-    /// already restricted to administrators and the service account by the
-    /// installer (D-029), so the token's confidentiality is a protection that
-    /// already exists rather than a new secret-management problem.
+    /// This directory is restricted to administrators and the service account by
+    /// the installer (D-029), which is why the tokens live in it — their
+    /// confidentiality is a protection that already exists rather than a new
+    /// secret-management problem.
+    ///
+    /// The explicit [`Config::data_dir`] field wins. Falling back to the
+    /// database's directory keeps configs written before that field existed
+    /// working unchanged; it is not the preferred answer, because it is the
+    /// inference that lost both tokens to a missing `sqlite:` prefix (I-017).
     pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        if let Some(dir) = self
+            .data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            return Some(std::path::PathBuf::from(dir));
+        }
         db_file_path(&self.db_url)
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .filter(|d| !d.as_os_str().is_empty())
@@ -336,6 +366,29 @@ impl Config {
     /// Only rules that are *structurally* wrong live here — whether a path exists
     /// is `setup::probe`'s job, and it runs against a candidate before it is saved.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // I-017: two functions held different definitions of `db_url`, and the
+        // lenient one was the visible one. `SqliteConnectOptions::from_str`
+        // accepts a bare path, so the database opened and the service ran;
+        // `db_file_path` requires the `sqlite:` prefix, so the data directory —
+        // and with it BOTH tokens — silently did not exist. The symptom was
+        // "the admin page does not accept the token", which is neither the page
+        // nor the token.
+        //
+        // Refusing at load makes the strict definition the only one. An explicit
+        // `data_dir` would now save the tokens, but the config would still be one
+        // whose database location nothing else can reason about, so the check is
+        // unconditional rather than "unless data_dir is set".
+        if !self.db_url.starts_with("sqlite:") {
+            return Err(ConfigError(format!(
+                "db_url {:?} is not a SQLite URL. It must start with `sqlite:` - e.g. \
+                 sqlite:C:/ProgramData/Chaperone/coord.db?mode=rwc, with forward slashes. \
+                 A bare path appears to work: the database opens and the service starts, \
+                 but the data directory is then unknown, so no admin token and no endpoint \
+                 token are ever written and every admin route answers 503.",
+                self.db_url
+            )));
+        }
+
         // `disabled` never fails, so a fallback behind it is unreachable. Saving
         // that would look like a configured cutover and be a no-op.
         if self.auth == "disabled" && self.auth_fallback.is_some() {
@@ -377,7 +430,7 @@ impl Config {
         {
             if !raw.starts_with("http://") && !raw.starts_with("https://") {
                 return Err(ConfigError(format!(
-                    "public_url {raw:?} needs a scheme — e.g. http://{raw}"
+                    "public_url {raw:?} needs a scheme - e.g. http://{raw}"
                 )));
             }
 
@@ -417,8 +470,8 @@ impl Config {
             {
                 return Err(ConfigError(format!(
                     "public_url {raw:?} names {host:?}, which no other machine can reach, but \
-                     addr {:?} is listening for them. Use the coordinator's hostname — the name \
-                     the laptops resolve — not its bind address.",
+                     addr {:?} is listening for them. Use the coordinator's hostname - the name \
+                     the laptops resolve - not its bind address.",
                     self.addr
                 )));
             }
@@ -842,6 +895,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(mem.data_dir(), None);
+    }
+
+    #[test]
+    fn an_explicit_data_dir_wins_over_the_database_directory() {
+        // The split-volume case the pilot runs: coordinator state on one volume,
+        // the database somewhere else entirely. Before this field the tokens
+        // followed the database, which is not where the hardened directory is.
+        let cfg = Config {
+            data_dir: Some(r"C:\ProgramData\Chaperone".into()),
+            db_url: "sqlite:D:/coordstate/coord.db?mode=rwc".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.data_dir(),
+            Some(std::path::PathBuf::from(r"C:\ProgramData\Chaperone"))
+        );
+    }
+
+    #[test]
+    fn a_bare_path_db_url_is_refused_at_load() {
+        // I-017. `SqliteConnectOptions::from_str` accepts this and the service
+        // starts, so nothing downstream ever notices; the only symptom is both
+        // tokens missing and every admin route answering 503. The strict reading
+        // is now the only reading.
+        let cfg = Config {
+            db_url: r"C:\ProgramData\Chaperone\coord.db".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.0.contains("sqlite:"), "{}", err.0);
+        assert!(err.0.contains("503"), "the message must name the symptom: {}", err.0);
+
+        // Still legal: the pseudo-target, which names no directory on purpose.
+        let mem = Config {
+            db_url: "sqlite::memory:".into(),
+            ..Default::default()
+        };
+        mem.validate().expect("an in-memory database is a valid configuration");
     }
 
     #[test]

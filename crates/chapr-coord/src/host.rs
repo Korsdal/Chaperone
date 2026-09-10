@@ -104,7 +104,7 @@ pub fn pause_if_own_console() {
         return;
     }
     use std::io::{BufRead, Write};
-    print!("\nPress Enter to close this window… ");
+    print!("\nPress Enter to close this window... ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);

@@ -116,7 +116,7 @@ pub async fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let port = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{port}/?t={token}");
 
-    println!("── Chaperone coordination service — setup ──\n");
+    println!("-- Chaperone coordination service - setup --\n");
     if !elevated {
         println!("  ! Not running as administrator. The config can still be written, but");
         println!("    registering the service will fail. Close this and re-run elevated if");
@@ -180,7 +180,7 @@ fn open_browser(url: &str) {
     let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
 
     if spawned.is_err() {
-        println!("  (could not open a browser automatically — use the link above)");
+        println!("  (could not open a browser automatically - use the link above)");
     }
 }
 
@@ -221,6 +221,10 @@ async fn apply(State(w): State<Arc<Wizard>>, Json(form): Json<Form>) -> axum::re
         no_service: !form.install_service,
         addr: Some(form.addr.clone()),
         public_url: Some(format!("{scheme}://{}:{port}", form.hostname.trim())),
+        // The page still collects the database and blob locations individually,
+        // so it states them; a data directory derived from them would be the
+        // inference I-017 was. Adding a field to the page is a later change.
+        data_dir: None,
         db: Some(form.db_url.clone()),
         blobs: Some(form.blob_root.clone()),
         auth: Some(form.auth.clone()),
@@ -280,8 +284,24 @@ fn render(token: &str, args: &SetupArgs) -> String {
         .addr
         .clone()
         .unwrap_or_else(|| "0.0.0.0:8787".to_string());
-    let db = args.db.clone().unwrap_or_else(|| cfg.db_url.clone());
-    let blobs = args.blobs.clone().unwrap_or_else(|| cfg.blob_root.clone());
+    // A double-click arrives with `--data-dir` and nothing else, so the page's two
+    // location fields are derived from it here. Without this they fall back to
+    // `Config::default()`'s *relative* paths, and a hand-delivered executable
+    // would offer to put a customer's coordinator state in their Downloads folder.
+    let db = args
+        .db
+        .clone()
+        .or_else(|| args.data_dir.as_deref().map(crate::setup::default_db_url_in))
+        .unwrap_or_else(|| cfg.db_url.clone());
+    let blobs = args
+        .blobs
+        .clone()
+        .or_else(|| {
+            args.data_dir
+                .as_ref()
+                .map(|d| d.join("blobs").display().to_string())
+        })
+        .unwrap_or_else(|| cfg.blob_root.clone());
     let share = args.share_unc.clone().unwrap_or_default();
     let watch = args.watch_dir.clone().unwrap_or_default();
     let config_out = args.config_out.display().to_string();

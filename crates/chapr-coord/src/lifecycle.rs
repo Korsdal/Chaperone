@@ -46,7 +46,7 @@ pub struct ServiceState {
 /// operator diagnosing a bad install needs to know *which* is wrong: the config
 /// loads, the service exists, the service runs, and the port answers.
 pub async fn status(config: Option<&Path>) -> i32 {
-    println!("── Chaperone coordination service — status ──\n");
+    println!("-- Chaperone coordination service - status --\n");
 
     let cfg = match Config::load(config) {
         Ok(c) => {
@@ -56,7 +56,7 @@ pub async fn status(config: Option<&Path>) -> i32 {
         Err(e) => {
             // Not fatal to the rest: the service can be installed and running on
             // a config this invocation cannot see, which is itself worth knowing.
-            println!("  config        NOT loaded — {e}");
+            println!("  config        NOT loaded - {e}");
             println!("                (the service may still be running on a config");
             println!("                 this command was not pointed at)");
             None
@@ -80,10 +80,10 @@ pub async fn status(config: Option<&Path>) -> i32 {
         match crate::setup::probe_healthz(&cfg.addr) {
             Ok(true) => {
                 healthy = true;
-                println!("  responding    yes — {url}/healthz");
+                println!("  responding    yes - {url}/healthz");
             }
             Ok(false) => println!("  responding    connected, but /healthz did not answer ok"),
-            Err(e) => println!("  responding    no — {e}"),
+            Err(e) => println!("  responding    no - {e}"),
         }
         println!("\n  Admin page    {url}/admin");
         if let Some(dir) = cfg.data_dir() {
@@ -105,7 +105,7 @@ pub async fn status(config: Option<&Path>) -> i32 {
         println!(
             "\n  ! Registered and started, but nothing answered on the port. Check that\n    \
                the bind address is reachable and that the config the SERVICE runs on is\n    \
-               the one you think it is — `sc qc ChaprCoord` shows its command line."
+               the one you think it is - `sc qc ChaprCoord` shows its command line."
         );
     }
 
@@ -115,7 +115,7 @@ pub async fn status(config: Option<&Path>) -> i32 {
 /// `chapr-coord uninstall`. Stops and removes the service; keeps every byte of
 /// data and says where it is.
 pub fn uninstall(config: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("── Chaperone coordination service — uninstall ──\n");
+    println!("-- Chaperone coordination service - uninstall --\n");
 
     // Loaded first and only to report the data locations. A config that will not
     // load must not stop the service being removed: "the config is broken" is one
@@ -150,7 +150,7 @@ pub fn uninstall(config: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
-    println!("\n── What was kept, on purpose ──");
+    println!("\n-- What was kept, on purpose --");
     match &cfg {
         Some(cfg) => {
             println!("  Database      {}", cfg.db_url);
@@ -162,7 +162,7 @@ pub fn uninstall(config: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
             println!(
                 "\n  The audit trail and every file version live here. Restoring history\n  \
                  needs the database and the blob store from the SAME moment, so delete\n  \
-                 them together or not at all — and only once you are sure.\n  \
+                 them together or not at all - and only once you are sure.\n  \
                  The tokens remain valid until the directory is gone."
             );
         }
@@ -170,7 +170,7 @@ pub fn uninstall(config: Option<&Path>) -> Result<(), Box<dyn std::error::Error>
             println!(
                 "  The config could not be read, so the paths cannot be named here.\n  \
                  Nothing was deleted. The data directory is wherever that config\n  \
-                 pointed — by default %ProgramData%\\Chaperone on Windows."
+                 pointed - by default %ProgramData%\\Chaperone on Windows."
             );
         }
     }
@@ -245,10 +245,10 @@ fn describe_scm_error(e: &windows_service::Error) -> String {
     };
     match code {
         Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
-            "no service registered under that name — setup has not run here".into()
+            "no service registered under that name - setup has not run here".into()
         }
         Some(ERROR_ACCESS_DENIED) => {
-            "access denied reading the service — run as administrator; it may well exist".into()
+            "access denied reading the service - run as administrator; it may well exist".into()
         }
         Some(c) => format!("service manager returned error {c}"),
         None => format!("{e}"),
@@ -378,5 +378,5 @@ fn service_state() -> ServiceState {
 
 #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
 fn remove_service() -> Result<String, String> {
-    Err("no service integration on this platform — nothing was installed".into())
+    Err("no service integration on this platform - nothing was installed".into())
 }

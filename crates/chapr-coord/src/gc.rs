@@ -160,7 +160,7 @@ pub async fn sweep(st: &AppState, cfg: &GcConfig) -> Result<GcReport, ChaprError
             keep.remove(&b.hash);
             over = over.saturating_sub(b.size);
         }
-        tracing::warn!(ceiling = cfg.ceiling_bytes, kept_bytes, "blob store over ceiling — evicting oldest beyond floor");
+        tracing::warn!(ceiling = cfg.ceiling_bytes, kept_bytes, "blob store over ceiling - evicting oldest beyond floor");
     }
 
     // Sweep: delete every blob file not in the keep set, except ones written so

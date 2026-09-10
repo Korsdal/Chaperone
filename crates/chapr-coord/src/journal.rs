@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn recover_refuses_a_live_entry() {
         let st = AppState::new(db::test_pool().await);
-        open_live(&st).await; // lease still alive → Live, not dangling
+        open_live(&st).await; // lease still alive -> Live, not dangling
         let err = recover(&st, &path()).await.unwrap_err();
         assert!(matches!(err, ChaprError::Internal { .. }));
     }
