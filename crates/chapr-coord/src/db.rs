@@ -14,171 +14,16 @@
 //! 3339 text: integer comparison in SQL is exact and index-friendly, which the
 //! lazy-expiry sweep (`WHERE expiry_ms <= ?`) depends on. Conversion to/from
 //! [`chrono::DateTime<Utc>`] happens at the Rust boundary.
+//!
+//! **The schema lives in `migrations/`, not here** (C0, D-041). `0001_baseline`
+//! is the schema as it stood at v0.1.4 and carries the per-table notes that used
+//! to sit on the `SCHEMA` constant.
 
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 use std::str::FromStr;
 use std::time::Duration;
-
-/// The schema through E-003: the lease table and the version index.
-///
-/// `leases`: one row per `(lease_id, path)` — a single lease covering N paths is
-/// N rows sharing a `lease_id`. Makes the per-path conflict check a trivial
-/// indexed lookup, the hot operation on `lease_acquire`.
-///
-/// `version_index`: the BLAKE3 hash cache (concept §4.2), one current entry per
-/// canonical path. The resolve lookup matches on the composite
-/// `(path, mtime_ms, size)` key — a changed file (different mtime/size) is a
-/// miss even though the `path` row still exists, which is exactly the
-/// stale-cache signal the endpoint needs (concept §8.1). Populated lazily via
-/// the refresh call until the change-watcher exists (deferred; §14).
-///
-/// `move_journal`: the in-flight-move record (B3). A **new table** rather than
-/// columns on `journal`, and that is not only a modelling preference: [`migrate`]
-/// is `CREATE TABLE IF NOT EXISTS` and nothing more, so a new table appears on an
-/// existing database while a new *column* on an existing table would be silently
-/// skipped — the deployed coordinator would then be asked for a column it does
-/// not have. Until C0's migration machinery lands, additive-by-table is the only
-/// schema change that reaches an install that already ran.
-///
-/// Later subsystems (intent journal E-004, history/conflict/audit) add tables.
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS leases (
-    lease_id       TEXT    NOT NULL,
-    path           TEXT    NOT NULL,   -- canonical (concept §5.1); keyed per invariant 5
-    principal      TEXT    NOT NULL,   -- AD principal that holds the lease
-    session_id     TEXT    NOT NULL,   -- acquiring session (for lease_* audit)
-    purpose        TEXT    NOT NULL,   -- LeasePurpose, serde snake_case
-    granted_at_ms  INTEGER NOT NULL,
-    ttl_s          INTEGER NOT NULL,
-    renewed_at_ms  INTEGER NOT NULL,
-    hard_expiry_ms INTEGER NOT NULL,   -- granted_at + max lifetime (concept §9)
-    expiry_ms      INTEGER NOT NULL,   -- renewed_at + ttl; the heartbeat expiry
-    PRIMARY KEY (lease_id, path)
-);
-CREATE INDEX IF NOT EXISTS idx_leases_path ON leases(path);
-
-CREATE TABLE IF NOT EXISTS version_index (
-    path          TEXT    PRIMARY KEY,  -- canonical
-    version       TEXT    NOT NULL,     -- BLAKE3 hex (invariant 2)
-    mtime_ms      INTEGER NOT NULL,     -- observed modification time
-    size          INTEGER NOT NULL,     -- observed size in bytes
-    updated_at_ms INTEGER NOT NULL      -- when coord last refreshed this entry
-);
-
-CREATE TABLE IF NOT EXISTS journal (
-    path              TEXT    PRIMARY KEY,  -- canonical; at most one in-flight write per path
-    lease_id          TEXT    NOT NULL,     -- the write's owning lease (liveness ⇒ live vs dangling)
-    principal         TEXT    NOT NULL,
-    pre_image_version TEXT    NOT NULL,     -- last known-good; points into history (blob store)
-    intended_version  TEXT,                 -- NULL if crashed before hashing new content (concept §5.2)
-    opened_at_ms      INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS move_journal (
-    src                   TEXT    PRIMARY KEY,  -- canonical; at most one in-flight move per source
-    dst                   TEXT    NOT NULL,     -- canonical; where the file is headed
-    lease_id              TEXT    NOT NULL,     -- the dual {src,dst} lease (liveness ⇒ live vs dangling)
-    principal             TEXT    NOT NULL,
-    session_id            TEXT    NOT NULL,
-    version               TEXT    NOT NULL,     -- src's CAS-verified version; what dst must hash to
-    size                  INTEGER NOT NULL,
-    overwrite             INTEGER NOT NULL,     -- 0/1; whether dst existed and went through CAS
-    dst_pre_image_version TEXT,                 -- overwrite only: the snapshot the rename destroyed
-    dst_pre_image_size    INTEGER,              -- set together with the version, or both NULL
-    opened_at_ms          INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_move_journal_dst ON move_journal(dst);
-
-CREATE TABLE IF NOT EXISTS version_log (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,  -- append order within a file
-    path             TEXT    NOT NULL,   -- canonical
-    timestamp_ms     INTEGER NOT NULL,
-    blob_hash        TEXT    NOT NULL,   -- this version's content address = blob-store key
-    writer_principal TEXT    NOT NULL,
-    prev_hash        TEXT,               -- previous version in the chain; NULL for the first
-    size             INTEGER NOT NULL,
-    event            TEXT    NOT NULL    -- VersionEvent, serde snake_case
-);
-CREATE INDEX IF NOT EXISTS idx_version_log_path ON version_log(path, id);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- append order
-    event_id       TEXT    NOT NULL UNIQUE,
-    timestamp_ms   INTEGER NOT NULL,
-    principal      TEXT    NOT NULL,   -- the AD principal that acted (concept §13.1)
-    session_id     TEXT    NOT NULL,
-    canonical_path TEXT    NOT NULL,
-    kind           TEXT    NOT NULL,   -- AuditKind, serde snake_case
-    from_version   TEXT,
-    to_version     TEXT,
-    detail         TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_audit_path ON audit_log(canonical_path, id);
--- Covers the admin view's principal filter. The plain fleet-wide listing needs no
--- index of its own: it orders by id, which is the primary key.
-CREATE INDEX IF NOT EXISTS idx_audit_principal ON audit_log(principal, id);
-
-CREATE TABLE IF NOT EXISTS conflicts (
-    conflict_id      TEXT    PRIMARY KEY,
-    base_path        TEXT    NOT NULL,   -- the live file the conflict is against (canonical)
-    sidecar_path     TEXT    NOT NULL,   -- F.conflict-{user}-{ts} holding the losing bytes
-    losing_principal TEXT    NOT NULL,
-    created_at_ms    INTEGER NOT NULL,
-    state            TEXT    NOT NULL,   -- ConflictState: open | resolved
-    resolution       TEXT                -- ConflictResolution snake_case; NULL while open
-);
-CREATE INDEX IF NOT EXISTS idx_conflicts_base ON conflicts(base_path, state);
-
-CREATE TABLE IF NOT EXISTS session_reads (
-    session_id TEXT    NOT NULL,
-    path       TEXT    NOT NULL,   -- canonical
-    version    TEXT    NOT NULL,   -- a version this session has read (concept §6.2)
-    seen_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (session_id, path, version)
-);
-
--- Operational diagnostics (E-026). Deliberately NOT the audit log: audit records
--- what a principal did and is a primary deliverable, this records why something
--- failed. Different reader, different retention; merging them makes audit
--- unreadable. Only unexpected failures land here -- a CAS conflict or an Office
--- lock is a designed outcome and surfaces as conflict/lease status instead.
---
--- Grouped by (code, path): the failure that matters is usually the one repeating,
--- and one looping agent would otherwise bury everything else under identical rows.
-CREATE TABLE IF NOT EXISTS diagnostics (
-    id            TEXT    PRIMARY KEY,
-    code          TEXT    NOT NULL,   -- stable machine code, from the ChaprError variant
-    path          TEXT,               -- canonical; NULL for endpoint-wide problems
-    title         TEXT    NOT NULL,
-    severity      TEXT    NOT NULL,   -- Severity: error | warning
-    detail        TEXT    NOT NULL,
-    remedy        TEXT    NOT NULL,   -- what fixes it; required, not decoration
-    facts_json    TEXT    NOT NULL,   -- free key/value context, so a new fact needs no migration
-    state         TEXT    NOT NULL,   -- DiagnosticState: open | acknowledged | resolved
-    first_seen_ms INTEGER NOT NULL,
-    last_seen_ms  INTEGER NOT NULL,
-    count         INTEGER NOT NULL
-);
--- The grouping key. A unique index cannot span a NULL path in SQLite, so the key
--- folds a missing path to the empty string; the module maps it back to NULL.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_diagnostics_group
-    ON diagnostics(code, IFNULL(path, ''));
-CREATE INDEX IF NOT EXISTS idx_diagnostics_recent ON diagnostics(state, last_seen_ms);
-
--- Individual sightings within a group. Bounded per group -- the group count is the
--- real history. principal/host are what separate one misconfigured laptop from a
--- fault hitting everybody.
-CREATE TABLE IF NOT EXISTS diagnostic_occurrences (
-    group_id  TEXT    NOT NULL REFERENCES diagnostics(id) ON DELETE CASCADE,
-    at_ms     INTEGER NOT NULL,
-    principal TEXT    NOT NULL,
-    host      TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_diag_occ_group
-    ON diagnostic_occurrences(group_id, at_ms);
-";
 
 /// Open (creating if absent) a SQLite pool at `url`, e.g.
 /// `sqlite:chapr-coord.db` or `sqlite::memory:`.
@@ -204,10 +49,89 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx
         .await
 }
 
-/// Apply the schema. Idempotent (`CREATE ... IF NOT EXISTS`), so it is safe to
-/// run on every startup — the E-002 stand-in for real migrations.
+/// One schema migration: a version, a name for the ledger, and its SQL.
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// Every migration, in order. Append only — never renumber, never edit one that
+/// has shipped, because a coordinator in the field records what it applied by
+/// version and will skip an edited file rather than notice it changed.
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "baseline",
+    sql: include_str!("../migrations/0001_baseline.sql"),
+}];
+
+// Each migration file owns its own BEGIN / COMMIT and inserts its own
+// `schema_migrations` row, rather than this module wrapping it in a
+// `pool.begin()` transaction. Not a stylistic choice, and not to be "tidied"
+// back:
+//
+// `sqlx::raw_sql(..).execute(&mut *tx)` makes the enclosing future non-Send.
+// The compiler needs `Executor` for `&mut SqliteConnection` at *any* lifetime,
+// cannot prove it, and reports the failure a long way away — at the `rt.spawn`
+// in `service_win.rs`, naming `&Pool<Sqlite>` and `&str`. Plain `sqlx::query`
+// does not trip this, which is why every other module's transaction compiles;
+// `raw_sql` is the one that does, and a migration is exactly where a
+// multi-statement script has to run.
+//
+// Executing the whole file — transaction and ledger row included — with one
+// `raw_sql` on the pool keeps atomicity (SQLite's DDL is transactional, and all
+// the statements run on one pooled connection) while using the call shape that
+// has compiled here since E-002.
+//
+// The cost is an implicit contract: a migration that forgot its ledger row
+// would re-run on every start. `tests::every_migration_records_its_own_version`
+// makes that contract checked rather than remembered.
+
+/// Bring the database up to the current schema (C0, D-041).
+///
+/// Plain versioned SQL, applied in order, recorded in `schema_migrations`.
+/// Deliberately **not** the abstractions D-003 rejected — no storage trait, no
+/// ORM, no compile-time `DATABASE_URL` — and deliberately **not** `sqlx::migrate!`
+/// either: that macro needs sqlx's `macros` feature, which drags a proc-macro
+/// crate and the MySQL and Postgres drivers into a build that speaks only SQLite.
+/// Forty lines here costs less than that, and every line of it is legible at the
+/// point of failure.
+///
+/// **Each migration and its ledger row commit in one transaction**, and SQLite's
+/// DDL is transactional, so a migration cannot half-apply: either the schema
+/// change and the record of it both land, or neither does. That is stronger than
+/// D-041 asked for — it wanted a partial state to be *detectable*; this makes it
+/// unreachable, and the ledger then says exactly how far a database has come.
+///
+/// Safe on every startup: an already-applied version is skipped.
+///
+/// **What it buys over the `CREATE TABLE IF NOT EXISTS` it replaces** is the
+/// thing that blocked B3 and 2.4 — a schema change that is *not*
+/// additive-by-table now reaches a database that already exists.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::raw_sql(SCHEMA).execute(pool).await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+             version       INTEGER PRIMARY KEY,
+             name          TEXT    NOT NULL,
+             applied_at_ms INTEGER NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+
+    for m in MIGRATIONS {
+        let already: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = ?")
+                .bind(m.version)
+                .fetch_optional(pool)
+                .await?;
+        if already.is_some() {
+            continue;
+        }
+
+        sqlx::raw_sql(m.sql).execute(pool).await?;
+        tracing::info!(version = m.version, name = m.name, "schema migration applied");
+    }
     Ok(())
 }
 
@@ -219,4 +143,170 @@ pub async fn test_pool() -> SqlitePool {
     let pool = connect("sqlite::memory:", 1).await.expect("open in-memory db");
     migrate(&pool).await.expect("migrate");
     pool
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tables a coordinator must have, whichever route the database took to
+    /// get here. Asserted by name rather than by count so a future migration
+    /// adding one does not fail this test for the wrong reason.
+    const BASELINE_TABLES: &[&str] = &[
+        "audit_log",
+        "conflicts",
+        "diagnostic_occurrences",
+        "diagnostics",
+        "journal",
+        "leases",
+        "move_journal",
+        "session_reads",
+        "version_index",
+        "version_log",
+    ];
+
+    async fn table_names(pool: &SqlitePool) -> Vec<String> {
+        // The ledger and SQLite's own internals are excluded: what this asserts
+        // is the *coordination* schema, which both routes below must agree on.
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations' \
+             ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("list tables")
+    }
+
+    /// A database as a pre-C0 install left it: every table present, **no ledger
+    /// and no record of anything** — which is exactly what a `CREATE TABLE IF NOT
+    /// EXISTS` on every startup produced for two months.
+    ///
+    /// Built by stripping the transaction and the ledger insert out of the
+    /// baseline file, so it stays faithful to that file rather than drifting from
+    /// a hand-copied duplicate of the schema.
+    async fn pre_c0_pool() -> SqlitePool {
+        let pool = connect("sqlite::memory:", 1).await.expect("open in-memory db");
+        let ddl_only: String = include_str!("../migrations/0001_baseline.sql")
+            .replace("BEGIN;", "")
+            .replace("COMMIT;", "");
+        let ddl_only = &ddl_only[..ddl_only
+            .find("INSERT INTO schema_migrations")
+            .expect("the baseline records itself")];
+        sqlx::raw_sql(ddl_only)
+            .execute(&pool)
+            .await
+            .expect("apply the pre-C0 schema");
+        pool
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_migrates_to_the_baseline_schema() {
+        let pool = connect("sqlite::memory:", 1).await.expect("open in-memory db");
+        migrate(&pool).await.expect("migrate a fresh database");
+
+        assert_eq!(table_names(&pool).await, BASELINE_TABLES);
+
+        // The point of the machinery: what ran is recorded, so a partially
+        // migrated database is detectable rather than guessed at (D-041).
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("the migration ledger exists");
+        assert_eq!(applied, 1, "exactly the baseline, recorded");
+    }
+
+    /// The risk D-041 named as C0's real one: not the mechanism, the **baseline
+    /// for the install that already exists**. A live coordinator's database has
+    /// every table and no ledger; migrating it must record the baseline and touch
+    /// nothing else.
+    #[tokio::test]
+    async fn an_existing_pre_c0_database_is_baselined_without_losing_data() {
+        let pool = pre_c0_pool().await;
+
+        // A row in the one table whose loss would be unrecoverable and visible.
+        sqlx::query(
+            "INSERT INTO audit_log \
+             (event_id, timestamp_ms, principal, session_id, canonical_path, kind, detail) \
+             VALUES (?, 1, ?, 'sess-1', ?, 'write', '')",
+        )
+        .bind("evt-1")
+        .bind(r"CONTOSO\alice")
+        .bind(r"\\fs\share\a.txt")
+        .execute(&pool)
+        .await
+        .expect("seed an audit row");
+
+        migrate(&pool).await.expect("migrate an existing database");
+
+        let survived: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log")
+            .fetch_one(&pool)
+            .await
+            .expect("audit_log still readable");
+        assert_eq!(survived, 1, "an upgrade must not touch the audit trail");
+
+        // Same end state as the fresh path — the two must converge, or an upgraded
+        // coordinator and a new one disagree about what the schema is.
+        assert_eq!(table_names(&pool).await, BASELINE_TABLES);
+
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("the migration ledger exists");
+        assert_eq!(applied, 1, "the baseline is recorded, not re-run forever");
+    }
+
+    /// The contract the file-owns-its-transaction design creates: a migration
+    /// that forgot its own ledger row would silently re-run on every start.
+    /// Checked here rather than remembered — see the comment above `MIGRATIONS`.
+    #[test]
+    fn every_migration_records_its_own_version() {
+        for m in MIGRATIONS {
+            assert!(
+                m.sql.contains("BEGIN;") && m.sql.contains("COMMIT;"),
+                "migration {} ({}) must own its transaction",
+                m.version,
+                m.name,
+            );
+            let expected = format!("VALUES ({},", m.version);
+            assert!(
+                m.sql.contains("INSERT INTO schema_migrations") && m.sql.contains(&expected),
+                "migration {} ({}) must insert its own schema_migrations row",
+                m.version,
+                m.name,
+            );
+        }
+    }
+
+    /// Versions are the identity a live coordinator records, so a duplicate or a
+    /// backwards step would make "which migrations has this database had?"
+    /// unanswerable.
+    #[test]
+    fn migration_versions_are_unique_and_ascending() {
+        let mut prev = 0;
+        for m in MIGRATIONS {
+            assert!(
+                m.version > prev,
+                "migration {} ({}) is not after {prev}",
+                m.version,
+                m.name,
+            );
+            prev = m.version;
+        }
+    }
+
+    /// Idempotence, which is what makes it safe on every startup.
+    #[tokio::test]
+    async fn migrating_twice_changes_nothing() {
+        let pool = connect("sqlite::memory:", 1).await.expect("open in-memory db");
+        migrate(&pool).await.expect("first");
+        migrate(&pool).await.expect("second");
+
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("ledger");
+        assert_eq!(applied, 1);
+        assert_eq!(table_names(&pool).await, BASELINE_TABLES);
+    }
 }
