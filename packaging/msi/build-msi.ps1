@@ -102,8 +102,13 @@ if ($Output) {
 $wxs = Join-Path $PSScriptRoot "chapr-coord.wxs"
 
 Write-Host "Packaging $CoordExe -> $out"
+# `-pdbtype none`: wix writes a .wixpdb beside the output by default, and when
+# the output is a release staging directory that debug symbol file becomes a
+# published artifact nobody asked for. It is only useful for authoring an MSI
+# patch, which this project does not do - it ships whole packages.
 & wix build $wxs -arch x64 -d "Version=$Version" -d "CoordExe=$CoordExe" `
-      -ext WixToolset.Firewall.wixext -ext WixToolset.UI.wixext -o $out
+      -ext WixToolset.Firewall.wixext -ext WixToolset.UI.wixext `
+      -pdbtype none -o $out
 if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 
 Write-Host ""
