@@ -170,14 +170,23 @@ jobs:
           wix extension add --global WixToolset.UI.wixext/6.0.2
           wix --version
 
+      # Built OUTSIDE dist/, then exactly one file copied in. `wix build` writes a
+      # .wixpdb beside its output, and building straight into the staging
+      # directory made that debug symbol file a published artifact — caught by
+      # the sanity check, but only after it had been staged. `-pdbtype none`
+      # suppresses it and is still set; this makes the flag belt-and-braces
+      # rather than the only thing standing between a build tool's incidental
+      # output and a release. Nothing reaches dist/ unless it is named here.
       - name: Build the coordinator MSI
         if: matrix.coord == 'msi'
         shell: pwsh
         run: |
+          $msi = "chapr-coord-${{ needs.version-gate.outputs.version }}-${{ matrix.slug }}.msi"
           ./packaging/msi/build-msi.ps1 `
             -Version ${{ needs.version-gate.outputs.version }} `
             -CoordExe ./target/release/chapr-coord.exe `
-            -Output ./dist/chapr-coord-${{ needs.version-gate.outputs.version }}-${{ matrix.slug }}.msi
+            -Output ./build/msi/$msi
+          Copy-Item ./build/msi/$msi ./dist/$msi
 
       - name: Stage binaries
         shell: bash
