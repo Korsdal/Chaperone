@@ -107,16 +107,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check!("restore copy contains v1", restored_ok);
     check!("restore left live file at v2", disk(&a).ok().as_deref() == Some("v2"));
 
-    // move a -> a2 (need a fresh read of a to satisfy read-before-write)
-    let ra = read(&coord, backend.as_file_source(), backend.kind(), &cfg, &who, &sess, &a).await?;
-    let vcur = ra.version.clone().unwrap();
-    ops::mv(&coord, &leases, backend.clone(), &who, &sess, &a, &a2, vcur, None).await?;
-    check!("move: source gone", disk(&a).is_err());
-    check!("move: dest has v2", disk(&a2).ok().as_deref() == Some("v2"));
+    // D-050 chains, against the REAL read-before-write check: every version a
+    // verb returns must be accepted as base_version with no read in between.
+    // These three were refused before 0.1.5 (restore recorded nothing; move
+    // recorded nothing and dropped its version at the tool boundary).
+    let copy_uri = rest.restored_path.as_ref().map(|p| p.as_str().to_string()).unwrap_or_default();
+    let chain_copy = write(&coord, &leases, backend.clone(), &who, &sess, &copy_uri, b"copy-edited".to_vec(), rest.version.clone(), WriteMode::Cas).await;
+    check!("chain: write to restore-copy with returned version, no read", chain_copy.is_ok());
+    let _ = std::fs::remove_file(&copy_uri);
 
-    // delete a2 (read first for read-before-write)
-    let ra2 = read(&coord, backend.as_file_source(), backend.kind(), &cfg, &who, &sess, &a2).await?;
-    let vdel = ra2.version.clone().unwrap();
+    // restore v1 in place: base is the live version (v2, from the last write).
+    let v2 = write(&coord, &leases, backend.clone(), &who, &sess, &a, b"v2".to_vec(), v1.clone(), WriteMode::Force { reason: "smoke: reset to v2".into() }).await?.version;
+    let rip = ops::restore(&coord, &leases, backend.clone(), &who, &sess, &a, v1.clone(), RestoreMode::InPlace, Some(chapr_proto::RestoreBase::Version(v2))).await?;
+    check!("restore in place lands v1", disk(&a).ok().as_deref() == Some("v1"));
+    let chain_rip = write(&coord, &leases, backend.clone(), &who, &sess, &a, b"v3".to_vec(), rip.version.clone(), WriteMode::Cas).await;
+    check!("chain: write after in-place restore with returned version, no read", chain_rip.is_ok());
+    let v3 = chain_rip.map(|r| r.version).unwrap_or(v1.clone());
+
+    // history shows the forced write as write_forced (I-020: was rendered `write`)
+    let hist = coord
+        .history(&chapr_proto::HistoryQuery { path: canonicalize(&a, g)? })
+        .await?;
+    check!(
+        "history renders the forced write as write_forced",
+        hist.entries.iter().any(|e| e.event == chapr_proto::VersionEvent::WriteForced)
+    );
+
+    // move a -> a2 on the version the write returned, no read
+    let moved = ops::mv(&coord, &leases, backend.clone(), &who, &sess, &a, &a2, v3, None).await?;
+    check!("move: source gone", disk(&a).is_err());
+    check!("move: dest has v3", disk(&a2).ok().as_deref() == Some("v3"));
+
+    // chain: write to the destination with the version move returned, no read
+    let chain_mv = write(&coord, &leases, backend.clone(), &who, &sess, &a2, b"v4".to_vec(), moved.version.clone(), WriteMode::Cas).await;
+    check!("chain: write after move with returned version, no read", chain_mv.is_ok());
+    let vdel = chain_mv.map(|r| r.version).unwrap_or(moved.version);
+
+    // delete a2 on the version the write returned
     ops::delete(&coord, &leases, backend.clone(), &who, &sess, &a2, vdel).await?;
     check!("delete removes the file", disk(&a2).is_err());
 

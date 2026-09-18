@@ -105,8 +105,8 @@ pub async fn create(
             .await
             .map_err(&committed)?;
         // Record the new version so the session can immediately write to it (§6.2).
-        let _ = coord
-            .record_read(&ReadReceipt {
+        coord
+            .record_read_best_effort(&ReadReceipt {
                 session_id: session_id.clone(),
                 path: path.clone(),
                 version: version.clone(),
@@ -408,6 +408,18 @@ pub async fn restore(
                     detail: "restore copy".to_string(),
                 })
                 .await?;
+            // The copy is a file this session now demonstrably knows the contents
+            // of, at a path it has just been told. Record it so a write to the
+            // copy can present the returned version (D-050) — keyed by the
+            // copy's path, not the original's, because that is where the bytes
+            // are.
+            coord
+                .record_read_best_effort(&ReadReceipt {
+                    session_id: session_id.clone(),
+                    path: restored.clone(),
+                    version: version.clone(),
+                })
+                .await;
             Ok(RestoreResponse {
                 restored_path: Some(restored),
                 version,
@@ -496,6 +508,18 @@ pub async fn restore(
                     })
                     .await
                     .map_err(&committed)?;
+                // Same rule as write's tail: the version this tool returns is
+                // one the session can chain a write on (D-050). Restore did not
+                // record before, so `restore → write` with the returned version
+                // was refused as never read — by the one verb whose whole point
+                // is that the caller has looked at the content.
+                coord
+                    .record_read_best_effort(&ReadReceipt {
+                        session_id: session_id.clone(),
+                        path: path.clone(),
+                        version: version.clone(),
+                    })
+                    .await;
                 Ok(RestoreResponse {
                     restored_path: None,
                     version: version.clone(),
@@ -579,8 +603,19 @@ pub async fn mv(
 
     let _ = leases.release(&lease.lease_id).await;
     // Hand the destination's version back, so a caller can chain a CAS write
-    // without reading the file it just moved.
-    result.map(|r| MoveResponse { version: r.version })
+    // without reading the file it just moved — and record it under the
+    // destination so coord's read-before-write check agrees (D-050). Returning
+    // the version without recording it made the return value a trap: it looked
+    // like a usable base_version and was refused the moment it was used.
+    let resp = result?;
+    coord
+        .record_read_best_effort(&ReadReceipt {
+            session_id: session_id.clone(),
+            path: dst.clone(),
+            version: resp.version.clone(),
+        })
+        .await;
+    Ok(MoveResponse { version: resp.version })
 }
 
 // ---- helpers --------------------------------------------------------------

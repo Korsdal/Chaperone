@@ -10,6 +10,54 @@
 
 ---
 
+<a id="d-050"></a>
+### D-050 — Any version a Chaperone tool returns is a usable `base_version` — 2026-09-14
+
+**Problem:** D-014 recorded read receipts on `chapr.read` and on write/create
+commit, so a caller could chain. Restore and move returned a version and recorded
+nothing, so `restore → write` and `move → write` with the returned version were
+refused as never read — by verbs whose whole point is that the caller has looked at
+the content. The round-three tester found the move half (2.3) and, in a refusal it
+could not reproduce (N1, I-022), that the rule *"read before you write"* had become
+*"the create hash usually works"*, which no caller can adapt to. Four decisions were
+taken with jok on 2026-09-14 against `specs/happypathfindings-round3-fixplan.md`.
+
+**Decisions:**
+
+1. **The rule, stated once and made true:** every version a tool hands back —
+   `create`, `write`, `restore` (in place *and* copy, keyed by the copy's path) and
+   `move` (keyed by the destination) — is recorded as a receipt for the session.
+   `chapr_write`'s description now says so. **Restore's own `base` stays CAS-only**
+   and is *not* asserted against the read set: D-014 said restore skips the assert,
+   D-047/Q13 made `base` mandatory and CAS-checked, and both stand. The
+   inconsistency the tester noted (point 4) is resolved in that direction, not the
+   other — do not "fix" it by adding an assert to restore.
+2. **Instrument before theorising (I-022).** A receipt that fails to land is
+   logged at the endpoint (the `let _ =` is gone from all five sites); a refused
+   `base_version` is logged at coord with what the session's read set held for
+   that path; the refusal says "this endpoint run's read set" and names the
+   restart case. The mechanism is decided by the audit rows on the rig, not by
+   code written first.
+3. **The directory refusal loses its release history.** "This used to be reported
+   as a permissions problem" was true for one of three tools sharing the text
+   (N3), and a changelog carries it better than a footnote every reader sees (N4).
+   Removed everywhere; no per-tool branching.
+4. **No model-visible config tool.** The version goes in the startup log line
+   beside the config that was already there; MCP `serverInfo.version` has carried
+   it since 08-20. The tool surface stays at 12. Re-raise if the next test round
+   still cannot identify a build.
+5. **No history schema change.** `force_reason` stays audit-only (the doc comment
+   on `VersionEvent::WriteForced` has the reasoning: agents read the event, humans
+   read the panel). Previous-name-on-move waits for B4/Q11 (I-016), where
+   overwrite-move history is already open, so one schema change rather than two.
+
+**Also fixed under this decision, as I-020 and I-021:** coord rendered
+`write_forced` as `write`; `chapr_move` dropped its version at the handler. Both
+were claimed in CHANGELOG 0.1.4; a correction note now sits under that entry.
+
+**Made by:** jok (decisions) / Claude (analysis, implementation) | **Review date:** when I-022 closes
+**Status:** CURRENT (extends D-014; consistent with D-044, D-047)
+
 <a id="d-047"></a>
 ### D-047 — The cowork-findings slice: what an agent is told, and what restore may destroy — 2026-09-09
 

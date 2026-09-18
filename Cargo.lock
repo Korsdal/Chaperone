@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "chapr-coord"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "axum-server",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "chapr-endpoint"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "axum-server",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "chapr-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "chrono",

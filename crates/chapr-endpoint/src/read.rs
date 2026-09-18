@@ -187,8 +187,8 @@ pub async fn read(
     // base_version (structural read-before-write, §6.2). Best-effort — a
     // recording failure must not fail the read.
     if let Some(version) = &resp.version {
-        let _ = coord
-            .record_read(&ReadReceipt {
+        coord
+            .record_read_best_effort(&ReadReceipt {
                 session_id: session_id.clone(),
                 path: path.clone(),
                 version: version.clone(),

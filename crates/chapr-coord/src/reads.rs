@@ -60,13 +60,34 @@ pub async fn assert(
     .map_err(internal)?;
 
     if found.is_some() {
-        Ok(())
-    } else {
-        Err(ChaprError::BaseVersionNotRecorded {
-            path: path.clone(),
-            provided: version.clone(),
-        })
+        return Ok(());
     }
+
+    // Refusal path only — one extra query that never runs on the hot path. A
+    // refusal seen from outside says "never read by this session" and nothing
+    // else; four controlled experiments could not tell whether the receipt was
+    // never posted, was posted under another session id, or was posted for a
+    // different version. This line answers that in one read of the log.
+    let held: Vec<String> = sqlx::query_scalar(
+        "SELECT version FROM session_reads WHERE session_id = ?1 AND path = ?2 ORDER BY seen_at_ms",
+    )
+    .bind(session_id.as_str())
+    .bind(path.as_str())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    tracing::warn!(
+        session = session_id.as_str(),
+        path = path.as_str(),
+        provided = version.as_str(),
+        held = ?held,
+        "base_version refused: not in this session's read set for the path"
+    );
+
+    Err(ChaprError::BaseVersionNotRecorded {
+        path: path.clone(),
+        provided: version.clone(),
+    })
 }
 
 fn internal(e: sqlx::Error) -> ChaprError {

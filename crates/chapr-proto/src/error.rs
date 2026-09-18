@@ -169,7 +169,14 @@ pub enum ChaprError {
     /// having read it. Read-before-write is structurally enforced: the model
     /// cannot fabricate a token it never saw (concept §6.2). Distinct from
     /// `Conflict` — this is rejected *before* the write path even starts.
-    #[error("base_version for {path} was never read by this session")]
+    ///
+    /// "Endpoint run", not "session": a session *is* one endpoint process
+    /// (`sess-{pid}`), and the old wording — "was never read by this session" —
+    /// asserted something a caller could see was false when the version had
+    /// come from a Chaperone tool minutes earlier in the same conversation. The
+    /// true condition is that *this run's* read set does not hold it, which is
+    /// also what a host restarting the endpoint mid-conversation produces.
+    #[error("base_version for {path} is not in this endpoint run's read set")]
     BaseVersionNotRecorded {
         path: CanonicalPath,
         provided: VersionToken,

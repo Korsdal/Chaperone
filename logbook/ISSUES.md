@@ -14,8 +14,121 @@
 
 ## Live
 
-<a id="i-018"></a>
+
+### I-022 — A `base_version` from `chapr_create` was refused as never read, once in four, and the mechanism is unknown
+
+**Severity:** MED · **Since:** 2026-09-10 (found), filed 2026-09-14 · **Status: OPEN — instrumented, evidence on the rig**
+
+**Symptom, from the round-three happy-path report** (`specs/happypathfindings-round3.md`,
+N1): within one conversation, `chapr_write` with the version `chapr_create` had just
+returned succeeded three times and was refused once with *"base_version … was never
+read by this session"*. Reading the file and retrying succeeded. A controlled
+experiment on 2026-09-11 ruled out elapsed time (150 s idle), read-set churn (22
+reads) and a preceding in-place restore — all three arms were accepted.
+
+**What the code rules out** (`specs/happypathfindings-round3-vs-code.md`): receipts
+are coord-side in `session_reads`, keyed `(session_id, path, version)`, so hash-only
+keying is not it; nothing sweeps the table, so there is no TTL; create and write
+**do** record on commit, so the tester's proposed fix was already the design.
+
+**Two candidates survive.** (1) A session is `sess-{pid}` (D-044); a host restarting
+the endpoint between the create and the write empties the read set, and the message
+is then literally true of the process and false of the conversation. (2) The
+post-commit `record_read` was `let _ =` at every call site — a transient failure
+left no receipt and no log line.
+
+**What separates them:** every audit row carries `session_id`. Compare the `create`
+row for `uxt3-cas.txt` with the `refused[base_version_not_read]` row on the rig's
+admin Audit tab. Equal ids → candidate 2; different → candidate 1.
+
+**Done 2026-09-14 (0.1.5):** a failed receipt is logged at the endpoint; coord logs
+a refusal with what the session's read set held for the path; the refusal names the
+restart case. Nothing deeper until the audit rows are read — a fix to a guessed
+mechanism is what the tester's own amendment warns against.
+
+---
+
+### I-021 — `chapr_move` returned no version, while the changelog said it did
+
+**Severity:** LOW · **Since:** 2026-09-09 · **Status: RESOLVED 2026-09-14**
+
+`MoveResponse.version` was added in `abf88c3` with a doc comment explaining the
+chaining case; `ops::mv` returned it; the tool handler matched `Ok(_)` and printed
+`moved a -> b`. The fix reached the last function before the model and stopped.
+CHANGELOG 0.1.4 listed "`chapr_move` returns its version" as shipped. Open across
+three test rounds as finding 2.3.
+
+**Fixed by:** printing the version, and — because printing without recording would
+have set a trap (I-022's class) — recording it under the destination. Test
+`chapr_move_reports_the_destination_version_and_records_it`, and a smoke chain
+`move → write` with no read against a real coordinator.
+
+**Same pattern as I-004:** a claim written at the documentation layer, unverified at
+the surface the claim is about. Filed separately so the recurrence is countable.
+
+---
+
+### I-020 — Coord rendered every `write_forced` history event as `write`
+
+**Severity:** MED · **Since:** 2026-09-09 · **Status: RESOLVED 2026-09-14**
+
+`abf88c3` gave a forced write its own event so `chapr_history` would show that a
+version discarded a concurrent edit. `event_str` learned `"write_forced"`;
+`event_from_str` did not, and its `_ => Write` fallback swallowed the new string.
+Every forced write was stored correctly and shown as an ordinary write — the one
+governance-relevant fact about that version, invisible exactly where the tool
+promised it. CHANGELOG 0.1.4 stated the opposite. No test exercised the round trip.
+
+**Found by** the round-three tester as finding 2.2 (`force_reason` absent), which
+was a design choice; reading why the *event* was also absent found this.
+
+**Fixed by:** the missing arm and `every_event_survives_the_round_trip`, which
+lists the enum exhaustively so a new variant without an arm fails the build of the
+test. A smoke check now asserts a forced write reads back as `write_forced` from a
+real coordinator.
+
+---
+
+### I-019 — The admin page could not sign in to any coordinator that authenticates
+
+**Severity:** HIGH · **Since:** 2026-09-11 · **Status: RESOLVED 2026-09-11**
+
+**Symptom, as reported from the rig with a correct token:** the Continue button
+was clickable, cleared the token from the input, showed no error, and did not
+sign in.
+
+**Cause, and it is three layers of the same thing.** The page loads six routes in
+one `Promise.all`. Five use `AdminAuth`; `/conflicts/query` used the **connection**
+auth, which under `shared-secret` demands the deployment's *endpoint* token — a
+credential the admin page does not hold and should not. One refusal in six takes
+the whole sign-in down.
+
+It was silent because `Caller` and `Authenticated` rejected with a bare
+`StatusCode`, which axum renders as a 401 with an **empty body**; the page did
+`throw new Unauthorized(await r.text())`, and `showLogin("")` sets
+`err.hidden = !message`, hiding the error element it had just been asked to fill.
+
+**Why it surfaced now:** the MSI defaults `COORD_AUTH=shared-secret`. Every earlier
+walkthrough ran `disabled` or `trusted-header`, where those routes do not enforce.
+
+**Fixed by:** `AdminOrAuthenticated` on that route — not a widening, since the
+admin token is the stronger credential and the route only reads; a body on every
+connection-auth refusal naming what was missing and where to find it; and a page
+that substitutes a status-specific sentence rather than rendering nothing.
+
+**The part worth keeping.** The suite had **206 tests and passed this.** It
+exercised the admin routes one at a time and never the *set* the page actually
+loads, so no test could observe that one member of the set behaved differently.
+The regression test now drives all six with only the admin token against an
+enforcing coordinator, and a second asserts no 401 leaves an empty body. Reverting
+just the route guard makes the first fail on `/conflicts/query` — checked, because
+a regression test nobody has seen fail is a regression test nobody has tested.
+
+---
+
 ### I-018 — The endpoint cannot use TLS at all, and trusting the certificate does not help
+
+**RESOLVED 2026-09-11** — `rustls-tls-native-roots` plus `CHAPR_COORD_CA_CERT`, and a refusal that names trust rather than reporting a healthy coordinator as unreachable. ⚠ Proven against a loopback HTTPS test server only; the hardware proof is the next session's first task.
 **Severity:** HIGH | **Since:** 2026-09-10 | **Status:** OPEN — one-line fix known
 
 Found while chasing jok's report that the admin page was "unsafe — not https, have
@@ -63,6 +176,8 @@ Detail: `specs/rig-findings-0910.md` §F2. Trust-model ordering: **D-049** / §D
 
 <a id="i-017"></a>
 ### I-017 — A bare-path `db_url` silently disables both the admin and endpoint tokens
+
+**RESOLVED 2026-09-11** — explicit `data_dir` config field, and `validate` now refuses a `db_url` without the `sqlite:` prefix at load. The strict reading is the only reading.
 **Severity:** MED | **Since:** 2026-09-10 | **Status:** OPEN — fix chosen, not built
 
 Reported as *"the generated admin page does not authenticate with the generated

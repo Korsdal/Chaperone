@@ -13,6 +13,52 @@
 <a id="d-049"></a>
 ### D-049 — The Windows coordinator is installed by an MSI; the wizard leaves, the admin page stays — 2026-09-10
 
+**AMENDED 2026-09-11 — the MSI carries no custom action, and the coordinator
+provisions itself.** The shape below ("MSI must not reimplement setup… invoke
+`chapr-coord setup --non-interactive` as a deferred custom action") was built, and
+it passed 21 assertions on the rig. Then an **interactive** install skipped that
+custom action without saying so, and left a registered service pointing at a
+config nobody had written: the installer sat on "Starting services" while the
+service failed, correctly, on a missing file. Nothing in the log said which step
+had not run.
+
+The root cause was never diagnosed and deliberately so — jok's call, and the
+better one: *"the one piece of work everything depends on does not belong in a
+step that can be skipped without saying so."* The mechanism was removed rather
+than debugged.
+
+What replaced it keeps the principle the original was protecting. The MSI is now
+**entirely declarative** — placement, `ServiceInstall` with this deployment's
+values on the service's own command line, `ServiceControl`, firewall rule, UI. On
+its **first start**, and only then, `run-service` writes the config, creates the
+data directory and restricts it, using the same `config_from_args` the prompts and
+the browser page use. So there is still exactly one definition of a valid config
+and the three front ends still cannot drift — the front ends are now *prompts ·
+browser page · service arguments*.
+
+Two consequences worth carrying:
+
+- **An existing `coord.toml` is never touched**, so an upgrade keeps an
+  administrator's edits. The MSI upgrades a binary and a service; the schema is
+  the binary's own job at start-up (C0). That boundary is unchanged.
+- **Empty means unset.** A formatted MSI argument string cannot omit a flag, so an
+  unanswered field arrives as `--share-unc ""`. Taken literally that is a
+  coordinator fronting the share named `""`, which validates and coordinates
+  nothing.
+
+**Also amended: the release asset set.** D-049 did not settle whether the MSI
+replaces the bare executable. It does, on Windows — and macOS ships no coordinator
+at all, because a Mac fronting a fileserver is a deployment nobody runs and
+nothing tests. Eight release artifacts, not nine (2026-09-11, jok).
+
+**What did not change:** data stays in `%ProgramData%\Chaperone`; the setup wizard
+still leaves this package; the admin page stays HTML because it is reached from an
+external admin host. The rule survives intact — *install is local and belongs to
+the platform's installer; operations are remote and belong on the web surface.*
+
+**Open item from the original, now closed:** the MSI carries only the coordinator.
+The endpoint bundle reaches laptops by its own channel.
+
 **Problem:** jok reopened D-048 one day after it shipped: *"the backend is itself
 packaged as vendor specific. We chose the html solution to avoid a windows native
 installer — but every Coord file is packaged for the system it handles. Making

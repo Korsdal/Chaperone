@@ -352,6 +352,29 @@ impl CoordClient {
         self.recv_empty(self.http.post(self.url("/reads")).json(req)).await
     }
 
+    /// [`record_read`](Self::record_read), best-effort and **logged** on failure.
+    ///
+    /// Every verb that hands a version back records it so the caller can chain
+    /// a write without re-reading (§6.2, D-050). That recording must never fail
+    /// the read or the commit it follows — the bytes are already on the share —
+    /// so the result is swallowed. It used to be swallowed *silently*, at five
+    /// call sites, which meant a receipt that never landed left no trace at
+    /// all: the next write was refused as "never read by this session", and
+    /// nothing anywhere said why. One warning here is the difference between a
+    /// refusal that can be diagnosed from the endpoint's log and one that
+    /// cannot.
+    pub async fn record_read_best_effort(&self, req: &ReadReceipt) {
+        if let Err(e) = self.record_read(req).await {
+            tracing::warn!(
+                path = req.path.as_str(),
+                version = req.version.as_str(),
+                session = req.session_id.as_str(),
+                error = %e,
+                "read receipt not recorded; a later write presenting this base_version will be refused"
+            );
+        }
+    }
+
     /// Assert this session read the given version, else `BaseVersionNotRecorded`.
     pub async fn assert_read(&self, req: &ReadReceipt) -> Result<(), ChaprError> {
         self.recv_empty(self.http.post(self.url("/reads/assert")).json(req)).await

@@ -401,9 +401,11 @@ bytes, never to read its contents."
 
     #[tool(
         description = "Write the full new contents of a file on the shared drive. You MUST pass \
-base_version from a prior chapr_read of the same file; the write is refused (CONFLICT) if the file \
-changed since — in which case your bytes are saved to a sidecar for reconciliation, never lost. \
-For a binary file, pass the base64 body chapr_read gave you and set encoding to \"base64\"."
+base_version: the version chapr_read returned for this file, or the version chapr_create, \
+chapr_write, chapr_restore or chapr_move returned for it earlier in this session — any version a \
+Chaperone tool hands you is usable. The write is refused (CONFLICT) if the file changed since — in \
+which case your bytes are saved to a sidecar for reconciliation, never lost. For a binary file, \
+pass the base64 body chapr_read gave you and set encoding to \"base64\"."
     )]
     async fn chapr_write(
         &self,
@@ -443,8 +445,8 @@ For a binary file, pass the base64 body chapr_read gave you and set encoding to 
         }
     }
 
-    #[tool(description = "List the entries in a directory on the shared drive (name, size, mtime, \
-and open-conflict counts).")]
+    #[tool(description = "List the entries in a directory on the shared drive (name, entry type — \
+file or directory — size, mtime, and open-conflict counts).")]
     async fn chapr_list(
         &self,
         Parameters(UriArgs { uri }): Parameters<UriArgs>,
@@ -720,8 +722,13 @@ governance history may span both names.")]
         )
         .await
         {
-            Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "moved {src_uri} -> {dst_uri}"
+            // The version is what makes the move chainable — `ops::mv` has
+            // returned it since 0.1.4, and this arm matched `Ok(_)` and printed
+            // without it, so the fix reached the last function before the model
+            // and stopped there. Same shape as create and write.
+            Ok(resp) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "moved {src_uri} -> {dst_uri} — version {}",
+                resp.version
             ))])),
             Err(e) => Ok(self.tool_failure("chapr_move", &src_uri, e).await),
         }
@@ -1162,11 +1169,13 @@ fn tool_error(e: ChaprError) -> CallToolResult {
         // failure this replaces sent callers into a filename-permutation loop:
         // `create` reporting `not found` on the path it was asked to create named
         // the one path the caller had right.
+        // No release history in the text: a sentence about what this "used to"
+        // report was true for one of the three tools that share this arm, and a
+        // changelog note ages better than a footnote every future reader sees.
         ChaprError::IsADirectory { path, tool } => format!(
             "\n\nNOTHING WAS CHANGED and nothing is wrong with the share — {path} is a folder, \
-             and {tool} works on files. This used to be reported as a permissions problem, \
-             which sent people to check ACLs that were fine. Use chapr_list to see what is in \
-             the folder, then call {tool} on one of the files it names."
+             and {tool} works on files. Use chapr_list to see what is in the folder, then call \
+             {tool} on one of the files it names."
         ),
         ChaprError::ParentMissing { parent, .. } => format!(
             "\n\nNOTHING WAS CHANGED, and the file you asked for is not the problem — the \
@@ -1204,7 +1213,10 @@ fn tool_error(e: ChaprError) -> CallToolResult {
             .to_string(),
         ChaprError::BaseVersionNotRecorded { .. } => "\n\nNOTHING WAS CHANGED. Read the file \
              with chapr_read first and pass the version it returns as base_version — this \
-             check exists so a write cannot be based on a version nobody actually looked at."
+             check exists so a write cannot be based on a version nobody actually looked at. \
+             If you did obtain this version from a Chaperone tool earlier in this conversation, \
+             the endpoint may have been restarted since and its record of what you saw is gone; \
+             reading the file again is the only remedy, and worth mentioning to the person."
             .to_string(),
         // Deliberately no extra guidance: the Display text already says what
         // happened, or it is a failure no wording improves.
@@ -1795,6 +1807,133 @@ mod tests {
         );
         assert!(msg.contains("absent"), "must state both accepted values: {msg}");
         assert_eq!(std::fs::read(&file).unwrap(), b"v1", "and change nothing");
+    }
+
+    /// The receipts a mocked coord received on `/reads`, as `(path, version)`.
+    async fn read_receipts(coord: &MockServer) -> Vec<(String, String)> {
+        coord
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == "/reads")
+            .map(|r| {
+                let v: serde_json::Value = serde_json::from_slice(&r.body).expect("receipt json");
+                (
+                    v["path"].as_str().unwrap_or_default().to_string(),
+                    v["version"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// D-050: any version a tool returns is a usable `base_version`. Restore
+    /// returned one and recorded nothing, so `restore → write` with the returned
+    /// version was refused as never read — by the one verb whose whole point is
+    /// that the caller has looked at the content. Both modes must record: in
+    /// place under the file, copy under the **copy's** path.
+    #[tokio::test]
+    async fn restore_records_a_receipt_for_the_version_it_returns() {
+        let coord = permissive_coord().await;
+        let v1 = VersionToken::hash(b"v1");
+        Mock::given(wmethod("GET"))
+            .and(wpath(format!("/blobs/{v1}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"v1".to_vec()))
+            .mount(&coord)
+            .await;
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("chain.txt");
+        std::fs::write(&file, b"v2").unwrap();
+        let uri = file.to_string_lossy().to_string();
+        let canon = canonicalize(&uri, grammar_for(BackendKind::Posix)).unwrap();
+
+        // In place: base is what is there now (v2); the returned version is v1.
+        let out = tool_text(
+            &srv.chapr_restore(Parameters(RestoreArgs {
+                uri: uri.clone(),
+                version: v1.as_str().to_string(),
+                in_place: true,
+                base: Some(VersionToken::hash(b"v2").as_str().to_string()),
+            }))
+            .await
+            .expect("in-place restore"),
+        );
+        assert!(out.contains(v1.as_str()), "restore must return the version: {out}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v1");
+        let receipts = read_receipts(&coord).await;
+        assert!(
+            receipts.contains(&(canon.as_str().to_string(), v1.as_str().to_string())),
+            "in-place restore must record (file, v1); got {receipts:?}"
+        );
+
+        // Copy: a fresh sibling; the receipt is keyed by where the bytes are.
+        let out = tool_text(
+            &srv.chapr_restore(Parameters(RestoreArgs {
+                uri: uri.clone(),
+                version: v1.as_str().to_string(),
+                in_place: false,
+                base: None,
+            }))
+            .await
+            .expect("copy restore"),
+        );
+        let copy = out
+            .split("copy at ")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("copy path in output")
+            .to_string();
+        assert!(copy.contains(".restored-"), "copy lands beside the file: {copy}");
+        let receipts = read_receipts(&coord).await;
+        assert!(
+            receipts
+                .iter()
+                .any(|(p, v)| p.eq_ignore_ascii_case(&copy) && v == v1.as_str()),
+            "copy restore must record (copy, v1); got {receipts:?}"
+        );
+    }
+
+    /// 2.3, open across three test rounds: `ops::mv` returned the version and
+    /// the handler matched `Ok(_)`, so the value reached the last function before
+    /// the model and was dropped. And D-050: the version it now prints must also
+    /// be recorded under the destination, or printing it would set a trap.
+    #[tokio::test]
+    async fn chapr_move_reports_the_destination_version_and_records_it() {
+        let coord = permissive_coord().await;
+        for p in ["/move/open", "/move", "/move/clear"] {
+            Mock::given(wmethod("POST"))
+                .and(wpath(p))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&coord)
+                .await;
+        }
+        let srv = server_for(coord.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("before.txt");
+        let dst = dir.path().join("after.txt");
+        std::fs::write(&src, b"moving").unwrap();
+        let v = VersionToken::hash(b"moving");
+        let dst_uri = dst.to_string_lossy().to_string();
+        let dst_canon = canonicalize(&dst_uri, grammar_for(BackendKind::Posix)).unwrap();
+
+        let out = tool_text(
+            &srv.chapr_move(Parameters(MoveArgs {
+                src_uri: src.to_string_lossy().to_string(),
+                dst_uri: dst_uri.clone(),
+                src_base_version: v.as_str().to_string(),
+                dst_base_version: None,
+            }))
+            .await
+            .expect("move"),
+        );
+        assert!(out.contains(v.as_str()), "move must print the version: {out}");
+        assert!(dst.exists() && !src.exists());
+        let receipts = read_receipts(&coord).await;
+        assert!(
+            receipts.contains(&(dst_canon.as_str().to_string(), v.as_str().to_string())),
+            "move must record (dst, version); got {receipts:?}"
+        );
     }
 
     /// R2, round two. `similar_names` matches an identical string, so an existing

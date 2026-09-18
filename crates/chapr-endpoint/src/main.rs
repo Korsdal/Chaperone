@@ -95,7 +95,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     chapr_endpoint::canon::set_coordinated_roots(roots)
         .map_err(|_| std::io::Error::other("coordinated roots were already set"))?;
 
-    tracing::info!(%coord_url, backend = %backend_kind, principal = principal.as_str(), confined, "chapr-endpoint starting");
+    // The version goes in this line because it is the one place an operator or
+    // a tester can tell builds apart without an MCP client that surfaces
+    // `serverInfo`: three test rounds ran against an unidentified bundle.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        %coord_url,
+        backend = %backend_kind,
+        principal = principal.as_str(),
+        confined,
+        "chapr-endpoint starting"
+    );
     // Two credentials, two questions. The token proves this is one of the
     // deployment's endpoints (coord's `shared-secret` mode refuses without it);
     // the principal header says which user it is acting for, and stays asserted

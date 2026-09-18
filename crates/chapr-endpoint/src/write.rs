@@ -121,8 +121,8 @@ pub async fn write(
             message: format!("backend bug: successful write receipt for {path} has no to_version"),
         })?;
         commit_tail(coord, principal, session_id, &path, &receipt, &v_new, &mode).await?;
-        let _ = coord
-            .record_read(&ReadReceipt {
+        coord
+            .record_read_best_effort(&ReadReceipt {
                 session_id: session_id.clone(),
                 path: path.clone(),
                 version: v_new.clone(),

@@ -15,15 +15,50 @@ Versions appear here only once a human has set them; work in flight sits under
 
 ---
 
-## Unreleased
+## 0.1.5 — 2026-09-14
 
-*(nothing in flight)*
+Set by jok. One thing to know before upgrading: **any version a Chaperone tool
+returns is now a usable `base_version`** — from `chapr_create`, `chapr_write`,
+`chapr_restore` or `chapr_move`, not only from `chapr_read`. No argument changes.
+
+### What was the problem
+
+A third happy-path round against the released bundle found two 0.1.4 claims that
+were true in the code and false at the tool surface: a forced write was stored as
+`write_forced` and rendered as `write`, and `chapr_move` carried its version to the
+handler and printed without it. A `base_version` from `chapr_create` was refused
+once in four as "never read by this session", and nothing anywhere recorded why.
+A restore's returned version was refused the same way, every time.
+
+### What was changed
+
+| Area | Change |
+|---|---|
+| History | `write_forced` round-trips through the coordinator; a test now covers every event |
+| `chapr_move` | Prints the destination's version, and records it so a chained write is accepted |
+| `chapr_restore` | Records the returned version — in place under the file, copy under the copy's path |
+| Receipts | A receipt that fails to land is logged at the endpoint; a refused `base_version` is logged at the coordinator with what the session's read set held for that path |
+| Refusal text | "not in this endpoint run's read set", and names the restart case, instead of asserting the version was never read |
+| Descriptions | `chapr_write` states the rule above; `chapr_list` names the entry type; the directory refusal drops its release-history sentence; the startup log line carries the version |
+
+### What was deferred / backlogged
+
+The refusal's mechanism is still unknown (**I-022**): the audit rows for the
+refused write decide between an endpoint restart and a lost receipt, and only the
+rig holds them. Previous-name-on-move in history waits for B4/Q11 (I-016), where
+overwrite-move history is already open. `force_reason` stays in the audit log by
+design. No model-visible config tool (D3, 2026-09-14).
 
 ---
 
 ## 0.1.4 — 2026-09-10
 
 Set by jok. Four things to know before upgrading:
+
+> **Correction, 2026-09-14.** Two rows under *Provenance* below were not true at the
+> tool surface when this shipped: a forced write was rendered `write` in
+> `chapr_history` (I-020), and `chapr_move` dropped its version before printing
+> (I-021). Both are fixed in 0.1.5. The rows are left as written.
 
 - **`chapr_restore` gains a required argument** — an in-place restore must now
   state the version it expects to find (or `absent`).

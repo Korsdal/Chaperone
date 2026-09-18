@@ -258,10 +258,18 @@ fn event_from_str(s: &str) -> VersionEvent {
         "baseline" => VersionEvent::Baseline,
         "create" => VersionEvent::Create,
         "delete" => VersionEvent::Delete,
+        "write_forced" => VersionEvent::WriteForced,
         "restore" => VersionEvent::Restore,
         "move" => VersionEvent::Move,
         "recover" => VersionEvent::Recover,
-        // "write" and any unexpected value fall back to the ordinary write.
+        // "write", and any value this build does not know — a row written by a
+        // NEWER coord — fall back to the ordinary write. That fallback is for
+        // forward compatibility, not a licence to skip an arm: `write_forced`
+        // was stored correctly for a release and rendered as `write` because
+        // this match lacked it, which made the one governance-relevant fact
+        // about a version invisible exactly where `chapr_history` promised it.
+        // `every_event_survives_the_round_trip` below now fails when an arm is
+        // missing.
         _ => VersionEvent::Write,
     }
 }
@@ -284,6 +292,43 @@ fn db(e: sqlx::Error) -> ChaprError {
 mod tests {
     use super::*;
     use crate::db;
+
+    /// The test that would have caught I-020. `write_forced` was stored by
+    /// `event_str` and read back as `write` because `event_from_str` had no arm
+    /// for it, so a forced write was invisible in `chapr_history` for a whole
+    /// release while the CHANGELOG said the opposite. Listed explicitly: the enum
+    /// has no iterator, and a new variant that is not added here fails the test,
+    /// which is the point.
+    #[test]
+    fn every_event_survives_the_round_trip() {
+        let all = [
+            VersionEvent::Baseline,
+            VersionEvent::Create,
+            VersionEvent::Write,
+            VersionEvent::WriteForced,
+            VersionEvent::Delete,
+            VersionEvent::Restore,
+            VersionEvent::Move,
+            VersionEvent::Recover,
+        ];
+        for e in all {
+            assert_eq!(event_from_str(event_str(e)), e, "{e:?} did not round-trip");
+        }
+        // The list above must be the whole enum. A wildcard match here would
+        // compile with a variant missing; an exhaustive one will not.
+        for e in all {
+            match e {
+                VersionEvent::Baseline
+                | VersionEvent::Create
+                | VersionEvent::Write
+                | VersionEvent::WriteForced
+                | VersionEvent::Delete
+                | VersionEvent::Restore
+                | VersionEvent::Move
+                | VersionEvent::Recover => {}
+            }
+        }
+    }
 
     fn path() -> CanonicalPath {
         CanonicalPath::new_unchecked("\\\\srv\\share\\doc.md")

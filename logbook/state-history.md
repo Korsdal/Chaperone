@@ -7,7 +7,357 @@
 > reached 20,539 chars — most of it narrative that had already stopped being
 > "current". On 2026-08-21 it was condensed to a statement of what is true now,
 > and every displaced paragraph was moved here **verbatim**, under the date it
-> was written. Nothing was deleted.
+
+## 2026-09-14 — displaced by the round-three slice (0.1.5)
+
+> The state as it stood at the end of 2026-09-11, immediately after v0.1.4 was
+> released. Kept because it is the snapshot the round-three tester was, in
+> effect, testing against — and the last one in which the two 0.1.4 claims
+> corrected by I-020 and I-021 were still believed.
+
+**Phase:** implementation — **v0.1.4 is released** (2026-09-11), the first tag this
+project has published through CI rather than by hand. v1 complete, installed at a
+customer, pilot-tested on real hardware (2026-08-14), hardened through phase 1
+(2026-08-21), Phase A "Truth" (09-07), Phase B's correctness core (09-08/09), the
+cowork slice (09-09), C0 migrations (09-10), and the packaging turn (09-10/11).
+Multi-backend (SMB + POSIX); Windows, Linux and macOS all run the suite in CI.
+**Test scope stays narrowed (D-049): Windows rig + Azure VM, Windows and Linux
+endpoints, POSIX parked with its own rig** until the SMB story is good.
+
+**Status:** three crates build clean; **466** tests pass; clippy `-D warnings`
+clean on Windows *and* Linux — both were run this session, and each caught
+something the other could not. **12** tools against **32** coord service routes,
+plus the six-tab token-gated admin page. Coord has **6** subcommands. MSRV
+**1.88.0**. `cargo fmt` still drifts and remains jok's call.
+*Counts re-measured 2026-09-11; the first attempt at the subcommand count was
+wrong, which is I-004 in miniature — re-measure, do not carry forward.*
+
+**What v0.1.4 actually ships, and how it is delivered.** Eight artifacts, not
+nine: the **Windows coordinator is an MSI** and the bare `.exe` is no longer
+published; **there is no macOS coordinator** (nobody runs one, nothing tests one);
+endpoints ship as a `.mcpb` and a bare binary on all three. The release stages by
+**name**, not by count — a count is satisfied by eight wrong things, and it caught
+a stray `.wixpdb` twice before the tag went up.
+
+**The MSI carries no custom action, and that is a correction (D-049 AMENDED).**
+The first build did what D-049 specified — a third front end to `SetupArgs`,
+invoking `setup --non-interactive` from a deferred custom action. It passed 21 rig
+checks. Then an *interactive* install skipped that action silently and left a
+registered service pointing at a config nobody had written: the installer hung on
+"Starting services" and said nothing. **The one piece of work everything depends
+on does not belong in a step that can be skipped without saying so.** The package
+is now declarative; the service writes its own config on **first start** from the
+values it was registered with, and never touches one that exists. Single-sourcing
+survives — it is the same `config_from_args` the prompts and the browser page use.
+
+**CI now proves the packaging it ships (E-029, partly done).** A `packaging` job
+builds the MCPB (with `-Pack`, so `mcpb validate` runs) and the MSI on every push,
+then **installs the MSI on the Windows runner and runs all 21 assertions**. Before
+this, packaging ran for the first time when a tag was pushed. The remaining half
+of E-029 is what CI is *for* now that the rig and the installer verification both
+exist — restate it rather than assume it.
+
+**The pattern this session, and it is the finding worth keeping.** Every defect
+found was in something that had never been executed: the MSI's interactive path,
+the endpoint over TLS, the admin page against an enforcing coordinator,
+`chapr_restore in_place`, the release's Windows leg. None were subtle. All were
+reached by *running* the thing. The suite went 444 → 466, and every one of those
+tests was written after a failure, not before it.
+
+**I-018 closed: the endpoint can use TLS at all.** `rustls-tls` linked Mozilla's
+roots only, so no private certificate worked wherever it was installed, and no
+test drove the client over HTTPS. Now `rustls-tls-native-roots` plus
+`CHAPR_COORD_CA_CERT` for a machine whose store cannot be reached, and a refusal
+that names trust instead of reporting a healthy coordinator as unreachable.
+**Established and not obvious: rustls accepts a self-signed end-entity certificate
+as a trust anchor**, so coord's generation needs no change. ⚠ **Proven only
+against a loopback test server** — see *Next*.
+
+**I-017 closed: one `data_dir`.** Explicit config field; `validate` refuses a
+`db_url` without `sqlite:` (the bare-path form opened a database, started a
+service and wrote neither token). Four locations became one, which is what made
+the installer a single property. `harden_data_dirs` now covers the data directory
+itself — it did not, and a split-volume config left both tokens unrestricted.
+
+**I-019: the admin page could not sign in to any coordinator that authenticates.**
+`/conflicts/query` was guarded by connection auth, which under `shared-secret`
+wants the *endpoint* token; one refusal in six takes the whole `Promise.all` down,
+silently, because bare `StatusCode` rejections carry no body. **206 tests passed
+this** — they exercised routes one at a time, never the set the page loads. Fixed
+with `AdminOrAuthenticated`, bodies on every refusal, and a page that cannot
+render an empty message.
+
+**Round-two happy-path findings answered (R1–R4).** `chapr_restore in_place`
+without `base` refused to leak the write path's `base_version` — a parameter that
+does not exist on the tool the caller used; `mkdir` checks exact existence before
+similarity; `stat`, `history` and `read` refuse a directory and name `chapr_list`.
+**Correction to that report: `in_place` was never zero-success** — the tool has
+always accepted `base`; the run never passed it.
+
+**Console output is ASCII** — the boring fix, not `SetConsoleOutputCP`, which
+would have "fixed" the display while writing the same bytes into a redirected log
+someone opens elsewhere. Doc comments, served HTML and MCP tool text are untouched
+(they are UTF-8 end to end by construction).
+
+**Read-path refusals still come in two kinds (D-039, I-015)** — a container
+refused by magic bytes, and non-UTF-8 text refused as a different thing naming the
+encoding and the human remedy. Chaperone coordinates files; it does not convert
+encodings or extract text (E-028).
+
+**Before touching the write path,** read the behaviour notes in
+`logbook/state-history.md` (2026-08-05): SQLite runs in **WAL** (10 s busy
+timeout); coord `PUT /blobs` is bounded at **256 MiB**, which is also the largest
+file Chaperone can write at all; `put_blob` runs **before** `journal_open`.
+
+**Three test environments, three jobs, none replacing another (D-045).** CI —
+every push, three OSes, and now the installer too. **Local rig** (`CHAPR-FS`,
+Hyper-V, Server 2022, share on `D:`, coord state on `C:`) — install process, file
+integrity, zero RTT, no Kerberos realm. **Azure VM** — the auth path and timing
+under real latency, still unused. **E-015 is blocked only on priority.**
+
+**Environment:** a Linux toolchain exists in WSL with an isolated
+`CARGO_TARGET_DIR`, and **this session proved it is not optional** — Linux clippy
+caught dead code that Windows cannot see. **jok pushes**; the SSH key is
+passphrase-protected by design, so an agent cannot read the remote and must ask
+rather than branch on it (see the new `CLAUDE.md` convention). WiX 6.0.2 plus the
+Firewall and UI extensions are now a local prerequisite for building the MSI.
+
+**What's next — the endpoint over TLS, on the rig.** It is the one thing v0.1.4
+ships that is proven only in a test. Install with `COORD_TLS=generate
+COORD_TLS_HOSTNAME=CHAPR-FS`, copy `coord.crt` to the laptop, set
+`CHAPR_COORD_CA_CERT`, run the self-test over `https://CHAPR-FS:18899`. **After
+it:** a round-three happy-path pass against the released bundle, and E-029's
+remainder.
+
+**Not blocking, and still jok's:** **Q11**/I-016 before B4, **Q4** before C3/C4,
+**Q1**. **B7**'s three scenarios still need a fault-injecting proxy that does not
+exist. **Owed and independent:** the `traceparent` measurement
+(`docs/measuring-session-identity.md`), and whether uninstalling an MCPB clears
+stored `user_config`.
+
+Deferred engineering (E-015, E-020, E-021, E-024b, E-028, E-030, V3-cloud) →
+`logbook/BACKLOG.md`. Note **E-021 ↔ V3-cloud is still circular as written**.
+
+---
+
+## 2026-09-11 — displaced by the v0.1.4 release
+
+> The state as it stood at the end of 2026-09-10, before the MSI was redesigned,
+> I-017 and I-018 were closed, the admin page was fixed and v0.1.4 shipped. Kept
+> because it is the last snapshot in which the packaging story was still a plan.
+
+**Phase:** implementation — v1 complete, installed at a customer, pilot-tested on
+real hardware (2026-08-14), phase 1 of the 0.2 plan delivered (2026-08-21) and
+corrected (2026-08-25), **Phase A "Truth" (2026-09-07)**, **Phase B's correctness
+core B0/B1/B2/B8 (2026-09-08) and B3 (2026-09-09)**, and the cowork spec's two
+workstreams — **W1, the endpoint slice (D-047)**, and **W2, the coord setup epic
+(D-048)**, both 2026-09-09 — and **C0, migration machinery (2026-09-10)**.
+Multi-backend (SMB + POSIX); Windows, Linux and macOS all run the suite in CI.
+**Test scope narrowed 2026-09-10 (D-049): Windows rig + Azure VM only, Windows
+and Linux endpoints, POSIX parked with its own rig** until the SMB story is good.
+
+**Version `0.1.4`, set by jok 2026-09-09 — the tag is not pushed.** A patch bump
+again, deliberately, even though `chapr_restore` gains a required argument: it
+stays 0.1.x until it is tested and true, and the minor number is a claim about
+proven-ness rather than a changelog of effort. Versioning is a human
+responsibility; never fill in a bump.
+
+**C0 landed 2026-09-10 — `db::migrate` is no longer `CREATE TABLE IF NOT EXISTS`.**
+Plain versioned SQL in `crates/chapr-coord/migrations/`, applied in order and
+recorded in a `schema_migrations` ledger (**D-041**'s option (a)). **The macro was
+not used**: `sqlx::migrate!` needs sqlx's `macros` feature, which drags a
+proc-macro crate and the MySQL and Postgres drivers into a SQLite-only build.
+**Each migration file owns its own `BEGIN`/`COMMIT` and inserts its own ledger
+row** — `raw_sql` inside a `pool.begin()` transaction makes the server future
+non-`Send`, reported far away at `service_win.rs`'s `rt.spawn`; do not "tidy" it
+back. Verified by a real upgrade, not only in memory: the pre-C0 binary's database
+file, migrated by the new binary, no re-run on restart. **What this unblocks:**
+move provenance in history (2.4), the audit chain and retention (C3/C4) — any
+change that is not additive-by-table.
+
+**Status:** three crates build clean; **449** tests pass (was 444); clippy
+`-D warnings` clean. **12** tools (was 11 — `chapr_mkdir`) against **32** coord
+service routes, plus the six-tab token-gated admin page whose Audit tab now
+searches by path and detail. Coord has **6** subcommands (was 3 — `handover`,
+`status`, `uninstall`) and its setup wizard now runs **in a browser** by default.
+MSRV **1.88.0**. `cargo fmt` still drifts and remains jok's call.
+*Counts re-measured 2026-09-09 by grepping `#[tool(` and `.route(`; tools and
+subcommands both moved this session, so do not carry them forward unread — that is
+what I-004 is for. The wizard's own two routes are deliberately **not** in the 32:
+they live on a temporary loopback listener, not the service router.*
+
+**⚠ What has NOT been driven against a real share or a real service install.**
+Both workstreams are verified by the unit suite, wiremock, real local processes
+and a live *local* coordinator — **not** by the rig. CI run **#16 on `fdbc2f8`
+was green across 7 jobs** and predates all of it. Specifically:
+
+- **W1** (the endpoint slice) has never touched an SMB share.
+- **W2**'s service paths have **never executed**: every walkthrough used
+  `--no-service` in an unelevated shell, so `install_service`, `remove_service`
+  and the SCM branches of `lifecycle.rs` are untested outside compilation. That
+  needs one elevated run on `CHAPR-FS`.
+
+The plan's verification walkthrough is owed for both: rebuild the endpoint bundle
+*without* defaults, revert the `clean-share` checkpoint, and confirm the four
+misconfiguration states are distinguishable from the tool surface alone. **jok
+has a happy-path-test skill** for driving the MCP from the user side once the
+whole spec is done, which is the natural close.
+
+**The cowork sessions' lesson, which is worth more than the fixes.** Driving all
+the tools against the rig showed **the engine behaving and not explaining
+itself**: every "works well" finding was boundary behaviour (fail-closed on a bad
+root, no damage after five failed operations, CAS under a real stale write,
+drive-letter resolution), and every failure was an explanation behaviour. jok's
+severity principle governs the order — **how long a user believes they are the
+problem**, not how broken a feature is. Configuration opacity consumed most of a
+session; the missing `mkdir` cost two tool calls.
+
+**Restore can no longer overwrite what nobody read (Q13 CLOSED as option (a)).**
+It performed **no CAS at all**, by design — "a restore is a deliberate overwrite"
+— so an agent could destroy current content it had never seen. It now requires
+the caller to state what it observed (a version, or `absent`) and checks that
+under the exclusive handle. **A soft-deleted target plus `absent` recreates the
+file at its original name**, so `chapr_delete`'s promise of recoverability is kept
+in practice and not only technically. Concept §6.5 always described the full write
+path; spec and code now agree, in the spec's favour.
+
+**`chapr_mkdir` exists, and its guard is deterministic on purpose.** The tool
+compares, never the model: normalise (case, separators, punctuation), then
+Damerau-Levenshtein within a length-scaled budget, refuse naming the candidates,
+`confirm_new` overrides and is audited. **Numbered siblings are exempt** — `2026`
+and `2027` are one edit apart and both deliberate, and a guard that refuses the
+second year of a deployment gets switched off, taking the typo protection with it.
+Parents are never created implicitly.
+
+**Every refusal is now audited, reads included**, as `AuditKind::Refused` with the
+cause as a greppable `refused[reason]` prefix in `detail`. Transport failures are
+excluded deliberately: a coordinator outage would write one row per read in a
+read-heavy workload, and it is not a decision anyone made. **Note for C4/Q4:
+§12's retention was sized before refusals existed.**
+
+**Two packaging failures were mine, found by handing jok a bundle.** "NOTE to
+packager" text rendered verbatim in his install dialog, and pre-filled defaults
+hid a stale stored value — a root typo'd as `charptest` survived several edits and
+a new build, because stored `user_config` is keyed by extension rather than
+version, so a *corrected* default never reaches an existing install. The template
+now ships **no defaults** and requires the root. **The binary stays permissive**
+and should: D-035(3) ships the bare executable for every OS, and one that refused
+to start until configured would be unusable for a Claude Code user.
+
+**B3 landed, so D-013's "stale-but-recoverable" is now true (D-046).** A
+`move_journal` row records the rename's intent beforehand; **`move_paths` deletes
+that row inside its own transaction**, which is the whole design — a surviving row
+*proves* the migration did not commit, so completion is exactly-once with no
+idempotency logic. `moverecover.rs` resolves them at endpoint start-up: complete,
+abandon, or leave it and say why.
+
+~~**A constraint that outlives B3: `db::migrate` is `CREATE TABLE IF NOT EXISTS`
+and nothing else.**~~ **Resolved 2026-09-10 by C0** — see above. A column now
+reaches an existing database.
+
+**W2 landed: the coordinator has a life beyond install (D-048).** The wizard runs
+**in a browser** — `--ui`, and the default for a double-click, while `setup` keeps
+the prompts — on loopback, behind a one-time token, single-shot. It is a **front
+end for `SetupArgs` and nothing else**: it calls the same `setup::run`, so probe /
+config write / hardening / service install / handover exist once and cannot drift.
+`status` reports config, service existence, service state and port response
+separately, exiting 0 only when all four hold. `uninstall` removes the service and
+**keeps every byte of data**, with no `--purge`. `handover` reprints the values
+and adds an `mcpServers` block — load-bearing now that bundles ship no defaults.
+
+**There is still no `chapr-coord update`, but the reason has changed.** C0 lifted
+the schema blocker on 2026-09-10; what is now missing is the *packaging* half, and
+**D-049 gives it to the MSI** rather than to a subcommand. The interim path is
+unchanged and still documented: uninstall → replace the binary → setup against the
+**same** data directory, which keeps history and the audit trail.
+**Ordering rule:** coordinator before endpoints.
+
+**D-044's `traceparent` probe is in and the measurement is still owed.** `rmcp`
+2.2 surfaces `_meta`; `traceprobe.rs` logs once per distinct trace id, covering
+all tools via a hand-written `call_tool`. Proven over real stdio. **One line per
+conversation would make it a conversation id; one per tool call makes it a request
+id; no line at all means the hook did not run.** Procedure:
+`docs/measuring-session-identity.md`.
+
+**Read-path refusals still come in two kinds (D-039, I-015)** — a *container*
+refused by magic bytes with advice naming what to read instead, and *non-UTF-8
+text* refused as a different thing, naming the encoding and the human remedy.
+Chaperone coordinates files; it does not convert encodings or extract text
+(E-028). The classifier chooses **a message, never an outcome**.
+
+**Before touching the write path,** read the behaviour notes in
+`logbook/state-history.md` (2026-08-05): SQLite runs in **WAL** (10 s busy
+timeout); coord `PUT /blobs` is bounded at **256 MiB**, which is also the largest
+file Chaperone can write at all; `put_blob` runs **before** `journal_open`.
+
+**Three test environments, three jobs, none replacing another (D-045).**
+**CI** — every push, three OSes, regression; loopback share, no realm, no latency.
+**Local rig** (`CHAPR-FS`, Hyper-V, Server 2022, Internal switch, share on `D:`
+and coord state on `C:`) — rapid development, install process, file integrity, at
+zero RTT in a workgroup with **no Kerberos realm**. **Azure VM fileserver** (demo
+tenant, available, unused) — the **auth path** and **timing under real network
+latency**, which nothing else covers. **E-015 is blocked only on priority.**
+
+**Known and accepted (not a bug):** after setup hardens the data directory, an
+**unelevated** `chapr-coord serve --config <that file>` cannot read its own
+config. The real deployment runs as a service account with access.
+
+**Environment:** a Linux toolchain exists in WSL, building with an isolated
+`CARGO_TARGET_DIR=$HOME/chapr-target` so the Windows `target/` is never clobbered.
+**jok pushes** — the SSH key is passphrase-protected *by design*. `api.github.com`
+is readable unauthenticated for a public repo, so CI results are reachable from
+here; **job logs are not** (403), so step conclusions are the available evidence.
+A YAML parser (`js-yaml` under node) validates the workflows locally, which is how
+run #15's invalid `ci.yml` should have been caught before the push.
+
+**What's next — the MSI installer rework, jok's call (2026-09-10).**
+Design settled in **`specs/coord-windows-packaging-0910.md`** and recorded as
+**D-049**. MSI (WiX) authored as a **third front end to `SetupArgs`**: it owns
+placement, service registration and ACLs, then invokes `chapr-coord setup
+--non-interactive` with its properties, so probe / config write / handover exist
+once and cannot drift. Binary → `%ProgramFiles%\Chaperone`; **data stays in
+`%ProgramData%\Chaperone`**. The setup wizard leaves this package for the later
+one; **the admin page stays HTML on purpose, because it is reached from an
+external admin host**. The rule to carry: *install is local and belongs to the
+platform's installer; operations are remote and belong on the web surface.*
+**The MSI does not remove C0's successors** — it upgrades a binary and a service,
+it cannot add a column.
+
+**Cheap, and worth doing first or alongside:**
+- **F2's client fix** (`rustls-tls-native-roots`) plus the missing
+  endpoint-over-TLS test. Smallest change on the board, and until it lands
+  TLS-by-default ships a coordinator nothing can reach (**I-018**).
+- **F1 and an explicit `data_dir`** (**I-017**). Four independent locations today
+  — `db_url`, `blob_root`, the inferred token directory, and the TLS directory
+  beside `config_out` — collapse to one, which makes the MSI a single property
+  instead of four.
+
+**Stopped and still owed:** the rig verification itself
+(`specs/rig-verification-0910.md`) got one finding into Step 1 before being
+halted. Nothing in it was invalidated; it resumes when there is something worth
+verifying against.
+
+**jok's read on the direction, 2026-09-10, and it should not be softened:**
+*"everything reads as overengineering to me right now — we are adding more
+friction per iteration."* The sharpest evidence is that **W2 shipped on 09-09 and
+half of it was proposed for removal on 09-10**. The distinction worth holding is
+that **F1 and F2 are not overengineering but under-verification** — not clever
+code, basics never tested — and the two have opposite cures: build less, versus
+prove what exists.
+
+**Not blocking any of the above, and still jok's:** **Q11**/I-016 before B4,
+**Q4** before C3/C4, **Q1**. **B7**'s three scenarios still need a fault-injecting
+proxy that does not exist. **Owed and independent:** the `traceparent`
+measurement (`docs/measuring-session-identity.md`), and whether uninstalling an
+MCPB clears stored `user_config`.
+
+Deferred engineering (E-015, E-020, E-021, E-024b, E-028, V3-cloud) →
+`logbook/BACKLOG.md`. Note **E-021 ↔ V3-cloud is still circular as written** and
+wants untangling.
+
+---
+
+---
 >
 > Read this when you need the reasoning behind a state change; read
 > `LOGBOOK.md` when you need to know where the project stands.
